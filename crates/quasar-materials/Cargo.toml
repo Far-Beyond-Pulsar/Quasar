@@ -1,0 +1,13 @@
+[package]
+name = "quasar-materials"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Quasar dynamic acoustic material system"
+
+[lib]
+
+[dependencies]
+quasar-core = { workspace = true }
+bytemuck    = { workspace = true }

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quasar",
+    "crates/quasar-core",
+    "crates/quasar-materials",
+    "crates/quasar-dsp",
+    "crates/quasar-backends",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "MIT OR Apache-2.0"
+authors    = ["Far Beyond Pulsar"]
+
+[workspace.dependencies]
+# ── Math + data ───────────────────────────────────────────────────
+glam      = { version = "0.33", features = ["bytemuck", "serde"] }
+bytemuck  = { version = "1",    features = ["derive"] }
+
+# ── Serialization ─────────────────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+
+# ── Async + threading ─────────────────────────────────────────────
+rayon      = "1"
+
+# ── Utilities ─────────────────────────────────────────────────────
+thiserror = "1"
+log       = "0.4"
+
+# ── Audio ─────────────────────────────────────────────────────────
+# public crate for crossfader math
+# (no direct dep on cpal or audio backends in core crates)
+
+# ── Internal workspace crates ─────────────────────────────────────
+quasar-core       = { path = "crates/quasar-core" }
+quasar-materials  = { path = "crates/quasar-materials" }
+quasar-dsp        = { path = "crates/quasar-dsp" }
+quasar-backends   = { path = "crates/quasar-backends" }
+quasar-audio      = { path = "crates/quasar-audio" }

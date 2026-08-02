@@ -1,0 +1,15 @@
+[package]
+name = "quasar-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Quasar spatial audio engine facade crate"
+
+[lib]
+
+[dependencies]
+quasar-core = { workspace = true }
+quasar-materials = { workspace = true }
+quasar-dsp = { workspace = true }
+quasar-backends = { workspace = true }
