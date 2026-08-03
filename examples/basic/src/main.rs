@@ -40,6 +40,8 @@ use quasar_audio::SpatialAudioEngine;
 use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
+use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
+use quasar_dsp::node_graph::AudioNode;
 
 use std::io::{self, BufRead};
 use std::sync::mpsc::Receiver;
@@ -103,6 +105,7 @@ struct WavPlayback {
     num_channels: usize,
     read_pos: f64,
     rate_ratio: f64,
+    occ_nodes: Vec<AirAbsorptionOcclusionNode>,
 }
 
 struct AudioEngine {
@@ -155,8 +158,12 @@ fn setup_audio_engine() -> AudioEngine {
     let engine = Arc::new(Mutex::new(engine));
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
+    let occ_nodes = (0..NUM_SOURCES)
+        .map(|_| AirAbsorptionOcclusionNode::new(1, sr, 0.1))
+        .collect();
+
     let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, occ_nodes,
     }));
 
     let state_cb = state.clone();
@@ -179,7 +186,7 @@ fn setup_audio_engine() -> AudioEngine {
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // Raw passthrough: first 2 WAV channels → stereo output, no DSP
+                // Match raw passthrough exactly: channel 0→left, channel 1→right
                 for i in 0..block {
                     let pos = st.read_pos;
                     let fa = pos.floor() as usize;
