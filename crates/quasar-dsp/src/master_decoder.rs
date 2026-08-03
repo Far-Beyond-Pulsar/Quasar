@@ -163,6 +163,20 @@ impl AudioNode for MasterSpatialDecoderNode {
                             }
                         }
                     }
+                    _ => {
+                        // Other layouts: route to front L/R for now
+                        for i in 0..num_samples {
+                            let mut mono = 0.0;
+                            for ch in 0..input.channels() as usize {
+                                mono += input.channel(ch as u16)[i];
+                            }
+                            mono /= input.channels() as f32;
+                            output.channel_mut(0)[i] = mono;
+                            if output.channels() > 1 {
+                                output.channel_mut(1)[i] = mono;
+                            }
+                        }
+                    }
                 }
             }
             DecoderMode::AmbisonicDecode { order: _order } => {
