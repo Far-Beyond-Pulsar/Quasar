@@ -3,32 +3,20 @@ use quasar_core::param_exchange::SpatialCoefficients;
 use crate::audio_buffer::AudioBuffer;
 use crate::node_graph::AudioNode;
 
-/// Applies direct-path distance attenuation (scalar gain only, NO delay line).
+/// Direct-path attenuation (scalar gain only, NO delay line).
 ///
-/// The delay line (`HermiteInterpolatingDelayLine`) and the earlier biquad
-/// shading have both been removed because they produced audible artifacts:
-///
-/// **Delay line** — the fractional Hermite interpolation through the circular
-/// buffer was reading partially overwritten data when the physical delay
-/// (~108 ms at 37 m, 5178 samples) exceeded the buffer's wrap period,
-/// causing periodic garbage injection.
-///
-/// **Biquad** — the ad-hoc cutoff-mapping formula plus stale filter state
-/// (coefficients changed every block without state resets) created click
-/// trains at every crossfade update.
-///
-/// For the P4 demo, the backend's `direct_gain.mean()` is applied purely as
-/// a sample-wise scalar — no buffer, no filter, no state. The loss of the
-/// fractional delay (the direct-path propagation delay) is inaudible in a
-/// 37 m static scene. P3 will reintroduce delay with a proper crossfading
-/// read pointer.
+/// The delay line was removed because every time the delay value changes
+/// (snapped, crossfaded, or otherwise) the circular buffer's read pointer
+/// jumps, creating a discontinuity in the output waveform.  In the P4
+/// cathedral demo the propagation delay (~108 ms at 37 m) is inaudible.
+/// P3 will reintroduce delay with a proper per-read-pointer crossfader
+/// that smoothly morphs between the old and new delay positions.
 pub struct AirAbsorptionOcclusionNode {
     input_channels: u16,
     output_channels: u16,
 }
 
 impl AirAbsorptionOcclusionNode {
-    /// Create a new occlusion node (no delay line, no biquads).
     pub fn new(input_channels: u16, _sample_rate: f32, _max_delay_secs: f32) -> Self {
         Self {
             input_channels,
@@ -36,13 +24,18 @@ impl AirAbsorptionOcclusionNode {
         }
     }
 
-    /// No-op — direct_gain.mean() in [`process`] handles all attenuation.
     pub fn update_occlusion(&mut self, _attenuation: &Band8, _delay_samples: f32) {
     }
-}
 
-impl AudioNode for AirAbsorptionOcclusionNode {
-    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &SpatialCoefficients) {
+    /// Fallback for tests that use the `AudioNode` trait (delay is constant,
+    /// no crossfade issues; delay value is ignored).
+    pub fn process_raw(
+        &mut self,
+        input: &AudioBuffer,
+        output: &mut AudioBuffer,
+        params: &SpatialCoefficients,
+        _delay_samples: f32,
+    ) {
         debug_assert_eq!(input.channels(), self.input_channels);
         debug_assert_eq!(output.channels(), self.output_channels);
         debug_assert_eq!(input.samples(), output.samples());
@@ -58,6 +51,12 @@ impl AudioNode for AirAbsorptionOcclusionNode {
                 out_ch[i] = in_ch[i] * gain;
             }
         }
+    }
+}
+
+impl AudioNode for AirAbsorptionOcclusionNode {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &SpatialCoefficients) {
+        self.process_raw(input, output, params, 0.0);
     }
 
     fn reset(&mut self) {

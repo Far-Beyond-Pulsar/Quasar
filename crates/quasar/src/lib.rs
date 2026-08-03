@@ -50,6 +50,12 @@ struct SceneRenderState {
     occ: Vec<AirAbsorptionOcclusionNode>,
     early: Vec<EarlyReflectionDelayNode>,
     rev: Vec<FdnReverbNode>,
+    /// Direct-path fractional delays (samples), one per scene output.
+    /// Written by `update_scene_spatial` for listener 0, read directly by
+    /// `process_audio_scene` — NOT crossfaded (crossfading the read pointer
+    /// causes a 1700-sample jump at every block boundary during the 15 ms
+    /// transition, producing a 188 Hz click train).
+    direct_delays: Vec<f32>,
     /// Per-listener cached resolved speaker positions (from listener.physical_layout).
     listener_layouts: Vec<Vec<[f32; 3]>>,
     /// Preallocated scratch (all mono unless noted), sized to DEFAULT_BLOCK_SIZE.
@@ -81,6 +87,7 @@ impl SceneRenderState {
             early: Vec::new(),
             rev: Vec::new(),
             listener_layouts: Vec::new(),
+            direct_delays: Vec::new(),
             mixed: Vec::new(),
             filtered: Vec::new(),
             reflections: Vec::new(),
@@ -318,12 +325,9 @@ impl SpatialAudioEngine {
     /// Compute thread (15–30 Hz). Mirrors the legacy [`update_spatial`] math for
     /// the direct path and derives early-reflection azimuth/elevation from each
     /// reflection's world direction.
-    pub fn update_scene_spatial(&self) {
+    pub fn update_scene_spatial(&mut self) {
         let n_out = self.scene_outputs.len();
         let n_lis = self.listeners.len();
-        // Guard: the engine may have been rebuilt between calls, so the
-        // triple-buffer size may differ from n_out * n_lis. Clamp to the min
-        // to avoid out-of-bounds writes.
         let n_pairs = n_out
             .saturating_mul(n_lis)
             .min(self.scene.triple_buffers.num_sources());
@@ -340,6 +344,15 @@ impl SpatialAudioEngine {
                     source_id: idx,
                 };
                 if let Ok(res) = self.hybrid_sampler.resolve(&query, &self.material_registry) {
+                    // Snapshot the raw direct-path delay for listener 0 (the
+                    // reference listener for occ/early/rev).  This is used by
+                    // the occlusion node INSTEAD of the crossfaded value,
+                    // because the crossfader interpolates from the initial
+                    // 0.0 over 15 ms, causing ~1700-sample tap-position
+                    // jumps at every block boundary (= 188 Hz click train).
+                    if l == 0 && o < self.scene.direct_delays.len() {
+                        self.scene.direct_delays[o] = res.direct_path.delay_samples;
+                    }
                     let early_reflections: Vec<_> = res
                         .early_reflections
                         .iter()
@@ -488,8 +501,13 @@ impl SpatialAudioEngine {
                 1 => self.scene.combined[o].copy_from(&self.scene.mixed[o]),
                 _ => {
                     // (a) Occlusion / air absorption / direct-path delay.
+                    // Use the raw snapshotted delay (direct_delays[o]) rather
+                    // than the crossfaded coeff.direct_delay_samples so the
+                    // delay-line tap position doesn't jump ~1700 samples per
+                    // block during the 15 ms initial crossfade.
                     self.scene.occ[o].update_occlusion(&coeff.direct_gain, coeff.direct_delay_samples);
-                    self.scene.occ[o].process(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff);
+                    let raw_delay = if o < self.scene.direct_delays.len() { self.scene.direct_delays[o] } else { coeff.direct_delay_samples };
+                    self.scene.occ[o].process_raw(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff, raw_delay);
 
                     if stage >= 3 {
                         // (b) Early reflections.
@@ -601,6 +619,8 @@ impl SpatialAudioEngine {
             .iter()
             .map(|l| layout_positions(&physical_to_speaker_layout(&l.physical_layout)))
             .collect();
+        // Direct-path delays: pre-allocated, written by update_scene_spatial.
+        let direct_delays = vec![0.0_f32; n_out];
 
         let mono = |count: usize| -> Vec<AudioBuffer> {
             (0..count)
@@ -622,6 +642,7 @@ impl SpatialAudioEngine {
             early,
             rev,
             listener_layouts,
+            direct_delays,
             mixed,
             filtered,
             reflections,
