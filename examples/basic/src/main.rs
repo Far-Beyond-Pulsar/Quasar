@@ -162,14 +162,14 @@ fn setup_audio_engine() -> AudioEngine {
             dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
                 DecoderMode::Vbap { layout: SpeakerLayout::Custom {
                     positions: vec![
-                        [-7.0, 5.5,-12.0], // 0: Left Front Top       — WAV ch 0
-                        [ 7.0, 5.5,-12.0], // 1: Right Front Top      — WAV ch 1
-                        [-7.0, 0.5,-12.0], // 2: Left Front Bottom    — WAV ch 2
-                        [ 7.0, 0.5,-12.0], // 3: Right Front Bottom   — WAV ch 3
-                        [ 0.0, 3.0,-12.0], // 4: Center Front         — WAV ch 4
-                        [-7.0, 2.0, 12.0], // 5: Left Rear (Aux)      — WAV ch 5
-                        [ 7.0, 2.0, 12.0], // 6: Right Rear (Aux)     — WAV ch 6
-                        [ 0.0, 0.3, -7.0], // 7: Subwoofer / LFE      — WAV ch 7
+                        [-7.0, 5.5,-12.0], // 0: Front Left     — WAV ch 0
+                        [ 7.0, 5.5,-12.0], // 1: Front Right    — WAV ch 1
+                        [-7.0, 0.5,-12.0], // 2: Center         — WAV ch 2
+                        [ 7.0, 0.5,-12.0], // 3: Back Left      — WAV ch 3
+                        [ 0.0, 3.0,-12.0], // 4: Back Right     — WAV ch 4
+                        [-7.0, 2.0, 12.0], // 5: Sub            — WAV ch 5
+                        [ 7.0, 2.0, 12.0], // 6: Aux Left       — WAV ch 6
+                        [ 0.0, 0.3, -7.0], // 7: Aux Right      — WAV ch 7
                     ],
                 }}, sr,
             )));
