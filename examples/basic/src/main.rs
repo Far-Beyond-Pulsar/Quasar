@@ -28,6 +28,7 @@ mod v3_demo_common;
 use helio::{
     required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig, Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer, RendererConfig, Scene,
 };
+// (BillboardInstance referenced inline as helio::BillboardInstance)
 use helio_pass_perf_overlay::PerfOverlayMode;
 use helio_default_graphs::build_default_graph;
 use v3_demo_common::{box_mesh, make_material, plane_mesh, point_light};
@@ -145,6 +146,23 @@ fn setup_quasar_audio() -> QuasarAudioDemo {
                 layout: quasar_dsp::master_decoder::SpeakerLayout::Stereo,
             }, 48000.),
     }
+}
+
+/// Generate a simple 16x16 white speaker icon as RGBA pixel data.
+fn generate_speaker_icon() -> (Vec<u8>, u32, u32) {
+    let w = 32u32; let h = 32u32;
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h { for x in 0..w {
+        let cx = x as i32 - 16; let cy = y as i32 - 16;
+        let in_cabinet = cx >= -8 && cx <= -3 && cy >= -8 && cy <= 8;
+        let in_cone = cx >= -2 && cx <= 8 && cy.abs() <= (10 - cx);
+        let in_grill = cx == -3 && cy >= -6 && cy <= 6 && cy % 3 == 0;
+        let lit = in_cabinet || in_cone || in_grill;
+        if lit { let idx = ((y * w + x) * 4) as usize;
+            pixels[idx]=255; pixels[idx+1]=255; pixels[idx+2]=255; pixels[idx+3]=255;
+        }
+    }}
+    (pixels, w, h)
 }
 
 fn hsl_to_rgba(h: f32, s: f32, l: f32, a: f32) -> [f32; 4] {
@@ -304,7 +322,7 @@ impl ApplicationHandler for App {
         let debug_camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Debug Camera Buffer"),
             size: std::mem::size_of::<helio::DebugCameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let cull_stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -318,7 +336,7 @@ impl ApplicationHandler for App {
         let mut renderer = Renderer::new(
             device.clone(), queue.clone(),
             config.surface_format, config.width, config.height, config.render_scale,
-            config, scene, graph, debug_state, debug_camera_buf, cull_stats_buf,
+            config, scene, graph, debug_state, debug_camera_buf.clone(), cull_stats_buf,
         );
         renderer.set_editor_mode(true);
 
@@ -612,6 +630,15 @@ impl ApplicationHandler for App {
         // deferred-light loop. Without this, all 9 glass window lights + environment
         // run full tiled PCF every frame even though they're fixed.
         renderer.auto_bake(BakeConfig::fast("indoor_cathedral"));
+
+        // Replace default billboard sprite with speaker icon
+        if let Some(idx) = renderer.graph_pass_index::<helio_pass_billboard::BillboardPass>() {
+            let (rgba, w, h) = generate_speaker_icon();
+            let custom_pass = helio_pass_billboard::BillboardPass::new_with_sprite_rgba(
+                device.as_ref(), queue.as_ref(), &debug_camera_buf, format, &rgba, w, h,
+            );
+            renderer.replace_graph_pass(idx, Box::new(custom_pass));
+        }
 
         let audio_engine = setup_quasar_audio();
 
@@ -974,6 +1001,17 @@ impl AppState {
         renderer.debug_sphere(listener_pos.into(), 0.2, [0.0, 1.0, 0.3, 1.0], 12);
         let look_dir = (glam::Vec3::ZERO - listener_pos).normalize();
         renderer.debug_cone((listener_pos + look_dir * 0.2).into(), look_dir.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
+
+        // Billboard speaker icons at each source position
+        let billboards: Vec<helio::BillboardInstance> = source_positions.iter().enumerate().map(|(i, &pos)| {
+            let c = hsl_to_rgba(i as f32 / source_positions.len() as f32, 0.9, 0.6, 1.0);
+            helio::BillboardInstance {
+                world_pos: [pos.x, pos.y + 1.2, pos.z, 1.0],
+                scale_flags: [0.5, 0.5, 0.0, 0.0],
+                color: c,
+            }
+        }).collect();
+        renderer.set_billboard_instances(&billboards);
 
         if self.show_rays {
             for (i, &src_pos) in source_positions.iter().enumerate() {

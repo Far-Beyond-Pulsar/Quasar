@@ -13,13 +13,14 @@ quasar-materials = { path = "../../crates/quasar-materials" }
 quasar-dsp = { path = "../../crates/quasar-dsp" }
 quasar-backends = { path = "../../crates/quasar-backends", features = ["cpu-simd"] }
 
-helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d", features = ["bake"] }
-helio-core = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
-libhelio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
-helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
-helio-pass-perf-overlay = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
-helio-pass-debug-overlay = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
-helio-pass-postprocess = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "7d946c10d6b2e4b0f8129b325dc651a698dc0a8d" }
+helio =                    { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/helio", features = ["bake"] }
+helio-core =               { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/helio-core" }
+libhelio =                 { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/libhelio" }
+helio-default-graphs =     { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/helio-default-graphs" }
+helio-pass-perf-overlay =  { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/passes/3d/helio-pass-perf-overlay" }
+helio-pass-debug-overlay = { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/passes/3d/helio-pass-debug-overlay" }
+helio-pass-postprocess = { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/passes/3d/helio-pass-postprocess" }
+helio-pass-billboard = { path = "C:/Users/redst/Documents/GitHub/Pulsar-Native/crates/renderer/helio/crates/passes/3d/helio-pass-billboard" }
 
 wgpu = "30"
 glam = { version = "0.33", features = ["bytemuck"] }
