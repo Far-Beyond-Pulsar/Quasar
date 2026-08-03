@@ -128,17 +128,38 @@ impl AudioNode for MasterSpatialDecoderNode {
                             output.channel_mut(1)[i] = mono * r;
                         }
                     }
-                    _ => {
-                        // Other layouts: route to front L/R for now
+                    SpeakerLayout::Custom { positions } => {
+                        // VBAP-style panning across the user-defined speaker array.
+                        // Reconstruct the source direction from the spatial azimuth/elevation
+                        // (azimuth 0 = straight ahead / -Z, +X = right), then give each
+                        // speaker a gain proportional to how well its position matches that
+                        // direction (measured from the listener origin), with cosine falloff.
+                        let src_dir = [
+                            params.direct_azimuth.sin() * params.direct_elevation.cos(),
+                            params.direct_elevation.sin(),
+                            -params.direct_azimuth.cos() * params.direct_elevation.cos(),
+                        ];
+                        let mut gains = vec![0.0f32; positions.len()];
+                        for (i, p) in positions.iter().enumerate() {
+                            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                            if len <= 1e-6 { continue; }
+                            let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
+                            let d = dot.clamp(-1.0, 1.0);
+                            gains[i] = d.max(0.0).powi(2);
+                        }
+                        let sum: f32 = gains.iter().sum();
+                        if sum > 1e-6 {
+                            for g in gains.iter_mut() { *g /= sum; }
+                        }
+                        let out_chs = output.channels() as usize;
                         for i in 0..num_samples {
                             let mut mono = 0.0;
                             for ch in 0..input.channels() as usize {
                                 mono += input.channel(ch as u16)[i];
                             }
                             mono /= input.channels() as f32;
-                            output.channel_mut(0)[i] = mono;
-                            if output.channels() > 1 {
-                                output.channel_mut(1)[i] = mono;
+                            for (ch, &g) in gains.iter().enumerate().take(out_chs) {
+                                output.channel_mut(ch as u16)[i] = mono * g;
                             }
                         }
                     }
