@@ -155,7 +155,7 @@ struct AudioEngine {
 
 fn setup_audio_engine() -> AudioEngine {
     // Load WAV via hound
-    let reader = hound::WavReader::open("assets/holiday.wav").expect("open WAV");
+    let reader = hound::WavReader::open("assets/8_Channel_ID.wav").expect("open WAV");
     let spec = reader.spec();
     let wav_sr = spec.sample_rate;
     let nch_wav = spec.channels as usize;
