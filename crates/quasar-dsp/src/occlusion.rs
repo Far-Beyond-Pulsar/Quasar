@@ -150,20 +150,20 @@ const FREQ_BAND_WIDTHS: [f32; 8] = [
 ];
 
 impl AudioNode for AirAbsorptionOcclusionNode {
-    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, _params: &SpatialCoefficients) {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &SpatialCoefficients) {
         debug_assert_eq!(input.channels(), self.input_channels);
         debug_assert_eq!(output.channels(), self.output_channels);
         debug_assert_eq!(input.samples(), output.samples());
 
         let num_samples = input.samples() as usize;
+        // Average direct gain across bands for distance/occlusion attenuation
+        let gain = params.direct_gain.mean();
 
         for ch in 0..self.input_channels as usize {
             let in_ch = input.channel(ch as u16);
             let out_ch = output.channel_mut(ch as u16);
 
-            // Process through the delay line with biquad filtering
             for i in 0..num_samples {
-                // Apply 8-band filter cascade for this channel
                 let mut sample = in_ch[i];
                 for band in 0..8 {
                     let idx = ch * 8 + band;
@@ -172,7 +172,7 @@ impl AudioNode for AirAbsorptionOcclusionNode {
                     }
                 }
                 self.delay_line.push(sample);
-                out_ch[i] = self.delay_line.tap(_params.direct_delay_samples);
+                out_ch[i] = self.delay_line.tap(params.direct_delay_samples) * gain;
             }
         }
     }

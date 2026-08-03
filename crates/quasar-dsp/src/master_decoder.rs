@@ -108,8 +108,8 @@ impl AudioNode for MasterSpatialDecoderNode {
                 }
                 let mono = mono_buf.channel(0);
                 let out_interleaved = output.channel_mut(0);
-                let azimuth = params.source_id as f32 * 0.2; // simplified from source position
-                Self::binaural_render(mono, out_interleaved, azimuth, 0.0, self.sample_rate);
+                let azimuth = params.direct_azimuth;
+                Self::binaural_render(mono, out_interleaved, azimuth, params.direct_elevation, self.sample_rate);
             }
             DecoderMode::Vbap { layout } => {
                 // Simple stereo / multi-channel panning
@@ -121,8 +121,9 @@ impl AudioNode for MasterSpatialDecoderNode {
                                 mono += input.channel(ch as u16)[i];
                             }
                             mono /= input.channels() as f32;
-                            let azimuth = params.source_id as f32 * 0.2;
-                            let (l, r) = Self::stereo_pan(azimuth);
+                            // Map azimuth [-π, π] to pan [-1, 1]
+                            let pan = (params.direct_azimuth / std::f32::consts::PI).clamp(-1.0, 1.0);
+                            let (l, r) = Self::stereo_pan(pan);
                             output.channel_mut(0)[i] = mono * l;
                             output.channel_mut(1)[i] = mono * r;
                         }

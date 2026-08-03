@@ -198,10 +198,13 @@ impl FdnReverbNode {
 }
 
 impl AudioNode for FdnReverbNode {
-    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, _params: &SpatialCoefficients) {
+    fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &SpatialCoefficients) {
         debug_assert_eq!(input.channels(), self.input_channels);
         debug_assert_eq!(output.channels(), self.output_channels);
         debug_assert_eq!(input.samples(), output.samples());
+
+        // Apply reverb parameters from spatial coefficients
+        self.update_from_coefficients(params);
 
         let num_samples = input.samples() as usize;
 

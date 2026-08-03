@@ -47,6 +47,7 @@ impl SpatialAudioEngine {
             source_id: 0,
             direct_gain: quasar_core::bands::Band8::splat(1.0),
             direct_delay_samples: 0.0,
+            direct_azimuth: 0.0, direct_elevation: 0.0,
             early_reflections: Vec::new(),
             late_t60: quasar_core::bands::Band8::splat(0.5),
             late_gain_db: 0.0,
@@ -128,10 +129,19 @@ impl SpatialAudioEngine {
                 })
                 .collect();
 
+            // Compute direct-path azimuth/elevation from query geometry
+            let dx = query.source_position[0] - query.listener_position[0];
+            let dy = query.source_position[1] - query.listener_position[1];
+            let dz = query.source_position[2] - query.listener_position[2];
+            let direct_azimuth = dx.atan2(-dz);
+            let direct_elevation = dy.atan2((dx * dx + dz * dz).sqrt());
+
             let coeffs = SpatialCoefficients {
                 source_id: query.source_id,
                 direct_gain: res.direct_path.attenuation,
                 direct_delay_samples: res.direct_path.delay_samples,
+                direct_azimuth,
+                direct_elevation,
                 early_reflections,
                 late_t60: res.late_reverb.t60,
                 late_gain_db: res.late_reverb.late_loudness_db,
@@ -187,3 +197,4 @@ impl SpatialAudioEngine {
         self.dsp_graph.reset_all();
     }
 }
+

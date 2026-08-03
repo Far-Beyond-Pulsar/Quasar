@@ -14,6 +14,10 @@ pub struct SpatialCoefficients {
     pub direct_gain: Band8,
     /// Direct-path fractional delay in samples.
     pub direct_delay_samples: f32,
+    /// Direct-path azimuth in radians (-π = left, 0 = centre, π = right).
+    pub direct_azimuth: f32,
+    /// Direct-path elevation in radians.
+    pub direct_elevation: f32,
     /// Early reflection tap coefficients.
     pub early_reflections: Vec<EarlyReflectionCoeffs>,
     /// Late reverb RT60 per band (seconds).

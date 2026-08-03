@@ -40,6 +40,8 @@ impl EqualPowerCrossfader {
             self.current.source_id = target.source_id;
             self.current.direct_gain = target.direct_gain;
             self.current.direct_delay_samples = target.direct_delay_samples;
+            self.current.direct_azimuth = target.direct_azimuth;
+            self.current.direct_elevation = target.direct_elevation;
             self.current.late_t60 = target.late_t60;
             self.current.late_gain_db = target.late_gain_db;
             self.current.early_reflections = target.early_reflections.clone();
@@ -92,6 +94,11 @@ impl EqualPowerCrossfader {
             // Direct delay
             self.current.direct_delay_samples = gain_cur * self.current.direct_delay_samples
                 + gain_tgt * self.target.direct_delay_samples;
+            // Azimuth / elevation
+            self.current.direct_azimuth = gain_cur * self.current.direct_azimuth
+                + gain_tgt * self.target.direct_azimuth;
+            self.current.direct_elevation = gain_cur * self.current.direct_elevation
+                + gain_tgt * self.target.direct_elevation;
             // Late reverb T60 per band
             for i in 0..8 {
                 self.current.late_t60.0[i] =

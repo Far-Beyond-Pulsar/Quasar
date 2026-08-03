@@ -536,3 +536,4 @@ fn audio_node_graph_process() {
     graph.process(&[&src], &[params], &mut output);
     assert!((output.get(0, 0) - 1.0).abs() < 1e-3);
 }
+

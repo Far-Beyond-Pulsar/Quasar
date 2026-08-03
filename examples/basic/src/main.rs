@@ -41,6 +41,7 @@ use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 use quasar_dsp::late_reverb::FdnReverbNode;
+use quasar_dsp::master_decoder::{DecoderMode, MasterSpatialDecoderNode, SpeakerLayout};
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::node_graph::AudioNode;
 
@@ -106,11 +107,6 @@ struct WavPlayback {
     num_channels: usize,
     read_pos: f64,
     rate_ratio: f64,
-    occ_nodes: Vec<AirAbsorptionOcclusionNode>,
-    reverb: FdnReverbNode,
-    /// Per-source pan [-1, 1] and gain [0, 1], updated by render loop
-    src_pan: [f32; NUM_SOURCES],
-    src_gain: [f32; NUM_SOURCES],
 }
 
 struct AudioEngine {
@@ -122,6 +118,7 @@ struct AudioEngine {
 fn zero_coeffs() -> SpatialCoefficients {
     SpatialCoefficients {
         source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
+                        direct_azimuth: 0.0, direct_elevation: 0.0,
         early_reflections: Vec::new(), late_t60: Band8::splat(0.0), late_gain_db: 0.0, version: 0,
     }
 }
@@ -147,8 +144,31 @@ fn setup_audio_engine() -> AudioEngine {
     let out_ch = out_config.channels() as usize;
     let sr = out_sr as f32;
 
-    // SpatialAudioEngine for coefficient computation (not used for audio graph)
     let mut engine = SpatialAudioEngine::new(NUM_SOURCES, sr, 15.0);
+
+    // Configure the graph: occ(0-3) → rev(4-7) → dec(8-11)
+    {
+        let graph = engine.dsp_graph();
+        for _ in 0..NUM_SOURCES {
+            graph.add_node(Box::new(AirAbsorptionOcclusionNode::new(1, sr, 0.1)));
+        }
+        let mut rev_idxs = [0usize; NUM_SOURCES];
+        let mut dec_idxs = [0usize; NUM_SOURCES];
+        for src in 0..NUM_SOURCES {
+            rev_idxs[src] = graph.add_node(Box::new(FdnReverbNode::new(1, sr)));
+        }
+        for src in 0..NUM_SOURCES {
+            dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
+                DecoderMode::Vbap { layout: SpeakerLayout::Stereo }, sr,
+            )));
+        }
+        for src in 0..NUM_SOURCES {
+            graph.connect_with_source(src, 0, rev_idxs[src], 0, 1.0, src);
+            graph.connect_with_source(rev_idxs[src], 0, dec_idxs[src], 0, 1.0, src);
+        }
+    }
+
+    // Register compute backend
     {
         let mut qs = QScene::new();
         qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], 0));
@@ -163,95 +183,64 @@ fn setup_audio_engine() -> AudioEngine {
     let engine = Arc::new(Mutex::new(engine));
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
-    let occ_nodes = (0..NUM_SOURCES)
-        .map(|_| AirAbsorptionOcclusionNode::new(1, sr, 0.1))
-        .collect();
-
     let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, occ_nodes,
-        reverb: FdnReverbNode::new(2, sr),
-        src_pan: [0.0; NUM_SOURCES],
-        src_gain: [1.0; NUM_SOURCES],
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
     }));
 
+    let eng_cb = engine.clone();
     let state_cb = state.clone();
+    let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
 
     let stream = device.build_output_stream(
         &out_config.config(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let total_frames = data.len() / out_ch;
+            let total_frames = data.len() / out_ch_cb;
             data.fill(0.0);
             if total_frames == 0 { return; }
 
-            let mut st = state_cb.lock().unwrap();
-            let total_raw = st.samples.len();
-            let nch = st.num_channels;
-            let ratio = st.rate_ratio;
+            let mut w = state_cb.lock().unwrap();
+            let total_raw = w.samples.len();
+            let nch = w.num_channels;
+            let ratio = w.rate_ratio;
             let mut remain = total_frames;
             let mut offset = 0;
 
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // 4-source stereo mix via occlusion node
-                let mut l_acc = vec![0.0f32; block];
-                let mut r_acc = vec![0.0f32; block];
-
+                // Per-source input buffers from WAV channels
+                let mut inputs: Vec<AudioBuffer> = Vec::with_capacity(NUM_SOURCES);
                 for src in 0..NUM_SOURCES.min(nch) {
-                    let mut mono_in = AudioBuffer::new(1, block as u16);
-                    {
-                        let ch = mono_in.channel_mut(0);
-                        for i in 0..block {
-                            let pos = st.read_pos + i as f64 * ratio;
-                            let fa = pos.floor() as usize;
-                            let fb = fa + 1;
-                            let frac = (pos - fa as f64) as f32;
-                            let g = |f: usize| -> f32 {
-                                if f < total_raw / nch { st.samples[f * nch + src] } else { 0.0 }
-                            };
-                            ch[i] = g(fa) + (g(fb) - g(fa)) * frac;
-                        }
-                    }
-
-                    let mut occ_out = AudioBuffer::new(1, block as u16);
-                    let zero = SpatialCoefficients {
-                        source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
-                        early_reflections: Vec::new(), late_t60: Band8::splat(0.0),
-                        late_gain_db: 0.0, version: 0,
-                    };
-                    st.occ_nodes[src].process(&mono_in, &mut occ_out, &zero);
-
-                    let pan = st.src_pan[src];
-                    let gain = st.src_gain[src];
-                    let t = (pan + 1.0) * 0.5;
-                    let angle = std::f32::consts::FRAC_PI_2 * t;
-                    let (lg, rg) = (angle.cos(), angle.sin());
-
+                    let mut buf = AudioBuffer::new(1, block as u16);
+                    let ch = buf.channel_mut(0);
                     for i in 0..block {
-                        let s = occ_out.channel(0)[i] * gain;
-                        l_acc[i] += s * lg;
-                        r_acc[i] += s * rg;
+                        let pos = w.read_pos + i as f64 * ratio;
+                        let fa = pos.floor() as usize;
+                        let fb = fa + 1;
+                        let frac = (pos - fa as f64) as f32;
+                        let g = |f: usize| -> f32 {
+                            if f < total_raw / nch { w.samples[f * nch + src] } else { 0.0 }
+                        };
+                        ch[i] = g(fa) + (g(fb) - g(fa)) * frac;
                     }
+                    inputs.push(buf);
                 }
-                st.read_pos += block as f64 * ratio;
+                w.read_pos += block as f64 * ratio;
+                if w.read_pos >= (total_raw / nch) as f64 { w.read_pos = 0.0; }
 
-                // Feed summed stereo through shared reverb
-                let mut rev_out = AudioBuffer::new(2, block as u16);
-                let stereo_buf = AudioBuffer::from_channels(&[&l_acc, &r_acc]);
-                let zero = SpatialCoefficients {
-                    source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
-                    early_reflections: Vec::new(), late_t60: Band8::splat(0.0),
-                    late_gain_db: 0.0, version: 0,
-                };
-                st.reverb.process(&stereo_buf, &mut rev_out, &zero);
+                // Process through Quasar engine: occ→rev→dec graph with per-source params
+                let refs: Vec<&AudioBuffer> = inputs.iter().collect();
+                let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
+                if let Ok(mut e) = eng_cb.lock() { e.process_audio(&refs, &mut out); }
 
                 for i in 0..block {
-                    data[(offset + i) * out_ch] = rev_out.channel(0)[i];
-                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = rev_out.channel(1)[i]; }
+                    let dst = offset + i;
+                    for c in 0..out_ch_cb.min(out.channels() as usize) {
+                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
+                    }
                 }
 
-                if st.read_pos >= (total_raw / nch) as f64 { st.read_pos = 0.0; }
                 remain -= block;
                 offset += block;
             }
@@ -1189,17 +1178,6 @@ impl AppState {
                 });
             }
         }
-        // Compute per-source pan/gain from geometry for audio callback
-        if let Ok(mut st) = self._audio_engine._state.lock() {
-            for (i, &pos) in source_positions.iter().enumerate().take(NUM_SOURCES) {
-                let dir = pos - listener_pos;
-                let dist = dir.length();
-                st.src_gain[i] = (1.0 / (1.0 + dist * 0.1)).min(1.0);
-                let azimuth = dir.x.atan2(-dir.z);
-                st.src_pan[i] = (azimuth / std::f32::consts::FRAC_PI_2).clamp(-1.0, 1.0);
-            }
-        }
-
         renderer.debug_clear();
         for (i, &pos) in source_positions.iter().enumerate() {
             let hue = i as f32 / source_positions.len() as f32;
@@ -1270,6 +1248,7 @@ impl AppState {
         self.queue.present(output);
     }
 }
+
 
 
 
