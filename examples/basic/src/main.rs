@@ -40,6 +40,7 @@ use quasar_audio::SpatialAudioEngine;
 use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
+use quasar_dsp::late_reverb::FdnReverbNode;
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::node_graph::AudioNode;
 
@@ -106,6 +107,7 @@ struct WavPlayback {
     read_pos: f64,
     rate_ratio: f64,
     occ_nodes: Vec<AirAbsorptionOcclusionNode>,
+    reverb: FdnReverbNode,
 }
 
 struct AudioEngine {
@@ -164,6 +166,7 @@ fn setup_audio_engine() -> AudioEngine {
 
     let state = Arc::new(Mutex::new(WavPlayback {
         samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, occ_nodes,
+        reverb: FdnReverbNode::new(2, sr),
     }));
 
     let state_cb = state.clone();
@@ -227,9 +230,19 @@ fn setup_audio_engine() -> AudioEngine {
                 }
                 st.read_pos += block as f64 * ratio;
 
+                // Feed summed stereo through shared reverb
+                let mut rev_out = AudioBuffer::new(2, block as u16);
+                let stereo_buf = AudioBuffer::from_channels(&[&l_acc, &r_acc]);
+                let zero = SpatialCoefficients {
+                    source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
+                    early_reflections: Vec::new(), late_t60: Band8::splat(0.0),
+                    late_gain_db: 0.0, version: 0,
+                };
+                st.reverb.process(&stereo_buf, &mut rev_out, &zero);
+
                 for i in 0..block {
-                    data[(offset + i) * out_ch] = l_acc[i];
-                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = r_acc[i]; }
+                    data[(offset + i) * out_ch] = rev_out.channel(0)[i];
+                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = rev_out.channel(1)[i]; }
                 }
 
                 if st.read_pos >= (total_raw / nch) as f64 { st.read_pos = 0.0; }
