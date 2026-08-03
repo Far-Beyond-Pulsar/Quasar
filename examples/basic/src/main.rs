@@ -107,19 +107,29 @@ const PEW_COUNT: usize = 6;
 
 /// Number of scene outputs / speakers in the cathedral stage.
 const NUM_SPEAKERS: usize = 8;
-/// Single source of truth for the 8 cathedral speaker positions.
-/// index i == WAV channel i: 0 FrontLeft, 1 FrontRight, 2 Center, 3 BackLeft,
-/// 4 BackRight, 5 Sub, 6 AuxLeft, 7 AuxRight.
+/// 8 cathedral speaker positions in STANDARD DEVICE CHANNEL ORDER.
+///
+/// Standard 8-channel audio devices route (FL, FR, C, Sub/LFE, BL, BR, SL, SR).
+/// The old order put the speakers in WAV-channel order (FL, FR, C, BL, BR, Sub,
+/// AuxL, AuxR), which caused a 3-way rotation: BL went to the Sub output, BR
+/// to BL, and Sub to BR.
+///
+/// WAV channels: 0=FL, 1=FR, 2=C, 3=BL, 4=BR, 5=Sub, 6=SL, 7=SR.
+/// CHANNEL_MAP below reconnects each output to the correct WAV channel.
 const SPEAKER_POSITIONS: [glam::Vec3; 8] = [
-    glam::Vec3::new(-7.0, 5.5,-12.0), // 0 Front Left
-    glam::Vec3::new( 7.0, 5.5,-12.0), // 1 Front Right
-    glam::Vec3::new( 0.0, 3.0,-12.0), // 2 Center
-    glam::Vec3::new(-7.0, 2.0, 12.0), // 3 Back Left
-    glam::Vec3::new( 7.0, 2.0, 12.0), // 4 Back Right
-    glam::Vec3::new( 0.0, 0.3, -7.0), // 5 Sub
-    glam::Vec3::new(-7.0, 0.5,-12.0), // 6 Aux Left
-    glam::Vec3::new( 7.0, 0.5,-12.0), // 7 Aux Right
+    glam::Vec3::new(-7.0, 5.5,-12.0), // device 0 — Front Left    ← WAV ch 0
+    glam::Vec3::new( 7.0, 5.5,-12.0), // device 1 — Front Right   ← WAV ch 1
+    glam::Vec3::new( 0.0, 3.0,-12.0), // device 2 — Center        ← WAV ch 2
+    glam::Vec3::new( 0.0, 0.3, -7.0), // device 3 — Sub/LFE       ← WAV ch 5
+    glam::Vec3::new(-7.0, 2.0, 12.0), // device 4 — Back Left     ← WAV ch 3
+    glam::Vec3::new( 7.0, 2.0, 12.0), // device 5 — Back Right    ← WAV ch 4
+    glam::Vec3::new(-7.0, 0.5,-12.0), // device 6 — Side Left     ← WAV ch 6
+    glam::Vec3::new( 7.0, 0.5,-12.0), // device 7 — Side Right    ← WAV ch 7
 ];
+/// Maps device-channel index → WAV-channel index so each physical speaker
+/// plays the correct sweep tone.  Replaces the old 1:1 identity mapping
+/// that assumed the demo's position order matched the device's.
+const CHANNEL_MAP: [u32; 8] = [0, 1, 2, 5, 3, 4, 6, 7];
 
 struct WavPlayback {
     samples: Vec<f32>,
@@ -267,16 +277,17 @@ fn setup_audio_engine() -> AudioEngine {
         })
         .expect("load source");
 
-    // One scene output per cathedral speaker; output i pulls (source, ch i, 0 dB).
-    // Using connect_pull (rather than pre-filled pulls) demonstrates the patch bay.
+    // One scene output per cathedral speaker, in device-channel order.
+    // Use CHANNEL_MAP so the correct WAV channel reaches each physical speaker.
     let mut outputs = [SceneOutputId(0); NUM_SPEAKERS];
-    for (i, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
+    for (dev_ch, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
         let out_id = engine.add_scene_output(SceneOutputConfig::new(
             pos.to_array(),
             quasar_core::scene::Movability::Static,
         ));
-        engine.connect_pull(out_id, ChannelPull::new(source_id, i as u32, 0.0));
-        outputs[i] = out_id;
+        let wav_ch = *CHANNEL_MAP.get(dev_ch).unwrap_or(&(dev_ch as u32));
+        engine.connect_pull(out_id, ChannelPull::new(source_id, wav_ch, 0.0));
+        outputs[dev_ch] = out_id;
     }
 
     // Physical device layout derived from the real output channel count.
