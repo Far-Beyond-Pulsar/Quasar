@@ -19,6 +19,7 @@
 //!   T           — toggle Quasar probe grid overlay
 //!   Y           — toggle Quasar material zone colors
 //!   G           — swap Aux Left/Right channels (live patch-bay remap)
+//!   [ / ]       — master volume down / up (3 dB steps; default +12 dB)
 //!   F2          — toggle performance overlay modes (GPU heatmaps)
 //!   F3          — toggle debug overlay (FPS, timings, texture stats)
 //!   Mouse drag  — look around (click to grab cursor)
@@ -125,6 +126,10 @@ struct WavPlayback {
     num_channels: usize,
     read_pos: f64,
     rate_ratio: f64,
+    /// Presentation-stage makeup gain (dB). The engine models absolute SPL —
+    /// inverse-distance attenuation across this ~30 m cathedral lands ~ −24 dB
+    /// below the source — so the demo applies a master volume on top.
+    master_gain_db: f32,
 }
 
 struct AudioEngine {
@@ -290,7 +295,7 @@ fn setup_audio_engine() -> AudioEngine {
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
     let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 12.0,
     }));
 
     let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));
@@ -314,6 +319,7 @@ fn setup_audio_engine() -> AudioEngine {
             let total_raw = w.samples.len();
             let nch = w.num_channels;
             let ratio = w.rate_ratio;
+            let master_gain = 10.0_f32.powf(w.master_gain_db / 20.0);
             let mut remain = total_frames;
             let mut offset = 0;
 
@@ -357,7 +363,7 @@ fn setup_audio_engine() -> AudioEngine {
                 for i in 0..block {
                     let dst = offset + i;
                     for c in 0..out_ch_cb.min(out.channels() as usize) {
-                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
+                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i] * master_gain;
                     }
                 }
 
@@ -1106,6 +1112,36 @@ impl ApplicationHandler for App {
                 }
                 state.aux_swapped = !state.aux_swapped;
                 println!("[audio] aux channels swapped = {}", state.aux_swapped);
+            }
+
+            // [ / ]: master volume down / up (3 dB steps).
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::BracketLeft),
+                        ..
+                    },
+                ..
+            } => {
+                if let Ok(mut w) = state._audio_engine._state.lock() {
+                    w.master_gain_db = (w.master_gain_db - 3.0).max(-60.0);
+                    println!("[audio] master gain = {} dB", w.master_gain_db);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::BracketRight),
+                        ..
+                    },
+                ..
+            } => {
+                if let Ok(mut w) = state._audio_engine._state.lock() {
+                    w.master_gain_db = (w.master_gain_db + 3.0).min(24.0);
+                    println!("[audio] master gain = {} dB", w.master_gain_db);
+                }
             }
 
             WindowEvent::KeyboardInput {
