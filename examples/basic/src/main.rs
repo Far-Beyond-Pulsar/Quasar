@@ -215,11 +215,12 @@ fn setup_audio_engine() -> AudioEngine {
     // Baked probe grid covering the whole navigable cathedral so HybridBlend
     // late reverb is probe-driven everywhere the camera goes. T60 ramps from
     // ~7 s near the altar (z = -28) to ~4.2 s at the entrance (z = +28).
-    // Row-major probe order: x outer, y middle, z inner (matches cell indexing).
+    // Probe order must match grid cell indexing (z*sy*sx + y*sx + x): z outer,
+    // y middle, x inner. Any other order scrambles which t60 is sampled where.
     let mut probes = Vec::with_capacity(5 * 5 * 9);
-    for x in 0..5 {
+    for z in 0..9 {
         for y in 0..5 {
-            for z in 0..9 {
+            for x in 0..5 {
                 let position = [
                     -12.0 + x as f32 * 6.0,
                     0.0 + y as f32 * 4.0,
