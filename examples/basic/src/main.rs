@@ -18,6 +18,7 @@
 //!   R           — toggle Quasar ray visualization
 //!   T           — toggle Quasar probe grid overlay
 //!   Y           — toggle Quasar material zone colors
+//!   G           — swap Aux Left/Right channels (live patch-bay remap)
 //!   F2          — toggle performance overlay modes (GPU heatmaps)
 //!   F3          — toggle debug overlay (FPS, timings, texture stats)
 //!   Mouse drag  — look around (click to grab cursor)
@@ -35,15 +36,18 @@ use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use quasar_core::bands::Band8;
-use quasar_core::param_exchange::SpatialCoefficients;
+use quasar_core::hybrid::HybridSamplingStrategy;
+use quasar_core::probe_grid::{AcousticProbe, AcousticProbeGrid};
+use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
+use quasar_core::scene_output::{
+    ChannelPull, ListenerConfig, ListenerId, PhysicalOutputLayout, SceneOutputConfig,
+    SceneOutputId, SourceConfig, SourceId,
+};
 use quasar_audio::SpatialAudioEngine;
 use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
-use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
-use quasar_dsp::late_reverb::FdnReverbNode;
-use quasar_dsp::master_decoder::{DecoderMode, MasterSpatialDecoderNode, SpeakerLayout};
-use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
-use quasar_dsp::node_graph::AudioNode;
+use quasar_materials::instance::AcousticMaterialInstance;
+use quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
 
 use std::io::{self, BufRead};
 use std::sync::mpsc::Receiver;
@@ -100,7 +104,21 @@ const PEW_COUNT: usize = 6;
 
 // ── Quasar spatial audio engine (playback + spatial) ──────────────────────
 
-const NUM_SOURCES: usize = 8;
+/// Number of scene outputs / speakers in the cathedral stage.
+const NUM_SPEAKERS: usize = 8;
+/// Single source of truth for the 8 cathedral speaker positions.
+/// index i == WAV channel i: 0 FrontLeft, 1 FrontRight, 2 Center, 3 BackLeft,
+/// 4 BackRight, 5 Sub, 6 AuxLeft, 7 AuxRight.
+const SPEAKER_POSITIONS: [glam::Vec3; 8] = [
+    glam::Vec3::new(-7.0, 5.5,-12.0), // 0 Front Left
+    glam::Vec3::new( 7.0, 5.5,-12.0), // 1 Front Right
+    glam::Vec3::new( 0.0, 3.0,-12.0), // 2 Center
+    glam::Vec3::new(-7.0, 2.0, 12.0), // 3 Back Left
+    glam::Vec3::new( 7.0, 2.0, 12.0), // 4 Back Right
+    glam::Vec3::new( 0.0, 0.3, -7.0), // 5 Sub
+    glam::Vec3::new(-7.0, 0.5,-12.0), // 6 Aux Left
+    glam::Vec3::new( 7.0, 0.5,-12.0), // 7 Aux Right
+];
 
 struct WavPlayback {
     samples: Vec<f32>,
@@ -113,15 +131,10 @@ struct AudioEngine {
     engine: Arc<Mutex<SpatialAudioEngine>>,
     _state: Arc<Mutex<WavPlayback>>,
     _stream: cpal::Stream,
-    levels: Arc<Mutex<[f32; NUM_SOURCES]>>,
-}
-
-fn zero_coeffs() -> SpatialCoefficients {
-    SpatialCoefficients {
-        source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
-                        direct_azimuth: 0.0, direct_elevation: 0.0,
-        early_reflections: Vec::new(), late_t60: Band8::splat(0.0), late_gain_db: 0.0, version: 0,
-    }
+    levels: Arc<Mutex<[f32; NUM_SPEAKERS]>>,
+    source_id: SourceId,
+    outputs: [SceneOutputId; NUM_SPEAKERS],
+    listener_id: ListenerId,
 }
 
 fn setup_audio_engine() -> AudioEngine {
@@ -145,53 +158,133 @@ fn setup_audio_engine() -> AudioEngine {
     let out_ch = out_config.channels() as usize;
     let sr = out_sr as f32;
 
-    let mut engine = SpatialAudioEngine::new(NUM_SOURCES, sr, 15.0);
+    // Scene-pipeline engine: the demo no longer uses the legacy per-WAV-channel
+    // graph (occ → rev → dec). One multi-channel Source is loaded, positioned
+    // SceneOutputs pull their content via ChannelPulls, and the engine renders
+    // onto one Listener whose physical layout matches the real output device.
+    let mut engine = SpatialAudioEngine::new(0, sr, 15.0);
 
-    // Configure the graph: occ(0-3) → rev(4-7) → dec(8-11)
-    {
-        let graph = engine.dsp_graph();
-        for _ in 0..NUM_SOURCES {
-            graph.add_node(Box::new(AirAbsorptionOcclusionNode::new(1, sr, 0.1)));
-        }
-        let mut rev_idxs = [0usize; NUM_SOURCES];
-        let mut dec_idxs = [0usize; NUM_SOURCES];
-        for src in 0..NUM_SOURCES {
-            rev_idxs[src] = graph.add_node(Box::new(FdnReverbNode::new(1, sr)));
-        }
-        for src in 0..NUM_SOURCES {
-            dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
-                DecoderMode::Vbap { layout: SpeakerLayout::Custom {
-                    positions: vec![
-                        [-7.0, 5.5,-12.0], // 0: Front Left     — WAV ch 0
-                        [ 7.0, 5.5,-12.0], // 1: Front Right    — WAV ch 1
-                        [ 0.0, 3.0,-12.0], // 2: Center         — WAV ch 2
-                        [-7.0, 2.0, 12.0], // 3: Back Left      — WAV ch 3
-                        [ 7.0, 2.0, 12.0], // 4: Back Right     — WAV ch 4
-                        [ 0.0, 0.3, -7.0], // 5: Sub            — WAV ch 5
-                        [-7.0, 0.5,-12.0], // 6: Aux Left       — WAV ch 6
-                        [ 7.0, 0.5,-12.0], // 7: Aux Right      — WAV ch 7
-                    ],
-                }}, sr,
-            )));
-        }
-        for src in 0..NUM_SOURCES {
-            graph.connect_with_source(src, 0, rev_idxs[src], 0, 1.0, src);
-            graph.connect_with_source(rev_idxs[src], 0, dec_idxs[src], 0, 1.0, src);
+    // Acoustic materials drive occlusion filtering and reflections. Polished
+    // stone floor (low absorption 0.15), rough stone walls + columns (0.35).
+    // Registered BEFORE the backend is created so mesh handles are valid.
+    engine.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
+    let floor_mat = engine.materials().add_instance(AcousticMaterialInstance::new(
+        TABULAR_MODEL_ID,
+        Tabular8BandEvaluator::create_params(Band8::splat(0.15), Band8::zeros(), Band8::zeros()),
+    ));
+    let wall_mat = engine.materials().add_instance(AcousticMaterialInstance::new(
+        TABULAR_MODEL_ID,
+        Tabular8BandEvaluator::create_params(Band8::splat(0.35), Band8::zeros(), Band8::zeros()),
+    ));
+
+    // Acoustic proxy scene: floor, two side walls, plus the 4 nave columns so
+    // occluding a speaker behind a column is demonstrable (columns are 0.65 × 20
+    // × 0.65 acoustic boxes at x = ±5.5, z = -22 / +18).
+    let mut qs = QScene::new();
+    qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], floor_mat));
+    qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
+    qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
+    for (i, &cz) in COLUMN_Z.iter().enumerate() {
+        for (j, &cx) in [-5.5_f32, 5.5].iter().enumerate() {
+            qs.add_mesh(QMesh::new(
+                4 + (i * 2 + j) as u64,
+                vec![
+                    [cx - 0.325, 0.0, cz - 0.325],
+                    [cx + 0.325, 0.0, cz - 0.325],
+                    [cx + 0.325, 0.0, cz + 0.325],
+                    [cx - 0.325, 0.0, cz + 0.325],
+                    [cx - 0.325, 20.0, cz - 0.325],
+                    [cx + 0.325, 20.0, cz - 0.325],
+                    [cx + 0.325, 20.0, cz + 0.325],
+                    [cx - 0.325, 20.0, cz + 0.325],
+                ],
+                vec![
+                    0,1,2, 0,2,3, 4,6,5, 4,7,6, 0,4,5, 0,5,1,
+                    2,6,7, 2,7,3, 0,3,7, 0,7,4, 1,5,6, 1,6,2,
+                ],
+                wall_mat,
+            ));
         }
     }
+    let cfg = CpuSimdConfig {
+        max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
+        speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
+    };
+    engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
 
-    // Register compute backend
-    {
-        let mut qs = QScene::new();
-        qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], 0));
-        qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
-        qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
-        let cfg = CpuSimdConfig {
-            max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
-            speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
-        };
-        engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
+    // Baked probe grid covering the whole navigable cathedral so HybridBlend
+    // late reverb is probe-driven everywhere the camera goes. T60 ramps from
+    // ~7 s near the altar (z = -28) to ~4.2 s at the entrance (z = +28).
+    // Row-major probe order: x outer, y middle, z inner (matches cell indexing).
+    let mut probes = Vec::with_capacity(5 * 5 * 9);
+    for x in 0..5 {
+        for y in 0..5 {
+            for z in 0..9 {
+                let position = [
+                    -12.0 + x as f32 * 6.0,
+                    0.0 + y as f32 * 4.0,
+                    -28.0 + z as f32 * 7.0,
+                ];
+                let f = ((-position[2] + 28.0) / 56.0).clamp(0.0, 1.0);
+                let t60 = 4.2 + 2.8 * f;
+                probes.push(AcousticProbe {
+                    position,
+                    rir_samples: Vec::new(),
+                    sample_rate: 48000,
+                    t60: Band8::splat(t60),
+                    broadband_t60: t60,
+                    early_late_split_secs: 0.05,
+                });
+            }
+        }
     }
+    engine.set_probe_grid(
+        AcousticProbeGrid::new(probes, [-12.0, 0.0, -28.0], [6.0, 4.0, 7.0], [5, 5, 9])
+            .expect("probe grid"),
+    );
+    engine.set_strategy(HybridSamplingStrategy::HybridBlend);
+
+    // Load the 8-channel WAV as ONE source; the patch bay taps individual channels.
+    let source_id = engine
+        .load_source(SourceConfig {
+            path: "assets/8_Channel_ID.wav".to_string(),
+            channels: nch_wav,
+        })
+        .expect("load source");
+
+    // One scene output per cathedral speaker; output i pulls (source, ch i, 0 dB).
+    // Using connect_pull (rather than pre-filled pulls) demonstrates the patch bay.
+    let mut outputs = [SceneOutputId(0); NUM_SPEAKERS];
+    for (i, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
+        let out_id = engine.add_scene_output(SceneOutputConfig::new(
+            pos.to_array(),
+            quasar_core::scene::Movability::Static,
+        ));
+        engine.connect_pull(out_id, ChannelPull::new(source_id, i as u32, 0.0));
+        outputs[i] = out_id;
+    }
+
+    // Physical device layout derived from the real output channel count.
+    let physical_layout = match out_ch {
+        2 => PhysicalOutputLayout::Stereo,
+        4 => PhysicalOutputLayout::Quad,
+        6 => PhysicalOutputLayout::Surround51,
+        8 => PhysicalOutputLayout::Custom { positions: SPEAKER_POSITIONS.map(|p| p.to_array()).to_vec() },
+        n => PhysicalOutputLayout::Custom {
+            positions: (0..n)
+                .map(|i| {
+                    let a = i as f32 * std::f32::consts::TAU / n as f32;
+                    [a.sin(), 0.0, -a.cos()]
+                })
+                .collect(),
+        },
+    };
+    let listener_id = engine.add_listener(ListenerConfig {
+        position: [0.0, 1.6, 0.0],
+        heading: [0.0, 0.0, -1.0],
+        physical_layout,
+    });
+
     let engine = Arc::new(Mutex::new(engine));
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
@@ -199,7 +292,7 @@ fn setup_audio_engine() -> AudioEngine {
         samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
     }));
 
-    let levels = Arc::new(Mutex::new([0.0_f32; NUM_SOURCES]));
+    let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));
     let eng_cb = engine.clone();
     let state_cb = state.clone();
     let levels_cb = levels.clone();
@@ -213,7 +306,10 @@ fn setup_audio_engine() -> AudioEngine {
             data.fill(0.0);
             if total_frames == 0 { return; }
 
-            let mut w = state_cb.lock().unwrap();
+            let mut w = match state_cb.lock() {
+                Ok(guard) => guard,
+                Err(_) => return, // poisoned playback state → keep this block silent
+            };
             let total_raw = w.samples.len();
             let nch = w.num_channels;
             let ratio = w.rate_ratio;
@@ -223,38 +319,39 @@ fn setup_audio_engine() -> AudioEngine {
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // Per-source input buffers from WAV channels
-                let mut inputs: Vec<AudioBuffer> = Vec::with_capacity(NUM_SOURCES);
-                for src in 0..NUM_SOURCES.min(nch) {
-                    let mut buf = AudioBuffer::new(1, block as u16);
-                    let ch = buf.channel_mut(0);
+                // ONE source buffer: deinterleave/resample every WAV channel into
+                // channel k of the source (the patch bay indexes by channel).
+                let mut src = AudioBuffer::new(nch as u16, block as u16);
+                for k in 0..nch.min(NUM_SPEAKERS) {
+                    let ch = src.channel_mut(k as u16);
                     for i in 0..block {
                         let pos = w.read_pos + i as f64 * ratio;
                         let fa = pos.floor() as usize;
                         let fb = fa + 1;
                         let frac = (pos - fa as f64) as f32;
                         let g = |f: usize| -> f32 {
-                            if f < total_raw / nch { w.samples[f * nch + src] } else { 0.0 }
+                            if f < total_raw / nch { w.samples[f * nch + k] } else { 0.0 }
                         };
                         ch[i] = g(fa) + (g(fb) - g(fa)) * frac;
                     }
-                    inputs.push(buf);
                 }
-                // Compute RMS per source for billboard flash feedback
+                // Compute per-channel RMS for billboard flash feedback
                 if let Ok(mut lvls) = levels_cb.lock() {
-                    for src in 0..inputs.len() {
-                        let ch = inputs[src].channel(0);
+                    for k in 0..nch.min(NUM_SPEAKERS) {
+                        let ch = src.channel(k as u16);
                         let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
-                        lvls[src] = (sum_sq / block as f32).sqrt();
+                        lvls[k] = (sum_sq / block as f32).sqrt();
                     }
                 }
                 w.read_pos += block as f64 * ratio;
                 if w.read_pos >= (total_raw / nch) as f64 { w.read_pos = 0.0; }
 
-                // Process through Quasar engine: occ→rev→dec graph with per-source params
-                let refs: Vec<&AudioBuffer> = inputs.iter().collect();
+                // Process through the scene pipeline: patch bay → spatial render →
+                // decode onto the listener's physical layout. Zero allocations.
                 let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
-                if let Ok(mut e) = eng_cb.lock() { e.process_audio(&refs, &mut out); }
+                if let Ok(mut e) = eng_cb.lock() {
+                    e.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
+                }
 
                 for i in 0..block {
                     let dst = offset + i;
@@ -271,7 +368,7 @@ fn setup_audio_engine() -> AudioEngine {
     ).expect("build output stream");
     stream.play().expect("play stream");
 
-    AudioEngine { engine, _state: state, _stream: stream, levels }
+    AudioEngine { engine, _state: state, _stream: stream, levels, source_id, outputs, listener_id }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -431,6 +528,8 @@ struct AppState {
     show_rays: bool,
     show_probes: bool,
     show_material_zones: bool,
+    // Aux Left/Right pulls swapped live via the G key (patch-bay remap).
+    aux_swapped: bool,
 }
 
 impl App {
@@ -879,6 +978,7 @@ impl ApplicationHandler for App {
             show_rays: true,
             show_probes: true,
             show_material_zones: true,
+            aux_swapped: false,
         });
     }
 
@@ -983,6 +1083,28 @@ impl ApplicationHandler for App {
                     }
                 }
                 println!("[debug] debug overlay = {}", state.debug_overlay_enabled);
+            }
+
+            // G: live patch-bay remap — swap Aux Left/Right channel pulls.
+            // Remapping a speaker is a single runtime connect_pull call.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::KeyG),
+                        ..
+                    },
+                ..
+            } => {
+                if let Ok(mut engine) = state._audio_engine.engine.lock() {
+                    let src = state._audio_engine.source_id;
+                    engine.disconnect_pull(state._audio_engine.outputs[6], src, 6);
+                    engine.connect_pull(state._audio_engine.outputs[6], ChannelPull::new(src, 7, 0.0));
+                    engine.disconnect_pull(state._audio_engine.outputs[7], src, 7);
+                    engine.connect_pull(state._audio_engine.outputs[7], ChannelPull::new(src, 6, 0.0));
+                }
+                state.aux_swapped = !state.aux_swapped;
+                println!("[audio] aux channels swapped = {}", state.aux_swapped);
             }
 
             WindowEvent::KeyboardInput {
@@ -1151,39 +1273,25 @@ impl AppState {
         // ── Quasar spatial audio debug overlay ─────────────────────────
         let listener_pos = self.cam_pos;
         // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
-        // Index order matches WAV channel → source_id mapping:
-        //  0: Front Left           — WAV ch 0 / source_id 0
-        //  1: Front Right          — WAV ch 1 / source_id 1
-        //  2: Center               — WAV ch 2 / source_id 2
-        //  3: Back Left            — WAV ch 3 / source_id 3
-        //  4: Back Right           — WAV ch 4 / source_id 4
-        //  5: Sub                  — WAV ch 5 / source_id 5
-        //  6: Aux Left             — WAV ch 6 / source_id 6
-        //  7: Aux Right            — WAV ch 7 / source_id 7
-        let source_positions = [
-            glam::Vec3::new(-7.0, 5.5,-12.0), // 0: Front Left
-            glam::Vec3::new( 7.0, 5.5,-12.0), // 1: Front Right
-            glam::Vec3::new( 0.0, 3.0,-12.0), // 2: Center
-            glam::Vec3::new(-7.0, 2.0, 12.0), // 3: Back Left
-            glam::Vec3::new( 7.0, 2.0, 12.0), // 4: Back Right
-            glam::Vec3::new( 0.0, 0.3, -7.0), // 5: Sub
-            glam::Vec3::new(-7.0, 0.5,-12.0), // 6: Aux Left
-            glam::Vec3::new( 7.0, 0.5,-12.0), // 7: Aux Right
-        ];
+        // Index order matches WAV channel → scene output mapping (SPEAKER_POSITIONS):
+        //  0: Front Left           — WAV ch 0 / scene output 0
+        //  1: Front Right          — WAV ch 1 / scene output 1
+        //  2: Center               — WAV ch 2 / scene output 2
+        //  3: Back Left            — WAV ch 3 / scene output 3
+        //  4: Back Right           — WAV ch 4 / scene output 4
+        //  5: Sub                  — WAV ch 5 / scene output 5
+        //  6: Aux Left             — WAV ch 6 / scene output 6
+        //  7: Aux Right            — WAV ch 7 / scene output 7
 
-        // Update Quasar spatial audio with current positions
-        if let Ok(engine) = self._audio_engine.engine.lock() {
-            for (i, &pos) in source_positions.iter().enumerate().take(NUM_SOURCES) {
-                engine.update_spatial(&quasar_core::backend::SpatialQuery {
-                    source_position: pos.to_array(),
-                    listener_position: listener_pos.to_array(),
-                    source_id: i as u32,
-                });
-            }
+        // Update the scene pipeline: move the listener with the camera, then
+        // resolve every (scene output, listener) pair (compute thread side).
+        if let Ok(mut engine) = self._audio_engine.engine.lock() {
+            engine.update_listener(self._audio_engine.listener_id, self.cam_pos.to_array(), forward.to_array());
+            engine.update_scene_spatial();
         }
         renderer.debug_clear();
-        for (i, &pos) in source_positions.iter().enumerate() {
-            let hue = i as f32 / source_positions.len() as f32;
+        for (i, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
+            let hue = i as f32 / SPEAKER_POSITIONS.len() as f32;
             let color = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
             renderer.debug_sphere(pos.into(), 0.25, color, 16);
             let dir = (glam::Vec3::new(0.0, 1.6, 0.0) - pos).normalize();
@@ -1191,16 +1299,15 @@ impl AppState {
             renderer.debug_circle(pos.into(), 2.0, [color[0], color[1], color[2], 0.12], 24);
         }
         renderer.debug_sphere(listener_pos.into(), 0.2, [0.0, 1.0, 0.3, 1.0], 12);
-        let look_dir = (glam::Vec3::ZERO - listener_pos).normalize();
-        renderer.debug_cone((listener_pos + look_dir * 0.2).into(), look_dir.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
+        renderer.debug_cone((listener_pos + forward * 0.2).into(), forward.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
 
-        // Billboard speaker icons at each source position, flash on audio activity
-        let src_levels = if let Ok(lvls) = self._audio_engine.levels.lock() { *lvls } else { [0.0; NUM_SOURCES] };
-        let billboards: Vec<helio::BillboardInstance> = source_positions.iter().enumerate().map(|(i, &pos)| {
+        // Billboard speaker icons at each speaker position, flash on audio activity
+        let src_levels = if let Ok(lvls) = self._audio_engine.levels.lock() { *lvls } else { [0.0; NUM_SPEAKERS] };
+        let billboards: Vec<helio::BillboardInstance> = SPEAKER_POSITIONS.iter().enumerate().map(|(i, &pos)| {
             let lvl = src_levels[i];
             let active = lvl > 0.005;
             let scale = if active { (0.5 + lvl * 4.0).min(1.5) } else { 0.5 };
-            let mut c = hsl_to_rgba(i as f32 / source_positions.len() as f32, 0.9, 0.6, 1.0);
+            let mut c = hsl_to_rgba(i as f32 / SPEAKER_POSITIONS.len() as f32, 0.9, 0.6, 1.0);
             if active {
                 let boost = (lvl * 6.0).min(1.0);
                 c[0] = c[0] * (1.0 - boost) + boost;
@@ -1216,8 +1323,8 @@ impl AppState {
         renderer.set_billboard_instances(&billboards);
 
         if self.show_rays {
-            for (i, &src_pos) in source_positions.iter().enumerate() {
-                let hue = i as f32 / source_positions.len() as f32;
+            for (i, &src_pos) in SPEAKER_POSITIONS.iter().enumerate() {
+                let hue = i as f32 / SPEAKER_POSITIONS.len() as f32;
                 let base = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
                 renderer.debug_line(src_pos.into(), listener_pos.into(), base);
                 let walls = [glam::Vec3::new(-11.0, 1.0, listener_pos.z * 0.5), glam::Vec3::new(11.0, 1.0, listener_pos.z * 0.3)];
