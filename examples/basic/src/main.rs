@@ -1068,6 +1068,33 @@ impl ApplicationHandler for App {
             }
 
 
+            // 2: print audio timing snapshot
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit2), .. },
+                ..
+            } => {
+                if let Ok(engine) = state._audio_engine.engine.lock() {
+                    let t = engine.timing_snapshot();
+                    let ns_per_us = 1000.0;
+                    println!("[timing] calls={}  max={:.1}μs  avg={:.1}μs  block={:.0}μs  headroom={:.1}μs",
+                        t.call_count,
+                        t.max_ns as f64 / ns_per_us,
+                        t.avg_ns as f64 / ns_per_us,
+                        t.block_us,
+                        t.headroom_us);
+                }
+            }
+            // 3: reset audio timing counters
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit3), .. },
+                ..
+            } => {
+                if let Ok(engine) = state._audio_engine.engine.lock() {
+                    engine.timing.reset();
+                    println!("[timing] counters reset");
+                }
+            }
+
             // F1: cycle debug modes (0=normal → 10=shadow heatmap → 11=light-space depth → 0)
             WindowEvent::KeyboardInput {
                 event:

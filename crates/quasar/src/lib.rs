@@ -10,6 +10,9 @@ pub mod prelude {
     pub use quasar_backends::*;
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery};
 use quasar_core::bands::Band8;
 use quasar_core::error::SpatialAudioError;
@@ -31,6 +34,65 @@ use quasar_dsp::node_graph::{AudioNode, AudioNodeGraph};
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayNode, PatchEntry};
 use quasar_materials::registry::AcousticMaterialRegistry;
+
+/// Atomic instrumentation for `process_audio_scene`.  All fields are relaxed-
+/// ordered atomics written from the audio callback and read from the demo's
+/// UI thread — no lock needed, no data race.
+pub struct AudioTiming {
+    /// Cumulative wall-clock nanoseconds spent in `process_audio_scene`.
+    pub total_ns: AtomicU64,
+    /// Peak single-call duration (nanoseconds).
+    pub max_ns: AtomicU64,
+    /// Number of `process_audio_scene` calls recorded.
+    pub call_count: AtomicU64,
+}
+
+impl AudioTiming {
+    pub const fn new() -> Self {
+        Self {
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            call_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the current counters (for display, avg calculation, etc.).
+    pub fn snapshot(&self, block_size: usize, sample_rate: f32) -> AudioTimingSnapshot {
+        let total = self.total_ns.load(Ordering::Relaxed);
+        let max = self.max_ns.load(Ordering::Relaxed);
+        let count = self.call_count.load(Ordering::Relaxed);
+        let block_us = block_size as f64 / sample_rate as f64 * 1e6;
+        let avg = if count > 0 { total / count } else { 0 };
+        AudioTimingSnapshot {
+            total_ns: total,
+            max_ns: max,
+            avg_ns: avg,
+            call_count: count,
+            block_us,
+            headroom_us: (block_us - max as f64 / 1000.0).max(0.0),
+        }
+    }
+
+    /// Reset all counters.
+    pub fn reset(&self) {
+        self.total_ns.store(0, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
+        self.call_count.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Human-readable timing readout from [`AudioTiming::snapshot`].
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTimingSnapshot {
+    pub total_ns: u64,
+    pub max_ns: u64,
+    pub avg_ns: u64,
+    pub call_count: u64,
+    /// Available wall-clock time per block (μs).
+    pub block_us: f64,
+    /// How much time is left after the worst measured call (μs).
+    pub headroom_us: f64,
+}
 
 /// One triple-buffer slot per (listener × scene output), flat index =
 /// `listener * n_out + output`. Contains the per-pair smoothing crossfaders and
@@ -140,6 +202,16 @@ pub struct SpatialAudioEngine {
     /// Set via the demo (`1` key cycles stages); `process_audio_scene` gates the
     /// per-output spatial chain accordingly.
     pub debug_audio_stage: u8,
+
+    /// Lock-free timing instrumentation for the audio callback.
+    pub timing: AudioTiming,
+}
+
+impl SpatialAudioEngine {
+    /// Snapshot the audio-thread timing counters (for display or logging).
+    pub fn timing_snapshot(&self) -> AudioTimingSnapshot {
+        self.timing.snapshot(DEFAULT_BLOCK_SIZE, self.sample_rate)
+    }
 }
 
 impl SpatialAudioEngine {
@@ -180,6 +252,7 @@ impl SpatialAudioEngine {
             next_scene_output_id: 0,
             next_listener_id: 0,
             debug_audio_stage: 4,
+            timing: AudioTiming::new(),
         }
     }
 
@@ -417,6 +490,7 @@ impl SpatialAudioEngine {
     /// differs from the registered listener count, or if any buffer exceeds
     /// `DEFAULT_BLOCK_SIZE` samples.
     pub fn process_audio_scene(&mut self, sources: &[&AudioBuffer], listener_outputs: &mut [AudioBuffer]) {
+        let _t_start = Instant::now();
         let n_out = self.scene_outputs.len();
         let n_lis = self.listeners.len();
 
@@ -576,6 +650,17 @@ impl SpatialAudioEngine {
         //    complete in ~fade_ms of real time, not per-sample).
         for c in 0..n_pairs {
             self.scene.crossfaders[c].advance(block);
+        }
+
+        // Record timing (relaxed atomics — lock-free, no allocation).
+        let elapsed = _t_start.elapsed();
+        let ns = elapsed.as_nanos() as u64;
+        let t = &self.timing;
+        t.total_ns.fetch_add(ns, Ordering::Relaxed);
+        t.call_count.fetch_add(1, Ordering::Relaxed);
+        let prev = t.max_ns.load(Ordering::Relaxed);
+        if ns > prev {
+            t.max_ns.store(ns, Ordering::Relaxed);
         }
     }
 
