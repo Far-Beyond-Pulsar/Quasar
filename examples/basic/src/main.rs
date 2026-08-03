@@ -108,6 +108,9 @@ struct WavPlayback {
     rate_ratio: f64,
     occ_nodes: Vec<AirAbsorptionOcclusionNode>,
     reverb: FdnReverbNode,
+    /// Per-source pan [-1, 1] and gain [0, 1], updated by render loop
+    src_pan: [f32; NUM_SOURCES],
+    src_gain: [f32; NUM_SOURCES],
 }
 
 struct AudioEngine {
@@ -167,6 +170,8 @@ fn setup_audio_engine() -> AudioEngine {
     let state = Arc::new(Mutex::new(WavPlayback {
         samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, occ_nodes,
         reverb: FdnReverbNode::new(2, sr),
+        src_pan: [0.0; NUM_SOURCES],
+        src_gain: [1.0; NUM_SOURCES],
     }));
 
     let state_cb = state.clone();
@@ -217,13 +222,14 @@ fn setup_audio_engine() -> AudioEngine {
                     };
                     st.occ_nodes[src].process(&mono_in, &mut occ_out, &zero);
 
-                    let pan = (src as f32 / (NUM_SOURCES - 1).max(1) as f32) * 2.0 - 1.0;
+                    let pan = st.src_pan[src];
+                    let gain = st.src_gain[src];
                     let t = (pan + 1.0) * 0.5;
                     let angle = std::f32::consts::FRAC_PI_2 * t;
                     let (lg, rg) = (angle.cos(), angle.sin());
 
                     for i in 0..block {
-                        let s = occ_out.channel(0)[i];
+                        let s = occ_out.channel(0)[i] * gain;
                         l_acc[i] += s * lg;
                         r_acc[i] += s * rg;
                     }
@@ -1181,6 +1187,16 @@ impl AppState {
                     listener_position: listener_pos.to_array(),
                     source_id: i as u32,
                 });
+            }
+        }
+        // Compute per-source pan/gain from geometry for audio callback
+        if let Ok(mut st) = self._audio_engine._state.lock() {
+            for (i, &pos) in source_positions.iter().enumerate().take(NUM_SOURCES) {
+                let dir = pos - listener_pos;
+                let dist = dir.length();
+                st.src_gain[i] = (1.0 / (1.0 + dist * 0.1)).min(1.0);
+                let azimuth = dir.x.atan2(-dir.z);
+                st.src_pan[i] = (azimuth / std::f32::consts::FRAC_PI_2).clamp(-1.0, 1.0);
             }
         }
 
