@@ -186,24 +186,36 @@ fn setup_audio_engine() -> AudioEngine {
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // Match raw passthrough exactly: channel 0→left, channel 1→right
+                // 4-source stereo mix: each source pans across the field
+                let mut l_acc = vec![0.0f32; block];
+                let mut r_acc = vec![0.0f32; block];
+
+                for src in 0..NUM_SOURCES.min(nch) {
+                    // Read this channel with per-sample position advancement
+                    for i in 0..block {
+                        let pos = st.read_pos + i as f64 * ratio;
+                        let fa = pos.floor() as usize;
+                        let fb = fa + 1;
+                        let frac = (pos - fa as f64) as f32;
+                        let g = |f: usize| -> f32 {
+                            if f < total_raw / nch { st.samples[f * nch + src] } else { 0.0 }
+                        };
+                        let s = g(fa) + (g(fb) - g(fa)) * frac;
+
+                        let pan = (src as f32 / (NUM_SOURCES - 1).max(1) as f32) * 2.0 - 1.0;
+                        let t = (pan + 1.0) * 0.5;
+                        let angle = std::f32::consts::FRAC_PI_2 * t;
+                        let (lg, rg) = (angle.cos(), angle.sin());
+
+                        l_acc[i] += s * lg;
+                        r_acc[i] += s * rg;
+                    }
+                }
+                st.read_pos += block as f64 * ratio;
+
                 for i in 0..block {
-                    let pos = st.read_pos;
-                    let fa = pos.floor() as usize;
-                    let fb = fa + 1;
-                    let frac = (pos - fa as f64) as f32;
-
-                    let g = |f: usize, ch: usize| -> f32 {
-                        if f < total_raw / nch { st.samples[f * nch + ch] } else { 0.0 }
-                    };
-
-                    let l = g(fa, 0) + (g(fb, 0) - g(fa, 0)) * frac;
-                    let r = if nch > 1 { g(fa, 1) + (g(fb, 1) - g(fa, 1)) * frac } else { l };
-
-                    data[(offset + i) * out_ch] = l;
-                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = r; }
-
-                    st.read_pos += ratio;
+                    data[(offset + i) * out_ch] = l_acc[i];
+                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = r_acc[i]; }
                 }
 
                 if st.read_pos >= (total_raw / nch) as f64 { st.read_pos = 0.0; }
