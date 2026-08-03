@@ -112,70 +112,71 @@ impl AudioNode for MasterSpatialDecoderNode {
                 Self::binaural_render(mono, out_interleaved, azimuth, params.direct_elevation, self.sample_rate);
             }
             DecoderMode::Vbap { layout } => {
-                // Simple stereo / multi-channel panning
-                match layout {
-                    SpeakerLayout::Stereo => {
-                        for i in 0..num_samples {
-                            let mut mono = 0.0;
-                            for ch in 0..input.channels() as usize {
-                                mono += input.channel(ch as u16)[i];
-                            }
-                            mono /= input.channels() as f32;
-                            // Map azimuth [-π, π] to pan [-1, 1]
-                            let pan = (params.direct_azimuth / std::f32::consts::PI).clamp(-1.0, 1.0);
-                            let (l, r) = Self::stereo_pan(pan);
-                            output.channel_mut(0)[i] = mono * l;
-                            output.channel_mut(1)[i] = mono * r;
-                        }
+                // Resolve every layout to an explicit speaker-position set so all
+                // VBAP layouts share one panner. Named layouts use unit-vector
+                // directions; Custom layouts use the user's world-space positions.
+                let positions: Vec<[f32; 3]> = match layout {
+                    SpeakerLayout::Stereo => vec![
+                        [-0.5, 0.0, -0.866], // FL (-30°)
+                        [ 0.5, 0.0, -0.866], // FR (+30°)
+                    ],
+                    SpeakerLayout::Surround51 => vec![
+                        [-0.5, 0.0, -0.866],      // FL
+                        [ 0.5, 0.0, -0.866],      // FR
+                        [ 0.0, 0.0, -1.0],        // C
+                        [ 0.0, -0.707, -0.707],   // LFE (below center)
+                        [-0.94, 0.0, 0.342],      // SL (-110°)
+                        [ 0.94, 0.0, 0.342],      // SR (+110°)
+                    ],
+                    SpeakerLayout::Surround714 => vec![
+                        [-0.5, 0.0, -0.866],      // FL
+                        [ 0.5, 0.0, -0.866],      // FR
+                        [ 0.0, 0.0, -1.0],        // C
+                        [ 0.0, -0.707, -0.707],   // LFE (below center)
+                        [-0.94, 0.0, 0.342],      // SL (-110°)
+                        [ 0.94, 0.0, 0.342],      // SR (+110°)
+                        [-0.5, 0.0, 0.866],       // BL (-150°)
+                        [ 0.5, 0.0, 0.866],       // BR (+150°)
+                    ],
+                    SpeakerLayout::Quad => vec![
+                        [-0.707, 0.0, -0.707],   // FL (-45°)
+                        [ 0.707, 0.0, -0.707],   // FR (+45°)
+                        [-0.707, 0.0, 0.707],    // BL (-135°)
+                        [ 0.707, 0.0, 0.707],    // BR (+135°)
+                    ],
+                    SpeakerLayout::Custom { positions } => positions.clone(),
+                };
+
+                // Reconstruct the source direction from the spatial azimuth/elevation
+                // (azimuth 0 = straight ahead / -Z, +X = right), then give each speaker
+                // a gain proportional to how well its position matches that direction
+                // (measured from the listener origin), with cosine falloff.
+                let src_dir = [
+                    params.direct_azimuth.sin() * params.direct_elevation.cos(),
+                    params.direct_elevation.sin(),
+                    -params.direct_azimuth.cos() * params.direct_elevation.cos(),
+                ];
+                let mut gains = vec![0.0f32; positions.len()];
+                for (i, p) in positions.iter().enumerate() {
+                    let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                    if len <= 1e-6 { continue; }
+                    let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
+                    let d = dot.clamp(-1.0, 1.0);
+                    gains[i] = d.max(0.0).powi(2);
+                }
+                let sum: f32 = gains.iter().sum();
+                if sum > 1e-6 {
+                    for g in gains.iter_mut() { *g /= sum; }
+                }
+                let out_chs = output.channels() as usize;
+                for i in 0..num_samples {
+                    let mut mono = 0.0;
+                    for ch in 0..input.channels() as usize {
+                        mono += input.channel(ch as u16)[i];
                     }
-                    SpeakerLayout::Custom { positions } => {
-                        // VBAP-style panning across the user-defined speaker array.
-                        // Reconstruct the source direction from the spatial azimuth/elevation
-                        // (azimuth 0 = straight ahead / -Z, +X = right), then give each
-                        // speaker a gain proportional to how well its position matches that
-                        // direction (measured from the listener origin), with cosine falloff.
-                        let src_dir = [
-                            params.direct_azimuth.sin() * params.direct_elevation.cos(),
-                            params.direct_elevation.sin(),
-                            -params.direct_azimuth.cos() * params.direct_elevation.cos(),
-                        ];
-                        let mut gains = vec![0.0f32; positions.len()];
-                        for (i, p) in positions.iter().enumerate() {
-                            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-                            if len <= 1e-6 { continue; }
-                            let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
-                            let d = dot.clamp(-1.0, 1.0);
-                            gains[i] = d.max(0.0).powi(2);
-                        }
-                        let sum: f32 = gains.iter().sum();
-                        if sum > 1e-6 {
-                            for g in gains.iter_mut() { *g /= sum; }
-                        }
-                        let out_chs = output.channels() as usize;
-                        for i in 0..num_samples {
-                            let mut mono = 0.0;
-                            for ch in 0..input.channels() as usize {
-                                mono += input.channel(ch as u16)[i];
-                            }
-                            mono /= input.channels() as f32;
-                            for (ch, &g) in gains.iter().enumerate().take(out_chs) {
-                                output.channel_mut(ch as u16)[i] = mono * g;
-                            }
-                        }
-                    }
-                    _ => {
-                        // Other layouts: route to front L/R for now
-                        for i in 0..num_samples {
-                            let mut mono = 0.0;
-                            for ch in 0..input.channels() as usize {
-                                mono += input.channel(ch as u16)[i];
-                            }
-                            mono /= input.channels() as f32;
-                            output.channel_mut(0)[i] = mono;
-                            if output.channels() > 1 {
-                                output.channel_mut(1)[i] = mono;
-                            }
-                        }
+                    mono /= input.channels() as f32;
+                    for (ch, &g) in gains.iter().enumerate().take(out_chs) {
+                        output.channel_mut(ch as u16)[i] = mono * g;
                     }
                 }
             }
