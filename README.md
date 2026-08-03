@@ -8,6 +8,8 @@ A **high-performance, ultra-modular spatial audio engine** designed for deep int
 
 <img width="2660" height="1154" alt="image" src="https://github.com/user-attachments/assets/cb406346-4bb3-4048-8203-61cdec81b74f" />
 
+https://github.com/user-attachments/assets/b06229b1-589d-4fb2-ba1e-74ac4bad6793
+
 ---
 
 ## Core Concept
