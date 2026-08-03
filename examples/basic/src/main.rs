@@ -62,7 +62,7 @@ use std::collections::HashSet;
 // ── Scene data ────────────────────────────────────────────────────────────────
 
 // Column positions along the nave (Z axis), symmetric at x = ±5.5
-const COLUMN_Z: &[f32] = &[-22.0, -14.0, -6.0, 2.0, 10.0, 18.0];
+const COLUMN_Z: &[f32] = &[-22.0, 18.0];
 
 // Stained glass window lights: (x_wall_side, y, z, r, g, b)
 // Positive x = right-side windows, negative = left-side; placed just inside the wall
