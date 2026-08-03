@@ -9,7 +9,7 @@ use quasar_dsp::late_reverb::FdnReverbNode;
 use quasar_dsp::master_decoder::{DecoderMode, MasterSpatialDecoderNode, SpeakerLayout};
 use quasar_dsp::node_graph::AudioNode;
 use quasar_dsp::node_graph::AudioNodeGraph;
-use quasar_dsp::occlusion::BiquadFilter;
+use quasar_dsp::biquad::BiquadFilter;
 
 // ── audio_buffer_new ──────────────────────────────────────────────────
 

@@ -1035,7 +1035,27 @@ impl ApplicationHandler for App {
                 event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyY), .. },
                 ..
             } => { state.show_material_zones = !state.show_material_zones; },
-            
+
+            // 1: cycle audio DSP stage (0=silence, 1=raw, 2=+occ, 3=+early, 4=full)
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit1), .. },
+                ..
+            } => {
+                if let Ok(mut engine) = state._audio_engine.engine.lock() {
+                    engine.debug_audio_stage = (engine.debug_audio_stage + 1) % 5;
+                    println!("[audio] dsp stage {}: {}",
+                        engine.debug_audio_stage,
+                        match engine.debug_audio_stage {
+                            0 => "silence",
+                            1 => "raw pull only (reduce master vol with [!)",
+                            2 => "+ occlusion",
+                            3 => "+ early reflections",
+                            _ => "full pipeline",
+                        }
+                    );
+                }
+            }
+
 
             // F1: cycle debug modes (0=normal → 10=shadow heatmap → 11=light-space depth → 0)
             WindowEvent::KeyboardInput {

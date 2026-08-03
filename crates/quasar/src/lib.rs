@@ -127,6 +127,12 @@ pub struct SpatialAudioEngine {
     next_scene_output_id: u32,
     /// Next ID to hand out for a freshly added listener.
     next_listener_id: u32,
+
+    /// Debug stage selector for isolating noise sources:
+    ///   0 = silence, 1 = raw pull only, 2 = +occlusion, 3 = +early reflections, 4 = full.
+    /// Set via the demo (`1` key cycles stages); `process_audio_scene` gates the
+    /// per-output spatial chain accordingly.
+    pub debug_audio_stage: u8,
 }
 
 impl SpatialAudioEngine {
@@ -166,6 +172,7 @@ impl SpatialAudioEngine {
             next_source_id: 0,
             next_scene_output_id: 0,
             next_listener_id: 0,
+            debug_audio_stage: 4,
         }
     }
 
@@ -459,6 +466,10 @@ impl SpatialAudioEngine {
 
         // 4. Spatial render ONCE per scene output. Reference listener = 0, so
         //    the flat index for (listener 0, output o) is simply `o`.
+        //
+        //    `debug_audio_stage` gates which spatial stages run:
+        //      0 = silence, 1 = raw mixed only, 2 = +occlusion, 3 = +early, 4 = full.
+        let stage = self.debug_audio_stage.min(4);
         let n_out_proc = n_out
             .min(self.scene.occ.len())
             .min(self.scene.early.len())
@@ -472,35 +483,34 @@ impl SpatialAudioEngine {
         for o in 0..n_out_proc {
             let coeff = self.scene.crossfaders[o].current_coefficients();
 
-            // (a) Occlusion / air absorption / direct-path delay.
-            self.scene.occ[o].update_occlusion(&coeff.direct_gain, coeff.direct_delay_samples);
-            self.scene.occ[o].process(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff);
+            match stage {
+                0 => self.scene.combined[o].clear(),
+                1 => self.scene.combined[o].copy_from(&self.scene.mixed[o]),
+                _ => {
+                    // (a) Occlusion / air absorption / direct-path delay.
+                    self.scene.occ[o].update_occlusion(&coeff.direct_gain, coeff.direct_delay_samples);
+                    self.scene.occ[o].process(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff);
 
-            // (b) Early reflection taps (mono contribution; spatialized in P3).
-            //
-            // The reflections and the late tail both feed off the DIRECT-attenuated
-            // `filtered` signal rather than the raw `mixed` pull: the backend's
-            // reflection gains and `late_gain_db` are expressed relative to the
-            // direct path, and the FDN's passband gain is ~1.7x, so processing the
-            // full-level source here put the reflected energy far above the dry
-            // signal (the -20..-30 dB direct) and clipped once the +18 dB master
-            // was applied. Feeding `filtered` keeps reverb ≈ dry level (the far-field
-            // cathedral reverberant field) and reflections a subtle layer.
-            self.scene.early[o].update_reflections(&coeff.early_reflections);
-            self.scene.early[o].process(&self.scene.filtered[o], &mut self.scene.reflections[o], coeff);
+                    if stage >= 3 {
+                        // (b) Early reflections.
+                        self.scene.early[o].update_reflections(&coeff.early_reflections);
+                        self.scene.early[o].process(&self.scene.filtered[o], &mut self.scene.reflections[o], coeff);
+                    }
 
-            // (c) Late reverb: T60 from the room, dry/wet split derived from the
-            //     resolved late gain. Wet-only tap; the dry path is handled by
-            //     the occlusion stage above.
-            self.scene.rev[o].set_t60(&coeff.late_t60);
-            let wet = db_to_linear(coeff.late_gain_db);
-            self.scene.rev[o].set_mix(wet, 0.0);
-            self.scene.rev[o].process(&self.scene.filtered[o], &mut self.scene.reverb[o], coeff);
+                    if stage >= 4 {
+                        // (c) Late reverb.
+                        self.scene.rev[o].set_t60(&coeff.late_t60);
+                        let wet = db_to_linear(coeff.late_gain_db);
+                        self.scene.rev[o].set_mix(wet, 0.0);
+                        self.scene.rev[o].process(&self.scene.filtered[o], &mut self.scene.reverb[o], coeff);
+                    }
 
-            // (d) Final mono for this output = filtered + reflections + reverb.
-            self.scene.combined[o].copy_from(&self.scene.filtered[o]);
-            self.scene.combined[o].add_from(&self.scene.reflections[o]);
-            self.scene.combined[o].add_from(&self.scene.reverb[o]);
+                    // (d) Final mono for this output.
+                    self.scene.combined[o].copy_from(&self.scene.filtered[o]);
+                    if stage >= 3 { self.scene.combined[o].add_from(&self.scene.reflections[o]); }
+                    if stage >= 4 { self.scene.combined[o].add_from(&self.scene.reverb[o]); }
+                }
+            }
         }
 
         // 5. Per-listener decode: VBAP the rendered mono onto the physical
@@ -578,7 +588,8 @@ impl SpatialAudioEngine {
 
         // Per-output mono DSP chain. Reference listener for occ/early/rev = 0.
         let occ = (0..n_out)
-            .map(|_| AirAbsorptionOcclusionNode::new(1, sr, 0.1))
+            // Cathedral diagonal ≈ 84 m → 84/343 ≈ 245 ms. Use 0.3 s margin.
+            .map(|_| AirAbsorptionOcclusionNode::new(1, sr, 0.3))
             .collect();
         let early = (0..n_out)
             .map(|_| EarlyReflectionDelayNode::new(1, sr, 0.2, 16))

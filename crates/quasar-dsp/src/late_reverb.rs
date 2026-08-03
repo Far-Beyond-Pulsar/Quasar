@@ -2,7 +2,7 @@ use quasar_core::bands::Band8;
 use quasar_core::param_exchange::SpatialCoefficients;
 use crate::audio_buffer::AudioBuffer;
 use crate::fractional_delay::HermiteInterpolatingDelayLine;
-use crate::occlusion::BiquadFilter;
+use crate::biquad::BiquadFilter;
 use crate::node_graph::AudioNode;
 
 /// Implementation of a Feedback Delay Network reverberator.

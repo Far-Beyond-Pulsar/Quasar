@@ -1,4 +1,5 @@
 pub mod audio_buffer;
+pub mod biquad;
 pub mod crossfader;
 pub mod fractional_delay;
 pub mod node_graph;
