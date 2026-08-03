@@ -165,9 +165,9 @@ fn setup_audio_engine() -> AudioEngine {
                         [-7.0, 5.5,-12.0], // 0: Front Left     — WAV ch 0
                         [ 7.0, 5.5,-12.0], // 1: Front Right    — WAV ch 1
                         [ 0.0, 3.0,-12.0], // 2: Center         — WAV ch 2
-                        [-7.0, 2.0, 12.0], // 3: Back Left      — WAV ch 3
-                        [ 7.0, 2.0, 12.0], // 4: Back Right     — WAV ch 4
-                        [ 0.0, 0.3, -7.0], // 5: Sub            — WAV ch 5
+                        [ 7.0, 2.0, 12.0], // 3: Back Left      — WAV ch 3
+                        [-7.0, 2.0, 12.0], // 4: Back Right     — WAV ch 4
+                        [0.0, 0.3, -7.0],  // 5: Sub            — WAV ch 5
                         [-7.0, 0.5,-12.0], // 6: Aux Left       — WAV ch 6
                         [ 7.0, 0.5,-12.0], // 7: Aux Right      — WAV ch 7
                     ],
@@ -1164,9 +1164,9 @@ impl AppState {
             glam::Vec3::new(-7.0, 5.5,-12.0), // 0: Front Left
             glam::Vec3::new( 7.0, 5.5,-12.0), // 1: Front Right
             glam::Vec3::new( 0.0, 3.0,-12.0), // 2: Center
-            glam::Vec3::new(-7.0, 2.0, 12.0), // 3: Back Left
-            glam::Vec3::new( 7.0, 2.0, 12.0), // 4: Back Right
-            glam::Vec3::new( 0.0, 0.3, -7.0), // 5: Sub
+            glam::Vec3::new( 7.0, 2.0, 12.0), // 3: Back Left
+            glam::Vec3::new( 0.0, 0.3, -7.0), // 4: Back Right
+            glam::Vec3::new(-7.0, 2.0, 12.0), // 5: Sub
             glam::Vec3::new(-7.0, 0.5,-12.0), // 6: Aux Left
             glam::Vec3::new( 7.0, 0.5,-12.0), // 7: Aux Right
         ];
