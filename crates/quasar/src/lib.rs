@@ -477,8 +477,17 @@ impl SpatialAudioEngine {
             self.scene.occ[o].process(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff);
 
             // (b) Early reflection taps (mono contribution; spatialized in P3).
+            //
+            // The reflections and the late tail both feed off the DIRECT-attenuated
+            // `filtered` signal rather than the raw `mixed` pull: the backend's
+            // reflection gains and `late_gain_db` are expressed relative to the
+            // direct path, and the FDN's passband gain is ~1.7x, so processing the
+            // full-level source here put the reflected energy far above the dry
+            // signal (the -20..-30 dB direct) and clipped once the +18 dB master
+            // was applied. Feeding `filtered` keeps reverb ≈ dry level (the far-field
+            // cathedral reverberant field) and reflections a subtle layer.
             self.scene.early[o].update_reflections(&coeff.early_reflections);
-            self.scene.early[o].process(&self.scene.mixed[o], &mut self.scene.reflections[o], coeff);
+            self.scene.early[o].process(&self.scene.filtered[o], &mut self.scene.reflections[o], coeff);
 
             // (c) Late reverb: T60 from the room, dry/wet split derived from the
             //     resolved late gain. Wet-only tap; the dry path is handled by
@@ -486,7 +495,7 @@ impl SpatialAudioEngine {
             self.scene.rev[o].set_t60(&coeff.late_t60);
             let wet = db_to_linear(coeff.late_gain_db);
             self.scene.rev[o].set_mix(wet, 0.0);
-            self.scene.rev[o].process(&self.scene.mixed[o], &mut self.scene.reverb[o], coeff);
+            self.scene.rev[o].process(&self.scene.filtered[o], &mut self.scene.reverb[o], coeff);
 
             // (d) Final mono for this output = filtered + reflections + reverb.
             self.scene.combined[o].copy_from(&self.scene.filtered[o]);
