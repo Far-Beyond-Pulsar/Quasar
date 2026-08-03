@@ -11,5 +11,10 @@ description = "Quasar spatial audio engine: core traits, types, triple-buffer pa
 [dependencies]
 glam     = { workspace = true }
 bytemuck = { workspace = true }
-serde    = { workspace = true }
+serde    = { workspace = true, optional = true }
+bincode  = { version = "2", features = ["serde"], optional = true }
 thiserror = { workspace = true }
+
+[features]
+default = []
+nebula-import = ["serde", "bincode"]

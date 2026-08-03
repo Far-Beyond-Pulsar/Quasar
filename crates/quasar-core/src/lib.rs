@@ -7,6 +7,10 @@ pub mod param_exchange;
 pub mod probe_grid;
 pub mod hybrid;
 
+/// Nebula audio import bridge (optional, behind `nebula-import` feature).
+#[cfg(feature = "nebula-import")]
+pub mod nebula_import;
+
 pub use bands::*;
 pub use rays::*;
 pub use backend::*;
