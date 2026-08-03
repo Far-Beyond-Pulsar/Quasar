@@ -162,14 +162,14 @@ fn setup_audio_engine() -> AudioEngine {
             dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
                 DecoderMode::Vbap { layout: SpeakerLayout::Custom {
                     positions: vec![
-                        [-3.0, 4.5, 5.0],  // 0: Left Front Top      — WAV ch 0
-                        [-3.0, 0.5, 5.0],  // 1: Left Front Bottom   — WAV ch 1
-                        [ 3.0, 4.5, 5.0],  // 2: Right Front Top     — WAV ch 2
-                        [ 3.0, 0.5, 5.0],  // 3: Right Front Bottom  — WAV ch 3
-                        [ 0.0, 2.5, 5.0],  // 4: Center Front        — WAV ch 4
-                        [-3.0, 1.6,-5.0],  // 5: Left Rear (Aux)     — WAV ch 5
-                        [ 3.0, 1.6,-5.0],  // 6: Right Rear (Aux)    — WAV ch 6
-                        [ 0.0, 0.3, 0.0],  // 7: Subwoofer / LFE     — WAV ch 7
+                        [-3.0, 4.5,-5.0],  // 0: Left Front Top       — WAV ch 0
+                        [ 3.0, 4.5,-5.0],  // 1: Right Front Top      — WAV ch 1
+                        [-3.0, 0.5,-5.0],  // 2: Left Front Bottom    — WAV ch 2
+                        [ 3.0, 0.5,-5.0],  // 3: Right Front Bottom   — WAV ch 3
+                        [ 0.0, 2.5,-5.0],  // 4: Center Front         — WAV ch 4
+                        [-3.0, 1.6, 5.0],  // 5: Left Rear (Aux)      — WAV ch 5
+                        [ 3.0, 1.6, 5.0],  // 6: Right Rear (Aux)     — WAV ch 6
+                        [ 0.0, 0.3, 0.0],  // 7: Subwoofer / LFE      — WAV ch 7
                     ],
                 }}, sr,
             )));
@@ -1203,22 +1203,23 @@ impl AppState {
         // ── Quasar spatial audio debug overlay ─────────────────────────
         let listener_pos = self.cam_pos;
         // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
-        //  0: Left Front Top      — WAV ch 0 / source_id 0
-        //  1: Left Front Bottom   — WAV ch 1 / source_id 1
-        //  2: Right Front Top     — WAV ch 2 / source_id 2
-        //  3: Right Front Bottom  — WAV ch 3 / source_id 3
-        //  4: Center Front        — WAV ch 4 / source_id 4
-        //  5: Left Rear (Aux)     — WAV ch 5 / source_id 5
-        //  6: Right Rear (Aux)    — WAV ch 6 / source_id 6
-        //  7: Subwoofer / LFE     — WAV ch 7 / source_id 7
+        // Index order matches WAV channel → source_id mapping:
+        //  0: Left Front Top       — WAV ch 0 / source_id 0
+        //  1: Right Front Top      — WAV ch 1 / source_id 1
+        //  2: Left Front Bottom    — WAV ch 2 / source_id 2
+        //  3: Right Front Bottom   — WAV ch 3 / source_id 3
+        //  4: Center Front         — WAV ch 4 / source_id 4
+        //  5: Left Rear (Aux)      — WAV ch 5 / source_id 5
+        //  6: Right Rear (Aux)     — WAV ch 6 / source_id 6
+        //  7: Subwoofer / LFE      — WAV ch 7 / source_id 7
         let source_positions = [
-            glam::Vec3::new(-3.0, 4.5, 5.0),  // 0: Left Front Top
-            glam::Vec3::new(-3.0, 0.5, 5.0),  // 1: Left Front Bottom
-            glam::Vec3::new( 3.0, 4.5, 5.0),  // 2: Right Front Top
-            glam::Vec3::new( 3.0, 0.5, 5.0),  // 3: Right Front Bottom
-            glam::Vec3::new( 0.0, 2.5, 5.0),  // 4: Center Front
-            glam::Vec3::new(-3.0, 1.6,-5.0),  // 5: Left Rear (Aux)
-            glam::Vec3::new( 3.0, 1.6,-5.0),  // 6: Right Rear (Aux)
+            glam::Vec3::new(-3.0, 4.5,-5.0),  // 0: Left Front Top
+            glam::Vec3::new( 3.0, 4.5,-5.0),  // 1: Right Front Top
+            glam::Vec3::new(-3.0, 0.5,-5.0),  // 2: Left Front Bottom
+            glam::Vec3::new( 3.0, 0.5,-5.0),  // 3: Right Front Bottom
+            glam::Vec3::new( 0.0, 2.5,-5.0),  // 4: Center Front
+            glam::Vec3::new(-3.0, 1.6, 5.0),  // 5: Left Rear (Aux)
+            glam::Vec3::new( 3.0, 1.6, 5.0),  // 6: Right Rear (Aux)
             glam::Vec3::new( 0.0, 0.3, 0.0),  // 7: Subwoofer / LFE
         ];
 
