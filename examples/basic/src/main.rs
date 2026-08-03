@@ -24,7 +24,6 @@
 //!   Escape      — release cursor / exit
 
 mod v3_demo_common;
-mod audio_player;
 
 use helio::{
     required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig, Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer, RendererConfig, Scene,
@@ -34,17 +33,13 @@ use helio_pass_perf_overlay::PerfOverlayMode;
 use helio_default_graphs::build_default_graph;
 use v3_demo_common::{box_mesh, make_material, plane_mesh, point_light};
 
-use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use quasar_core::bands::Band8;
-use quasar_core::param_exchange::{ParameterTripleBuffer, SpatialCoefficients};
+use quasar_core::param_exchange::SpatialCoefficients;
+use quasar_audio::SpatialAudioEngine;
+use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
-use quasar_materials::instance::AcousticMaterialInstance;
-use quasar_materials::registry::AcousticMaterialRegistry;
-use quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
-use quasar_dsp::crossfader::EqualPowerCrossfader;
-use quasar_dsp::late_reverb::FdnReverbNode;
-use quasar_dsp::fractional_delay::HermiteInterpolatingDelayLine;
-use quasar_dsp::master_decoder::MasterSpatialDecoderNode;
+use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 
 use std::io::{self, BufRead};
 use std::sync::mpsc::Receiver;
@@ -99,54 +94,121 @@ const PEW_Z_START: f32 = -20.0;
 const PEW_Z_STEP: f32 = 3.2;
 const PEW_COUNT: usize = 6;
 
-// ── Quasar spatial audio demo types ─────────────────────────────────────────
+// ── Quasar spatial audio engine (playback + spatial) ──────────────────────
 
-struct QuasarAudioDemo {
-    _registry: Arc<AcousticMaterialRegistry>,
-    _backend: CpuSimdComputeBackend,
-    _triple_buffer: Arc<ParameterTripleBuffer>,
-    _crossfader: EqualPowerCrossfader,
-    _fdn: FdnReverbNode,
-    _delay: HermiteInterpolatingDelayLine,
-    _decoder: MasterSpatialDecoderNode,
+const NUM_SOURCES: usize = 4;
+
+struct WavPlayback {
+    samples: Vec<f32>,
+    num_channels: usize,
+    read_pos: f64,
+    rate_ratio: f64,
 }
 
-fn setup_quasar_audio() -> QuasarAudioDemo {
-    let registry = Arc::new(AcousticMaterialRegistry::new());
-    registry.register_evaluator(Box::new(Tabular8BandEvaluator::new()));
-    let mats = [
-        ([0.02,0.02,0.03,0.04,0.05,0.06,0.07,0.08], [0.1;8]),
-        ([0.05,0.04,0.06,0.08,0.10,0.12,0.15,0.18], [0.2;8]),
-        ([0.10,0.15,0.30,0.50,0.70,0.75,0.70,0.60], [0.4;8]),
-    ];
-    for &(abs, scat) in &mats {
-        registry.add_instance(AcousticMaterialInstance::new(TABULAR_MODEL_ID,
-            Tabular8BandEvaluator::create_params(Band8::new(abs), Band8::new(scat), Band8::zeros())));
+struct AudioEngine {
+    engine: Arc<Mutex<SpatialAudioEngine>>,
+    _state: Arc<Mutex<WavPlayback>>,
+    _stream: cpal::Stream,
+}
+
+fn zero_coeffs() -> SpatialCoefficients {
+    SpatialCoefficients {
+        source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
+        early_reflections: Vec::new(), late_t60: Band8::splat(0.0), late_gain_db: 0.0, version: 0,
     }
-    let mut qs = QScene::new();
-    qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], 0));
-    qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
-    qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
-    let cfg = CpuSimdConfig { max_reflection_order:3, diffuse_rays_per_query:128, max_reflection_distance:60.,
-        speed_of_sound:343., temperature_celsius:20., humidity_percent:50. };
-    QuasarAudioDemo {
-        _registry: registry,
-        _backend: CpuSimdComputeBackend::new(qs, cfg),
-        _triple_buffer: Arc::new(ParameterTripleBuffer::new(1, SpatialCoefficients {
-            source_id:0, direct_gain: Band8::splat(1.), direct_delay_samples:0., early_reflections:vec![],
-            late_t60: Band8::splat(0.5), late_gain_db:0., version:0,
-        })),
-        _crossfader: EqualPowerCrossfader::new(15., 48000., SpatialCoefficients {
-            source_id:0, direct_gain: Band8::splat(0.), direct_delay_samples:0., early_reflections:vec![],
-            late_t60: Band8::splat(0.5), late_gain_db:-60., version:0,
-        }),
-        _fdn: FdnReverbNode::new(2, 48000.),
-        _delay: HermiteInterpolatingDelayLine::new(0.1, 48000.),
-        _decoder: MasterSpatialDecoderNode::new(
-            quasar_dsp::master_decoder::DecoderMode::Vbap {
-                layout: quasar_dsp::master_decoder::SpeakerLayout::Stereo,
-            }, 48000.),
+}
+
+fn setup_audio_engine() -> AudioEngine {
+    // Load WAV via hound
+    let reader = hound::WavReader::open("assets/8_Channel_ID.wav").expect("open WAV");
+    let spec = reader.spec();
+    let wav_sr = spec.sample_rate;
+    let nch_wav = spec.channels as usize;
+    let samples: Vec<f32> = match spec.bits_per_sample {
+        16 => reader.into_samples::<i16>().filter_map(|s| s.ok()).map(|s| s as f32 / i16::MAX as f32).collect(),
+        24 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / 8_388_608.0).collect(),
+        32 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / i32::MAX as f32).collect(),
+        b => panic!("unsupported bit depth: {b}"),
+    };
+
+    // Set up cpal
+    let host = cpal::default_host();
+    let device = host.default_output_device().expect("audio output device");
+    let out_config = device.default_output_config().expect("output config");
+    let out_sr = out_config.sample_rate().0;
+    let out_ch = out_config.channels() as usize;
+    let sr = out_sr as f32;
+
+    // SpatialAudioEngine for coefficient computation (not used for audio graph)
+    let mut engine = SpatialAudioEngine::new(NUM_SOURCES, sr, 15.0);
+    {
+        let mut qs = QScene::new();
+        qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], 0));
+        qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
+        qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], 1));
+        let cfg = CpuSimdConfig {
+            max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
+            speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
+        };
+        engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
     }
+    let engine = Arc::new(Mutex::new(engine));
+    let rate_ratio = wav_sr as f64 / out_sr as f64;
+
+    let state = Arc::new(Mutex::new(WavPlayback {
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
+    }));
+
+    let state_cb = state.clone();
+    let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
+
+    let stream = device.build_output_stream(
+        &out_config.config(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let total_frames = data.len() / out_ch;
+            data.fill(0.0);
+            if total_frames == 0 { return; }
+
+            let mut st = state_cb.lock().unwrap();
+            let total_raw = st.samples.len();
+            let nch = st.num_channels;
+            let ratio = st.rate_ratio;
+            let mut remain = total_frames;
+            let mut offset = 0;
+
+            while remain > 0 {
+                let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
+
+                // Raw passthrough: first 2 WAV channels → stereo output, no DSP
+                for i in 0..block {
+                    let pos = st.read_pos;
+                    let fa = pos.floor() as usize;
+                    let fb = fa + 1;
+                    let frac = (pos - fa as f64) as f32;
+
+                    let g = |f: usize, ch: usize| -> f32 {
+                        if f < total_raw / nch { st.samples[f * nch + ch] } else { 0.0 }
+                    };
+
+                    let l = g(fa, 0) + (g(fb, 0) - g(fa, 0)) * frac;
+                    let r = if nch > 1 { g(fa, 1) + (g(fb, 1) - g(fa, 1)) * frac } else { l };
+
+                    data[(offset + i) * out_ch] = l;
+                    if out_ch > 1 { data[(offset + i) * out_ch + 1] = r; }
+
+                    st.read_pos += ratio;
+                }
+
+                if st.read_pos >= (total_raw / nch) as f64 { st.read_pos = 0.0; }
+                remain -= block;
+                offset += block;
+            }
+        },
+        err_fn, None,
+    ).expect("build output stream");
+    stream.play().expect("play stream");
+
+    AudioEngine { engine, _state: state, _stream: stream }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -305,8 +367,7 @@ struct AppState {
     start_time: std::time::Instant,
 
     // Quasar spatial audio
-    _audio_engine: QuasarAudioDemo,
-    audio_player: audio_player::QuasarAudioPlayer,
+    _audio_engine: AudioEngine,
     show_rays: bool,
     show_probes: bool,
     show_material_zones: bool,
@@ -712,10 +773,7 @@ impl ApplicationHandler for App {
         // triggered by resize or sky-change (Helio issue #192).
         apply_billboard_replacement(&mut renderer, &device, &queue);
 
-        let audio_engine = setup_quasar_audio();
-
-        let audio_player = audio_player::QuasarAudioPlayer::new("assets/8_Channel_ID.wav")
-            .expect("failed to initialize audio player");
+        let audio_engine = setup_audio_engine();
 
         // Draw initial probe grid
         {
@@ -790,7 +848,6 @@ impl ApplicationHandler for App {
             candle_light_ids,
             start_time: std::time::Instant::now(),
             _audio_engine: audio_engine,
-            audio_player,
             show_rays: true,
             show_probes: true,
             show_material_zones: true,
@@ -834,15 +891,7 @@ impl ApplicationHandler for App {
                 event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyY), .. },
                 ..
             } => { state.show_material_zones = !state.show_material_zones; },
-            // P: toggle WAV playback
-            WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyP), .. },
-                ..
-            } => {
-                let playing = state.audio_player.is_playing();
-                state.audio_player.set_playing(!playing);
-                println!("[audio] playback {}", if !playing { "started" } else { "stopped" });
-            },
+            
 
             // F1: cycle debug modes (0=normal → 10=shadow heatmap → 11=light-space depth → 0)
             WindowEvent::KeyboardInput {
@@ -1078,10 +1127,15 @@ impl AppState {
             glam::Vec3::new(-1.0, 2.5, 3.0), glam::Vec3::new(4.0, 0.3, -3.0),
         ];
 
-        // Update Quasar spatial audio with current source/listener positions
-        {
-            let src_pos: Vec<[f32; 3]> = source_positions.iter().map(|v| v.to_array()).collect();
-            self.audio_player.update_spatial(&src_pos, listener_pos.to_array());
+        // Update Quasar spatial audio with current positions
+        if let Ok(engine) = self._audio_engine.engine.lock() {
+            for (i, &pos) in source_positions.iter().enumerate().take(NUM_SOURCES) {
+                engine.update_spatial(&quasar_core::backend::SpatialQuery {
+                    source_position: pos.to_array(),
+                    listener_position: listener_pos.to_array(),
+                    source_id: i as u32,
+                });
+            }
         }
 
         renderer.debug_clear();

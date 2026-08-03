@@ -30,12 +30,25 @@ impl EqualPowerCrossfader {
         }
     }
 
-    /// Set a new target. Resets the fade counter.
+    /// Set a new target. If the source_id differs, snap immediately.
+    /// Otherwise resets the fade counter for a smooth blend.
     ///
     /// Called from the audio thread after picking up new triple-buffer data.
     pub fn set_target(&mut self, target: SpatialCoefficients) {
-        self.target = target;
-        self.frame_counter = 0;
+        if self.current.source_id != target.source_id {
+            // Source identity changed — instant switch to avoid stale panning
+            self.current.source_id = target.source_id;
+            self.current.direct_gain = target.direct_gain;
+            self.current.direct_delay_samples = target.direct_delay_samples;
+            self.current.late_t60 = target.late_t60;
+            self.current.late_gain_db = target.late_gain_db;
+            self.current.early_reflections = target.early_reflections.clone();
+            self.target = target;
+            self.frame_counter = self.fade_frames; // already at target
+        } else {
+            self.target = target;
+            self.frame_counter = 0;
+        }
     }
 
     /// Returns true if the crossfade is complete (target reached).

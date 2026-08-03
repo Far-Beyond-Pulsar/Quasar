@@ -34,6 +34,7 @@ pub struct SpatialAudioEngine {
     material_registry: AcousticMaterialRegistry,
     dsp_graph: AudioNodeGraph,
     crossfaders: Vec<EqualPowerCrossfader>,
+    last_versions: Vec<u64>,
     num_sources: usize,
     sample_rate: f32,
     fade_ms: f32,
@@ -44,11 +45,11 @@ impl SpatialAudioEngine {
     pub fn new(num_sources: usize, sample_rate: f32, fade_ms: f32) -> Self {
         let initial = SpatialCoefficients {
             source_id: 0,
-            direct_gain: quasar_core::bands::Band8::splat(0.0),
+            direct_gain: quasar_core::bands::Band8::splat(1.0),
             direct_delay_samples: 0.0,
             early_reflections: Vec::new(),
             late_t60: quasar_core::bands::Band8::splat(0.5),
-            late_gain_db: -10.0,
+            late_gain_db: 0.0,
             version: 0,
         };
 
@@ -64,6 +65,7 @@ impl SpatialAudioEngine {
             material_registry: AcousticMaterialRegistry::new(),
             dsp_graph: AudioNodeGraph::new(),
             crossfaders,
+            last_versions: vec![0; num_sources],
             num_sources,
             sample_rate,
             fade_ms,
@@ -163,8 +165,12 @@ impl SpatialAudioEngine {
 
         let params: Vec<SpatialCoefficients> = (0..inputs.len().min(self.num_sources))
             .map(|src| {
-                let latest = unsafe { self.triple_buffers.read(src) };
-                self.crossfaders[src].set_target(latest.clone());
+                let ver = self.triple_buffers.read_version(src);
+                if ver != self.last_versions[src] {
+                    self.last_versions[src] = ver;
+                    let latest = unsafe { self.triple_buffers.read(src) };
+                    self.crossfaders[src].set_target(latest.clone());
+                }
                 self.crossfaders[src].current_coefficients().clone()
             })
             .collect();

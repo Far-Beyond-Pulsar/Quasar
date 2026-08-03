@@ -141,4 +141,10 @@ impl ParameterTripleBuffer {
         let idx = self.read_indices[source_id].load(Ordering::Acquire) as usize;
         &*self.buffers[source_id][idx].get()
     }
+
+    /// Get the version of the readable slot for a given source (no unsafe access).
+    pub fn read_version(&self, source_id: usize) -> u64 {
+        let idx = self.read_indices[source_id].load(Ordering::Acquire) as usize;
+        unsafe { (*self.buffers[source_id][idx].get()).version }
+    }
 }
