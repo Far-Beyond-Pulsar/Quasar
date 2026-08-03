@@ -76,11 +76,19 @@ impl EqualPowerCrossfader {
         &self.target
     }
 
-    /// Advance the crossfade by one frame. Call once per sample block.
+    /// Advance the crossfade by one audio block.
+    ///
+    /// `block_size` is the number of frames in the block being processed. The
+    /// frame counter advances by `block_size` (clamped to `fade_frames`) so a
+    /// `fade_ms` fade converges in ~`fade_ms` of real time regardless of block
+    /// size — a 15 ms fade takes ~2 blocks at 512 frames/block, not ~3.8 s.
     /// Returns the current blend factor.
-    pub fn advance(&mut self) -> f32 {
+    pub fn advance(&mut self, block_size: usize) -> f32 {
         if self.frame_counter < self.fade_frames {
-            self.frame_counter += 1;
+            self.frame_counter = self
+                .frame_counter
+                .saturating_add(block_size as u32)
+                .min(self.fade_frames);
             let t = self.blend_factor();
             let gain_cur = (std::f32::consts::PI * t / 2.0).cos();
             let gain_tgt = (std::f32::consts::PI * t / 2.0).sin();

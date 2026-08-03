@@ -1,3 +1,14 @@
+/// How a scene output's position may change over time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Movability {
+    /// Fixed position; never moves.
+    Static,
+    /// Position changes over time (real-time tracing).
+    Dynamic,
+    /// Large / streaming content whose position may change.
+    Streaming,
+}
+
 /// Simplified runtime geometry for acoustic ray tracing.
 #[derive(Clone, Debug)]
 pub struct AcousticScene {

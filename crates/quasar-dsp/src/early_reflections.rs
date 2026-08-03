@@ -6,14 +6,16 @@ use crate::node_graph::AudioNode;
 /// A single early reflection tap.
 struct ReflectionTap {
     delay_samples: f32,
-    gain_left: f32,
-    gain_right: f32,
+    gain: f32,
 }
 
-/// Multi-tap early reflection processor.
+/// Multi-tap early reflection processor (MONO contribution).
 ///
 /// Feeds a shared delay line with multiple tapped outputs, each representing one
-/// specular early reflection path with its own delay and stereo pan.
+/// specular early reflection path with its own delay. The contribution is mono:
+/// each tap's gain is the average per-band reflection gain and the pan from
+/// `EarlyReflectionCoeffs.azimuth` is ignored. Spatialized (per-direction)
+/// reflections land in P3; this stage feeds the listener's mono mix.
 pub struct EarlyReflectionDelayNode {
     delay_line: HermiteInterpolatingDelayLine,
     taps: Vec<ReflectionTap>,
@@ -34,7 +36,7 @@ impl EarlyReflectionDelayNode {
             delay_line,
             taps,
             input_channels,
-            output_channels: 2,
+            output_channels: 1,
             _sample_rate: sample_rate,
             _max_delay_secs: max_delay_secs,
         }
@@ -44,14 +46,11 @@ impl EarlyReflectionDelayNode {
     pub fn update_reflections(&mut self, reflections: &[EarlyReflectionCoeffs]) {
         self.taps.clear();
         for r in reflections {
-            let pan = r.azimuth / std::f32::consts::PI;
-            let angle = std::f32::consts::FRAC_PI_2 * (pan + 1.0) * 0.5;
-            let (gain_left, gain_right) = (angle.cos(), angle.sin());
+            // Mono early-reflection contribution; pan (azimuth) is spatialized in P3.
             let avg_gain = r.gain.0.iter().sum::<f32>() / 8.0;
             self.taps.push(ReflectionTap {
                 delay_samples: r.delay_samples,
-                gain_left: avg_gain * gain_left,
-                gain_right: avg_gain * gain_right,
+                gain: avg_gain,
             });
         }
     }
@@ -65,9 +64,7 @@ impl AudioNode for EarlyReflectionDelayNode {
 
         let num_samples = input.samples() as usize;
 
-        for ch in 0..self.output_channels as usize {
-            output.channel_mut(ch as u16).fill(0.0);
-        }
+        output.channel_mut(0).fill(0.0);
 
         for i in 0..num_samples {
             let mut mono = 0.0_f32;
@@ -80,8 +77,7 @@ impl AudioNode for EarlyReflectionDelayNode {
 
             for tap in &self.taps {
                 let delayed = self.delay_line.tap(tap.delay_samples);
-                output.channel_mut(0)[i] += delayed * tap.gain_left;
-                output.channel_mut(1)[i] += delayed * tap.gain_right;
+                output.channel_mut(0)[i] += delayed * tap.gain;
             }
         }
     }

@@ -1,5 +1,5 @@
 use quasar_core::param_exchange::SpatialCoefficients;
-use crate::audio_buffer::AudioBuffer;
+use crate::audio_buffer::{AudioBuffer, MAX_AUDIO_CHANNELS};
 use crate::node_graph::AudioNode;
 
 /// Speaker layout for VBAP panning.
@@ -205,4 +205,101 @@ impl AudioNode for MasterSpatialDecoderNode {
     fn output_channels(&self) -> u16 {
         self.output_channels
     }
+}
+
+// ── Zero-alloc VBAP helpers (scene pipeline) ─────────────────────────────
+
+/// Unit-vector speaker directions for the named layouts.
+///
+/// Must stay in lock-step with the inline tables in
+/// [`MasterSpatialDecoderNode`]'s VBAP branch (see `process`).
+const STEREO_POSITIONS: [[f32; 3]; 2] = [
+    [-0.5, 0.0, -0.866], // FL (-30°)
+    [ 0.5, 0.0, -0.866], // FR (+30°)
+];
+
+const SURROUND51_POSITIONS: [[f32; 3]; 6] = [
+    [-0.5, 0.0, -0.866],      // FL
+    [ 0.5, 0.0, -0.866],      // FR
+    [ 0.0, 0.0, -1.0],        // C
+    [ 0.0, -0.707, -0.707],   // LFE (below center)
+    [-0.94, 0.0, 0.342],      // SL (-110°)
+    [ 0.94, 0.0, 0.342],      // SR (+110°)
+];
+
+const SURROUND714_POSITIONS: [[f32; 3]; 8] = [
+    [-0.5, 0.0, -0.866],      // FL
+    [ 0.5, 0.0, -0.866],      // FR
+    [ 0.0, 0.0, -1.0],        // C
+    [ 0.0, -0.707, -0.707],   // LFE (below center)
+    [-0.94, 0.0, 0.342],      // SL (-110°)
+    [ 0.94, 0.0, 0.342],      // SR (+110°)
+    [-0.5, 0.0, 0.866],       // BL (-150°)
+    [ 0.5, 0.0, 0.866],       // BR (+150°)
+];
+
+const QUAD_POSITIONS: [[f32; 3]; 4] = [
+    [-0.707, 0.0, -0.707],   // FL (-45°)
+    [ 0.707, 0.0, -0.707],   // FR (+45°)
+    [-0.707, 0.0, 0.707],    // BL (-135°)
+    [ 0.707, 0.0, 0.707],    // BR (+135°)
+];
+
+/// Resolve a speaker layout to explicit speaker directions (unit vectors).
+///
+/// Named layouts use the exact unit-vector positions already in
+/// [`MasterSpatialDecoderNode`] (Stereo ±30°, 5.1, 7.1, Quad); Custom uses the
+/// caller's positions. API thread only (allocates).
+pub fn layout_positions(layout: &SpeakerLayout) -> Vec<[f32; 3]> {
+    match layout {
+        SpeakerLayout::Stereo => STEREO_POSITIONS.to_vec(),
+        SpeakerLayout::Surround51 => SURROUND51_POSITIONS.to_vec(),
+        SpeakerLayout::Surround714 => SURROUND714_POSITIONS.to_vec(),
+        SpeakerLayout::Quad => QUAD_POSITIONS.to_vec(),
+        SpeakerLayout::Custom { positions } => positions.clone(),
+    }
+}
+
+/// Fill `out[0..n]` with per-speaker VBAP gains for the given resolved speaker
+/// directions. Returns the number of speakers written (`n`).
+///
+/// Zero allocation. Reuses the same math as [`MasterSpatialDecoderNode`]'s VBAP
+/// branch: `src_dir = [sin(az)·cos(el), sin(el), -cos(az)·cos(el)]`; per-speaker
+/// gain = `(dot(src_dir, pos)/len(pos)).max(0)²`, normalized to sum 1.
+///
+/// `positions` comes from [`layout_positions`] (precomputed per listener on the
+/// API thread); `out` is caller-owned stack scratch.
+pub fn vbap_gains(
+    positions: &[[f32; 3]],
+    azimuth: f32,
+    elevation: f32,
+    out: &mut [f32; MAX_AUDIO_CHANNELS],
+) -> usize {
+    let n = positions.len().min(out.len());
+
+    let src_dir = [
+        azimuth.sin() * elevation.cos(),
+        elevation.sin(),
+        -azimuth.cos() * elevation.cos(),
+    ];
+
+    for (i, p) in positions.iter().enumerate().take(n) {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if len <= 1e-6 {
+            out[i] = 0.0;
+            continue;
+        }
+        let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
+        let d = dot.clamp(-1.0, 1.0);
+        out[i] = d.max(0.0).powi(2);
+    }
+
+    let sum: f32 = out.iter().take(n).sum();
+    if sum > 1e-6 {
+        for g in out.iter_mut().take(n) {
+            *g /= sum;
+        }
+    }
+
+    n
 }
