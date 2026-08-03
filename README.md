@@ -19,7 +19,7 @@ A **high-performance, ultra-modular spatial audio engine** designed for deep int
 │  ┌─────────────────────────┐   ┌─────────────────────────┐   ┌────────────────────────┐  │
 │  │    Acoustic Scene DB    │   │  Nebula Probe Grid      │   │  Lock-Free Audio Graph │  │
 │  │  (BVH / Proxy Geometry) │   │  (8-Band RIR / T60 /    │   │  (DSP Nodes / Buses)   │  │
-│  │                        │   │   Reverb Zones)          │   │                        │  │
+│  │                         │   │   Reverb Zones)         │   │                        │  │
 │  └───────────┬─────────────┘   └───────────┬─────────────┘   └───────────┬────────────┘  │
 └──────────────┼─────────────────────────────┼─────────────────────────────┼───────────────┘
                │                             │                             │
