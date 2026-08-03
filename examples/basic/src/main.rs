@@ -162,14 +162,14 @@ fn setup_audio_engine() -> AudioEngine {
             dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
                 DecoderMode::Vbap { layout: SpeakerLayout::Custom {
                     positions: vec![
-                        [-3.0, 4.5,-5.0],  // 0: Left Front Top       — WAV ch 0
-                        [ 3.0, 4.5,-5.0],  // 1: Right Front Top      — WAV ch 1
-                        [-3.0, 0.5,-5.0],  // 2: Left Front Bottom    — WAV ch 2
-                        [ 3.0, 0.5,-5.0],  // 3: Right Front Bottom   — WAV ch 3
-                        [ 0.0, 2.5,-5.0],  // 4: Center Front         — WAV ch 4
-                        [-3.0, 1.6, 5.0],  // 5: Left Rear (Aux)      — WAV ch 5
-                        [ 3.0, 1.6, 5.0],  // 6: Right Rear (Aux)     — WAV ch 6
-                        [ 0.0, 0.3, 0.0],  // 7: Subwoofer / LFE      — WAV ch 7
+                        [-7.0, 5.5,-12.0], // 0: Left Front Top       — WAV ch 0
+                        [ 7.0, 5.5,-12.0], // 1: Right Front Top      — WAV ch 1
+                        [-7.0, 0.5,-12.0], // 2: Left Front Bottom    — WAV ch 2
+                        [ 7.0, 0.5,-12.0], // 3: Right Front Bottom   — WAV ch 3
+                        [ 0.0, 3.0,-12.0], // 4: Center Front         — WAV ch 4
+                        [-7.0, 2.0, 12.0], // 5: Left Rear (Aux)      — WAV ch 5
+                        [ 7.0, 2.0, 12.0], // 6: Right Rear (Aux)     — WAV ch 6
+                        [ 0.0, 0.3, -7.0], // 7: Subwoofer / LFE      — WAV ch 7
                     ],
                 }}, sr,
             )));
@@ -1213,14 +1213,14 @@ impl AppState {
         //  6: Right Rear (Aux)     — WAV ch 6 / source_id 6
         //  7: Subwoofer / LFE      — WAV ch 7 / source_id 7
         let source_positions = [
-            glam::Vec3::new(-3.0, 4.5,-5.0),  // 0: Left Front Top
-            glam::Vec3::new( 3.0, 4.5,-5.0),  // 1: Right Front Top
-            glam::Vec3::new(-3.0, 0.5,-5.0),  // 2: Left Front Bottom
-            glam::Vec3::new( 3.0, 0.5,-5.0),  // 3: Right Front Bottom
-            glam::Vec3::new( 0.0, 2.5,-5.0),  // 4: Center Front
-            glam::Vec3::new(-3.0, 1.6, 5.0),  // 5: Left Rear (Aux)
-            glam::Vec3::new( 3.0, 1.6, 5.0),  // 6: Right Rear (Aux)
-            glam::Vec3::new( 0.0, 0.3, 0.0),  // 7: Subwoofer / LFE
+            glam::Vec3::new(-7.0, 5.5,-12.0), // 0: Left Front Top
+            glam::Vec3::new( 7.0, 5.5,-12.0), // 1: Right Front Top
+            glam::Vec3::new(-7.0, 0.5,-12.0), // 2: Left Front Bottom
+            glam::Vec3::new( 7.0, 0.5,-12.0), // 3: Right Front Bottom
+            glam::Vec3::new( 0.0, 3.0,-12.0), // 4: Center Front
+            glam::Vec3::new(-7.0, 2.0, 12.0), // 5: Left Rear (Aux)
+            glam::Vec3::new( 7.0, 2.0, 12.0), // 6: Right Rear (Aux)
+            glam::Vec3::new( 0.0, 0.3, -7.0), // 7: Subwoofer / LFE
         ];
 
         // Update Quasar spatial audio with current positions
@@ -1240,7 +1240,7 @@ impl AppState {
             renderer.debug_sphere(pos.into(), 0.25, color, 16);
             let dir = (glam::Vec3::new(0.0, 1.6, 0.0) - pos).normalize();
             renderer.debug_cone((pos + dir * 0.3).into(), dir.into(), 1.5, 0.8, [color[0], color[1], color[2], 0.3], 12);
-            renderer.debug_circle(pos.into(), 5.0, [color[0], color[1], color[2], 0.15], 32);
+            renderer.debug_circle(pos.into(), 2.0, [color[0], color[1], color[2], 0.12], 24);
         }
         renderer.debug_sphere(listener_pos.into(), 0.2, [0.0, 1.0, 0.3, 1.0], 12);
         let look_dir = (glam::Vec3::ZERO - listener_pos).normalize();
