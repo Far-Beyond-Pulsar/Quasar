@@ -1313,7 +1313,3 @@ impl AppState {
         self.queue.present(output);
     }
 }
-
-
-
-
