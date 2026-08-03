@@ -129,14 +129,16 @@ impl FdnReverbNode {
     /// Set T60 target per band. Adjusts damping filter coefficients.
     pub fn set_t60(&mut self, t60: &Band8) {
         self.t60 = *t60;
-        // Map average T60 to damping coefficient
+        // Map average T60 to a one-pole lowpass cutoff. Longer rooms decay
+        // darker, so the cutoff drops as T60 grows; it stays well inside the
+        // audible range so the reverb retains highs instead of turning into a
+        // DC smear (the previous pole sat at ~0.99999, i.e. a ~0.1 Hz lowpass
+        // that let the feedback loop accumulate DC and amplify low frequencies).
         let avg_t60 = t60.mean().max(0.1).min(10.0);
-        // Higher T60 → lower damping
-        let damping = (-3.0 / (avg_t60 * self.sample_rate)).exp();
+        let cutoff = (3500.0 / (avg_t60 * 0.5 + 0.25)).clamp(300.0, 5000.0);
+        let alpha = 1.0 - (-2.0 * std::f32::consts::PI * cutoff / self.sample_rate).exp();
         for i in 0..16 {
-            let b0 = 1.0 - damping;
-            let a1 = -damping;
-            self.dampings[i].set_coefficients(b0, 0.0, 0.0, a1, 0.0);
+            self.dampings[i].set_coefficients(alpha, 0.0, 0.0, -(1.0 - alpha), 0.0);
         }
     }
 
