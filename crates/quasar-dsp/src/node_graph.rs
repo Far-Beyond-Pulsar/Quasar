@@ -1,23 +1,9 @@
 use crate::audio_buffer::AudioBuffer;
 
-/// A single audio processing node in the graph.
-///
-/// NEVER allocates during `process()`. All work is done in-place or on pre-allocated buffers.
 pub trait AudioNode: Send {
-    /// Process one block of audio.
-    ///
-    /// `input`: the incoming audio buffer (e.g., from previous node or source).
-    /// `output`: the processed audio buffer.
-    /// `params`: spatial coefficients for this frame.
     fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &quasar_core::param_exchange::SpatialCoefficients);
-
-    /// Reset internal state (clear delay lines, filters, etc.).
     fn reset(&mut self);
-
-    /// Get the number of input channels this node expects.
     fn input_channels(&self) -> u16;
-
-    /// Get the number of output channels this node produces.
     fn output_channels(&self) -> u16;
 }
 
@@ -29,20 +15,17 @@ pub struct AudioConnection {
     pub to_node: usize,
     pub to_channel: u16,
     pub gain: f32,
+    /// Which source's parameters to use when processing the destination node.
+    pub source_id: usize,
 }
 
-/// A graph of audio nodes processed in topological order.
-///
-/// Built at initialization time. NEVER allocates during `process()`.
 pub struct AudioNodeGraph {
     nodes: Vec<Box<dyn AudioNode>>,
     connections: Vec<AudioConnection>,
-    /// Pre-allocated scratch buffers for routing
     scratch: Vec<AudioBuffer>,
 }
 
 impl AudioNodeGraph {
-    /// Create a new empty audio node graph.
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -64,14 +47,28 @@ impl AudioNodeGraph {
         idx
     }
 
-    /// Connect two nodes with gain.
+    /// Connect two nodes with gain and an optional source_id for params.
     pub fn connect(&mut self, from: usize, from_ch: u16, to: usize, to_ch: u16, gain: f32) {
+        self.connect_with_source(from, from_ch, to, to_ch, gain, 0);
+    }
+
+    /// Connect two nodes, specifying which source's params to use.
+    pub fn connect_with_source(
+        &mut self,
+        from: usize,
+        from_ch: u16,
+        to: usize,
+        to_ch: u16,
+        gain: f32,
+        source_id: usize,
+    ) {
         self.connections.push(AudioConnection {
             from_node: from,
             from_channel: from_ch,
             to_node: to,
             to_channel: to_ch,
             gain,
+            source_id,
         });
     }
 
@@ -100,7 +97,7 @@ impl AudioNodeGraph {
 
         let num_sources = inputs.len().min(self.nodes.len());
 
-        // Phase 1: process each source node into its scratch buffer
+        // Phase 1: process each source node with its input and params
         for src_idx in 0..num_sources {
             let input = inputs[src_idx];
             let param = &params[src_idx];
@@ -109,10 +106,9 @@ impl AudioNodeGraph {
             node.process(input, scratch, param);
         }
 
-        // Phase 2: route connections using index-based access (no concurrent borrows)
+        // Phase 2: route connections using per-source params
         let num_connections = self.connections.len();
         if num_connections > 0 {
-            // Snapshot connection count (connections themselves are not modified in process)
             for conn_idx in 0..num_connections {
                 let conn = &self.connections[conn_idx];
                 if conn.from_node < self.nodes.len() && conn.to_node < self.nodes.len() {
@@ -122,10 +118,15 @@ impl AudioNodeGraph {
                     let to_ch = conn.to_channel as usize;
                     let gain = conn.gain;
 
-                    // Build input for the target node: copy from source scratch with gain
+                    // Use the connection's source_id to pick the right params
+                    let conn_params = if conn.source_id < params.len() {
+                        &params[conn.source_id]
+                    } else {
+                        &params[0]
+                    };
+
                     let src_scratch = &self.scratch[from_idx];
 
-                    // Create a temporary input buffer (stack-allocated, no heap alloc)
                     let mut temp = AudioBuffer::new(src_scratch.channels(), src_scratch.samples());
                     if from_ch < src_scratch.channels() as usize {
                         let src_ch_data = src_scratch.channel(from_ch as u16);
@@ -138,16 +139,7 @@ impl AudioNodeGraph {
 
                     let node = &mut *self.nodes[to_idx];
                     let dst_scratch = &mut self.scratch[to_idx];
-                    let empty_params = quasar_core::param_exchange::SpatialCoefficients {
-                        source_id: 0,
-                        direct_gain: quasar_core::bands::Band8::splat(0.0),
-                        direct_delay_samples: 0.0,
-                        early_reflections: Vec::new(),
-                        late_t60: quasar_core::bands::Band8::splat(0.0),
-                        late_gain_db: 0.0,
-                        version: 0,
-                    };
-                    node.process(&temp, dst_scratch, &empty_params);
+                    node.process(&temp, dst_scratch, conn_params);
                 }
             }
         }
@@ -176,12 +168,10 @@ impl AudioNodeGraph {
         }
     }
 
-    /// Number of nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    /// Number of connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
     }

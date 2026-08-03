@@ -1,12 +1,8 @@
-// quasar-audio: Facade crate — re-exports all public API from sub-crates
-// and provides the top-level SpatialAudioEngine.
-
 pub use quasar_core;
 pub use quasar_materials;
 pub use quasar_dsp;
 pub use quasar_backends;
 
-/// High-level convenience alias for the full workspace.
 pub mod prelude {
     pub use quasar_core::*;
     pub use quasar_dsp::*;
@@ -16,39 +12,36 @@ pub mod prelude {
 
 use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery};
 use quasar_core::hybrid::{HybridProbeSampler, HybridSamplingStrategy};
-use quasar_core::param_exchange::{ParameterTripleBuffer, SpatialCoefficients};
+use quasar_core::param_exchange::{
+    EarlyReflectionCoeffs, ParameterTripleBuffer, SpatialCoefficients,
+};
 use quasar_core::probe_grid::AcousticProbeGrid;
 use quasar_dsp::audio_buffer::AudioBuffer;
 use quasar_dsp::crossfader::EqualPowerCrossfader;
 use quasar_dsp::node_graph::AudioNodeGraph;
 use quasar_materials::registry::AcousticMaterialRegistry;
 
-/// Top-level Quasar spatial audio engine.
+/// Top-level Quasar spatial audio engine for multiple sources.
 ///
-/// Owns all subsystems and manages the compute → audio thread data flow.
-/// The *compute thread* (15–30 Hz) calls [`update_spatial`] to query the
-/// backend / probe grid and publish fresh spatial coefficients via the
-/// lock-free triple buffer.  The *audio thread* (48 kHz) calls
-/// [`process_audio`] to read those coefficients, smoothly crossfade
-/// between old and new parameters, and run the DSP node graph.
+/// Manages lock-free handoff of per-source spatial coefficients via
+/// `ParameterTripleBuffer`, per-source crossfaders, and a shared DSP graph.
 ///
-/// NEVER allocates, locks, or blocks on the audio-thread hot path.
+/// **Compute thread** (15–30 Hz): call [`update_spatial`] for each source.
+/// **Audio thread** (48 kHz): call [`process_audio`] with one input per source.
 pub struct SpatialAudioEngine {
     hybrid_sampler: HybridProbeSampler,
-    triple_buffer: ParameterTripleBuffer,
+    triple_buffers: ParameterTripleBuffer,
     material_registry: AcousticMaterialRegistry,
     dsp_graph: AudioNodeGraph,
-    crossfader: EqualPowerCrossfader,
+    crossfaders: Vec<EqualPowerCrossfader>,
+    num_sources: usize,
     sample_rate: f32,
     fade_ms: f32,
 }
 
 impl SpatialAudioEngine {
-    /// Create a new engine with default configuration.
-    ///
-    /// `sample_rate` — audio sample rate in Hz (e.g. 48 000.0).
-    /// `fade_ms`    — crossfade duration in milliseconds (typically 10–20 ms).
-    pub fn new(sample_rate: f32, fade_ms: f32) -> Self {
+    /// Create a new engine with the given number of sources.
+    pub fn new(num_sources: usize, sample_rate: f32, fade_ms: f32) -> Self {
         let initial = SpatialCoefficients {
             source_id: 0,
             direct_gain: quasar_core::bands::Band8::splat(0.0),
@@ -59,12 +52,19 @@ impl SpatialAudioEngine {
             version: 0,
         };
 
+        let triple_buffers = ParameterTripleBuffer::new(num_sources, initial.clone());
+
+        let crossfaders = (0..num_sources)
+            .map(|_| EqualPowerCrossfader::new(fade_ms, sample_rate, initial.clone()))
+            .collect();
+
         Self {
             hybrid_sampler: HybridProbeSampler::new(HybridSamplingStrategy::RealTimeOnly),
-            triple_buffer: ParameterTripleBuffer::new(initial.clone()),
+            triple_buffers,
             material_registry: AcousticMaterialRegistry::new(),
             dsp_graph: AudioNodeGraph::new(),
-            crossfader: EqualPowerCrossfader::new(fade_ms, sample_rate, initial),
+            crossfaders,
+            num_sources,
             sample_rate,
             fade_ms,
         }
@@ -100,57 +100,56 @@ impl SpatialAudioEngine {
         &mut self.dsp_graph
     }
 
-    /// Run a spatial update cycle (called from the compute thread at 15–30 Hz).
+    /// Number of sources configured.
+    pub fn num_sources(&self) -> usize {
+        self.num_sources
+    }
+
+    /// Run a spatial update cycle for one source (called from compute thread).
     ///
-    /// Resolves every [`SpatialQuery`] through the hybrid sampler (baked probe
-    /// grid, real-time ray tracing, or a blend of both) and publishes the
-    /// resulting [`SpatialCoefficients`] to the lock-free triple buffer so the
-    /// audio thread can pick them up on its next [`process_audio`] call.
-    pub fn update_spatial(
-        &self,
-        queries: &[SpatialQuery],
-    ) {
-        for query in queries {
-            let result = self
-                .hybrid_sampler
-                .resolve(query, &self.material_registry);
+    /// Resolves `query` through the hybrid sampler and publishes the resulting
+    /// [`SpatialCoefficients`] to that source's slot in the lock-free triple buffer.
+    pub fn update_spatial(&self, query: &SpatialQuery) {
+        let result = self
+            .hybrid_sampler
+            .resolve(query, &self.material_registry);
 
-            if let Ok(res) = result {
-                let early_reflections: Vec<_> = res
-                    .early_reflections
-                    .iter()
-                    .map(|er| quasar_core::param_exchange::EarlyReflectionCoeffs {
-                        azimuth: 0.0,
-                        elevation: 0.0,
-                        delay_samples: er.delay_samples,
-                        gain: er.gain,
-                    })
-                    .collect();
+        if let Ok(res) = result {
+            let early_reflections: Vec<_> = res
+                .early_reflections
+                .iter()
+                .map(|er| EarlyReflectionCoeffs {
+                    azimuth: 0.0,
+                    elevation: 0.0,
+                    delay_samples: er.delay_samples,
+                    gain: er.gain,
+                })
+                .collect();
 
-                let coeffs = SpatialCoefficients {
-                    source_id: query.source_id,
-                    direct_gain: res.direct_path.attenuation,
-                    direct_delay_samples: res.direct_path.delay_samples,
-                    early_reflections,
-                    late_t60: res.late_reverb.t60,
-                    late_gain_db: res.late_reverb.late_loudness_db,
-                    version: 0,
-                };
+            let coeffs = SpatialCoefficients {
+                source_id: query.source_id,
+                direct_gain: res.direct_path.attenuation,
+                direct_delay_samples: res.direct_path.delay_samples,
+                early_reflections,
+                late_t60: res.late_reverb.t60,
+                late_gain_db: res.late_reverb.late_loudness_db,
+                version: 0,
+            };
 
-                // SAFETY: called from the compute thread (single writer).
+            let src = query.source_id as usize;
+            if src < self.triple_buffers.num_sources() {
                 unsafe {
-                    *self.triple_buffer.begin_write() = coeffs;
+                    *self.triple_buffers.begin_write(src) = coeffs;
                 }
-                self.triple_buffer.end_write();
+                self.triple_buffers.end_write(src);
             }
         }
     }
 
-    /// Process one audio block (called from the audio thread at 48 kHz).
+    /// Process one audio block (called from the audio thread).
     ///
-    /// Reads the latest [`SpatialCoefficients`] from the triple buffer,
-    /// applies an equal-power crossfade, then runs the entire audio node
-    /// graph to produce the final output.
+    /// `inputs`: one [`AudioBuffer`] per source.
+    /// `output`: final mixed output buffer.
     ///
     /// # Safety
     ///
@@ -160,26 +159,24 @@ impl SpatialAudioEngine {
         inputs: &[&AudioBuffer],
         output: &mut AudioBuffer,
     ) {
-        // Pick up the latest published coefficients.
-        self.triple_buffer.update();
-        // SAFETY: called from the audio thread (single reader).
-        let latest = unsafe { self.triple_buffer.read() };
+        self.triple_buffers.update();
 
-        // Feed the new target into the crossfader so it begins blending.
-        self.crossfader.set_target(latest.clone());
-
-        // Build the param slice for the DSP graph (one param set per input).
-        let params: Vec<SpatialCoefficients> = (0..inputs.len())
-            .map(|_| self.crossfader.current_coefficients().clone())
+        let params: Vec<SpatialCoefficients> = (0..inputs.len().min(self.num_sources))
+            .map(|src| {
+                let latest = unsafe { self.triple_buffers.read(src) };
+                self.crossfaders[src].set_target(latest.clone());
+                self.crossfaders[src].current_coefficients().clone()
+            })
             .collect();
 
         self.dsp_graph.process(inputs, &params, output);
 
-        // Advance the crossfader by one frame.
-        self.crossfader.advance();
+        for src in 0..params.len() {
+            self.crossfaders[src].advance();
+        }
     }
 
-    /// Reset all DSP state (delay lines, filters, etc.).
+    /// Reset all DSP state.
     pub fn reset(&mut self) {
         self.dsp_graph.reset_all();
     }

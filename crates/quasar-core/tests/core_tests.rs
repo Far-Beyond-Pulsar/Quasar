@@ -110,7 +110,7 @@ fn triple_buffer_write_read() {
         late_gain_db: -10.0,
         version: 0,
     };
-    let tb = ParameterTripleBuffer::new(initial);
+    let tb = ParameterTripleBuffer::new(1, initial);
 
     let updated = SpatialCoefficients {
         source_id: 1,
@@ -123,13 +123,13 @@ fn triple_buffer_write_read() {
     };
 
     unsafe {
-        *tb.begin_write() = updated.clone();
+        *tb.begin_write(0) = updated.clone();
     }
-    tb.end_write();
+    tb.end_write(0);
 
     tb.update();
 
-    let read = unsafe { tb.read() };
+    let read = unsafe { tb.read(0) };
     assert_eq!(read.source_id, updated.source_id);
     assert!((read.direct_gain.0[0] - 0.8).abs() < 1e-6);
     assert!((read.direct_delay_samples - 12.5).abs() < 1e-6);
@@ -150,7 +150,7 @@ fn triple_buffer_no_data_loss() {
         late_gain_db: -10.0,
         version: 0,
     };
-    let tb = ParameterTripleBuffer::new(initial);
+    let tb = ParameterTripleBuffer::new(1, initial);
 
     for i in 1..=5 {
         let v = SpatialCoefficients {
@@ -162,12 +162,12 @@ fn triple_buffer_no_data_loss() {
             late_gain_db: -10.0,
             version: 0,
         };
-        unsafe { *tb.begin_write() = v; }
-        tb.end_write();
+        unsafe { *tb.begin_write(0) = v; }
+        tb.end_write(0);
     }
 
     tb.update();
-    let read = unsafe { tb.read() };
+    let read = unsafe { tb.read(0) };
     assert_eq!(read.source_id, 5);
     assert!((read.direct_gain.0[0] - 0.5).abs() < 1e-6);
 }
@@ -185,7 +185,7 @@ fn triple_buffer_thread_safety_loom() {
         late_gain_db: -10.0,
         version: 0,
     };
-    let tb = std::sync::Arc::new(ParameterTripleBuffer::new(initial));
+    let tb = std::sync::Arc::new(ParameterTripleBuffer::new(1, initial));
 
     let tb_writer = tb.clone();
     let writer = std::thread::spawn(move || {
@@ -199,8 +199,8 @@ fn triple_buffer_thread_safety_loom() {
                 late_gain_db: -10.0,
                 version: 0,
             };
-            unsafe { *tb_writer.begin_write() = v; }
-            tb_writer.end_write();
+            unsafe { *tb_writer.begin_write(0) = v; }
+            tb_writer.end_write(0);
             std::thread::yield_now();
         }
     });
@@ -210,7 +210,7 @@ fn triple_buffer_thread_safety_loom() {
         let mut last_version = 0u32;
         for _ in 0..500 {
             tb_reader.update();
-            let r = unsafe { tb_reader.read() };
+            let r = unsafe { tb_reader.read(0) };
             assert!(r.source_id >= last_version);
             last_version = r.source_id;
             std::thread::yield_now();

@@ -24,6 +24,7 @@
 //!   Escape      — release cursor / exit
 
 mod v3_demo_common;
+mod audio_player;
 
 use helio::{
     required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig, Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer, RendererConfig, Scene,
@@ -131,7 +132,7 @@ fn setup_quasar_audio() -> QuasarAudioDemo {
     QuasarAudioDemo {
         _registry: registry,
         _backend: CpuSimdComputeBackend::new(qs, cfg),
-        _triple_buffer: Arc::new(ParameterTripleBuffer::new(SpatialCoefficients {
+        _triple_buffer: Arc::new(ParameterTripleBuffer::new(1, SpatialCoefficients {
             source_id:0, direct_gain: Band8::splat(1.), direct_delay_samples:0., early_reflections:vec![],
             late_t60: Band8::splat(0.5), late_gain_db:0., version:0,
         })),
@@ -305,6 +306,7 @@ struct AppState {
 
     // Quasar spatial audio
     _audio_engine: QuasarAudioDemo,
+    audio_player: audio_player::QuasarAudioPlayer,
     show_rays: bool,
     show_probes: bool,
     show_material_zones: bool,
@@ -712,6 +714,9 @@ impl ApplicationHandler for App {
 
         let audio_engine = setup_quasar_audio();
 
+        let audio_player = audio_player::QuasarAudioPlayer::new("assets/8_Channel_ID.wav")
+            .expect("failed to initialize audio player");
+
         // Draw initial probe grid
         {
             for x in -2..=2 { for z in -2..=2 {
@@ -785,6 +790,7 @@ impl ApplicationHandler for App {
             candle_light_ids,
             start_time: std::time::Instant::now(),
             _audio_engine: audio_engine,
+            audio_player,
             show_rays: true,
             show_probes: true,
             show_material_zones: true,
@@ -828,6 +834,15 @@ impl ApplicationHandler for App {
                 event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyY), .. },
                 ..
             } => { state.show_material_zones = !state.show_material_zones; },
+            // P: toggle WAV playback
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyP), .. },
+                ..
+            } => {
+                let playing = state.audio_player.is_playing();
+                state.audio_player.set_playing(!playing);
+                println!("[audio] playback {}", if !playing { "started" } else { "stopped" });
+            },
 
             // F1: cycle debug modes (0=normal → 10=shadow heatmap → 11=light-space depth → 0)
             WindowEvent::KeyboardInput {
@@ -1062,6 +1077,12 @@ impl AppState {
             glam::Vec3::new(-3.0, 1.2, -2.0), glam::Vec3::new(3.0, 0.8, 2.0),
             glam::Vec3::new(-1.0, 2.5, 3.0), glam::Vec3::new(4.0, 0.3, -3.0),
         ];
+
+        // Update Quasar spatial audio with current source/listener positions
+        {
+            let src_pos: Vec<[f32; 3]> = source_positions.iter().map(|v| v.to_array()).collect();
+            self.audio_player.update_spatial(&src_pos, listener_pos.to_array());
+        }
 
         renderer.debug_clear();
         for (i, &pos) in source_positions.iter().enumerate() {
