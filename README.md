@@ -6,6 +6,8 @@
 
 A **high-performance, ultra-modular spatial audio engine** designed for deep integration into custom game engine ecosystems. Quasar bridges offline acoustic baking with a flexible real-time spatial computation pipeline, enabling everything from static baked environments to fully dynamic real-time acoustics.
 
+<img width="2660" height="1154" alt="image" src="https://github.com/user-attachments/assets/cb406346-4bb3-4048-8203-61cdec81b74f" />
+
 ---
 
 ## Architecture
