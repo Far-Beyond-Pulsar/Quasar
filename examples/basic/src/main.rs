@@ -100,7 +100,7 @@ const PEW_COUNT: usize = 6;
 
 // ── Quasar spatial audio engine (playback + spatial) ──────────────────────
 
-const NUM_SOURCES: usize = 4;
+const NUM_SOURCES: usize = 8;
 
 struct WavPlayback {
     samples: Vec<f32>,
@@ -1163,9 +1163,20 @@ impl AppState {
 
         // ── Quasar spatial audio debug overlay ─────────────────────────
         let listener_pos = self.cam_pos;
+        // Stage speaker layout:
+        //  0: Left Front Top     1: Left Front Bottom
+        //  2: Right Front Top    3: Right Front Bottom
+        //  4: Left Rear          5: Right Rear
+        //  6: Center Cube        7: Center High
         let source_positions = [
-            glam::Vec3::new(-3.0, 1.2, -2.0), glam::Vec3::new(3.0, 0.8, 2.0),
-            glam::Vec3::new(-1.0, 2.5, 3.0), glam::Vec3::new(4.0, 0.3, -3.0),
+            glam::Vec3::new(-8.0, 6.0, 5.0),  // left front top
+            glam::Vec3::new(-8.0, 1.0, 5.0),  // left front bottom
+            glam::Vec3::new( 8.0, 6.0, 5.0),  // right front top
+            glam::Vec3::new( 8.0, 1.0, 5.0),  // right front bottom
+            glam::Vec3::new(-6.0, 3.0,-8.0),  // left rear
+            glam::Vec3::new( 6.0, 3.0,-8.0),  // right rear
+            glam::Vec3::new( 0.0, 1.5, 0.0),  // center cube
+            glam::Vec3::new( 0.0, 4.5, 0.0),  // center high
         ];
 
         // Update Quasar spatial audio with current positions
