@@ -8,8 +8,9 @@
 use quasar_audio::SpatialAudioEngine;
 use quasar_core::scene::Movability;
 use quasar_core::scene_output::{
-    ChannelPull, ListenerConfig, PhysicalOutputLayout, SceneOutputConfig, SourceConfig,
+    ChannelPull, ListenerConfig, PhysicalOutputLayout, SceneOutputConfig, SourceConfig, SourceId,
 };
+use quasar_dsp::audio_buffer::AudioBuffer;
 
 fn source(path: &str, channels: usize) -> SourceConfig {
     SourceConfig {
@@ -86,14 +87,86 @@ fn registry_round_trip() {
     engine.remove_scene_output(out);
     assert!(engine.scene_outputs().is_empty());
 
-    // unload_source drops the source and any pulls referencing it.
+    // unload_source drops the source and any pulls referencing it. Order-
+    // preserving removal keeps `SourceId == index`: the surviving source B is
+    // now at index 0, so its surviving pull is remapped to id 0.
     let out2 = engine.add_scene_output(SceneOutputConfig::new([0.0, 0.0, 0.0], Movability::Static));
     engine.connect_pull(out2, ChannelPull::new(src_a, 0, 0.0));
     engine.connect_pull(out2, ChannelPull::new(src_b, 0, 0.0));
     engine.unload_source(src_a);
     assert_eq!(engine.sources().len(), 1);
+    assert_eq!(engine.sources()[0].path, "b.wav", "surviving source is B");
     assert_eq!(engine.scene_outputs()[0].pulls.len(), 1);
-    assert_eq!(engine.scene_outputs()[0].pulls[0].source_id, src_b);
+    assert_eq!(engine.scene_outputs()[0].pulls[0].source_id, SourceId(0));
+}
+
+// ── unload_middle_source_remaps_surviving_pulls ────────────────────────
+
+/// M3 regression: `unload_source` must keep `SourceId == registry index` for
+/// every surviving source. The old `swap_remove` relocated the last source
+/// into the vacated slot (its index changed but its ID did not), which made
+/// patch-bay `source_id -> buffer index` lookups wrong and let a subsequent
+/// `load_source` reuse an existing ID. Order-preserving removal + remap keeps
+/// the invariant, and the rebuilt scene pipeline must still render audibly.
+#[test]
+fn unload_middle_source_remaps_surviving_pulls() {
+    let mut engine = SpatialAudioEngine::new(8, 48000.0, 15.0);
+
+    // Load A(id0), B(id1), C(id2).
+    let src_a = engine.load_source(source("a.wav", 2)).expect("load source");
+    let src_b = engine.load_source(source("b.wav", 2)).expect("load source");
+    let src_c = engine.load_source(source("c.wav", 2)).expect("load source");
+    assert_eq!((src_a.0, src_b.0, src_c.0), (0, 1, 2));
+
+    // One scene output pulling A(ch0) and C(ch0) at 0 dB.
+    let out = engine.add_scene_output(SceneOutputConfig {
+        position: [0.0, 0.0, -5.0], // straight ahead of the stereo listener
+        orientation: None,
+        directivity: 0.0,
+        pulls: vec![
+            ChannelPull::new(src_a, 0, 0.0),
+            ChannelPull::new(src_c, 0, 0.0),
+        ],
+        movability: Movability::Static,
+    });
+
+    // One stereo listener.
+    let listener = engine.add_listener(ListenerConfig {
+        position: [0.0, 0.0, 0.0],
+        heading: [0.0, 0.0, -1.0],
+        physical_layout: PhysicalOutputLayout::Stereo,
+    });
+    assert_eq!(listener.0, 0);
+
+    // Unload the MIDDLE source B. The survivors must keep ID == index:
+    // A stays 0, C shifts from 2 down to 1.
+    engine.unload_source(src_b);
+
+    let pulls = &engine.scene_outputs()[out.0 as usize].pulls;
+    assert_eq!(pulls.len(), 2);
+    assert_eq!(pulls[0].source_id, SourceId(0), "surviving pull on A must stay id 0");
+    assert_eq!(pulls[1].source_id, SourceId(1), "pull on C must be remapped to id 1");
+
+    // The next load_source must get the next sequential ID (2) — no collision.
+    let src_d = engine.load_source(source("d.wav", 2)).expect("load source");
+    assert_eq!(src_d.0, 2, "next_source_id must resume at sources.len()");
+
+    // Registry invariant: every loaded source's ID equals its index.
+    assert_eq!(engine.sources().len(), 3);
+
+    // Process one block through the scene pipeline. No backend is registered,
+    // so coefficients stay at their initial values; the patch bay must still
+    // mix the two surviving pulls and the listener output must be non-silent.
+    let src_a_buf = AudioBuffer::from_channels(&[&[0.25f32; 64], &[0.0f32; 64]]);
+    let src_c_buf = AudioBuffer::from_channels(&[&[0.25f32; 64], &[0.0f32; 64]]);
+    let src_d_buf = AudioBuffer::from_channels(&[&[0.0f32; 64], &[0.0f32; 64]]);
+    let inputs: Vec<&AudioBuffer> = vec![&src_a_buf, &src_c_buf, &src_d_buf];
+    let mut listener_out = AudioBuffer::new(2, 64);
+    engine.process_audio_scene(&inputs, std::slice::from_mut(&mut listener_out));
+    assert!(
+        listener_out.peak() > 0.0,
+        "surviving pulls must be audible after unloading a middle source"
+    );
 }
 
 // ── registry_index_panics ────────────────────────────────────────────

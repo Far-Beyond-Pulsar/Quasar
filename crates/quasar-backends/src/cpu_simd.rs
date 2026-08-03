@@ -506,14 +506,17 @@ impl CpuSimdComputeBackend {
         materials: &dyn MaterialProvider,
     ) -> DirectPathResult {
         let dist = distance3(*source, *listener);
-        let dir = normalize3(sub3(*listener, *source));
 
         let mut occluded = false;
         let mut occlusion_factor = 1.0f32;
 
         let shadow_ray = Ray {
             origin: *listener,
-            direction: dir,
+            // Trace TOWARD the source: a wall between source and listener must
+            // be on the listener->source segment. The previous code traced
+            // `normalize(listener - source)`, i.e. away from the source, so
+            // occlusion_factor was always 1.0 and M1 was dead code in practice.
+            direction: normalize3(sub3(*source, *listener)),
             min_distance: 0.01,
             max_distance: dist - 0.01,
         };
@@ -547,7 +550,16 @@ impl CpuSimdComputeBackend {
             self.config.temperature_celsius,
             self.config.humidity_percent,
         );
-        let total_atten = atten.mul(&air);
+        let mut total_atten = atten.mul(&air);
+        // Fold the traced occlusion factor into the direct-path attenuation.
+        // A clear line of sight keeps occlusion_factor == 1.0 and skips the loop;
+        // an occluding surface (factor < 1.0) scales every band down so the
+        // direct gain and the per-band occlusion lowpass both respond to geometry.
+        if occlusion_factor < 1.0 {
+            for band in total_atten.0.iter_mut() {
+                *band *= occlusion_factor;
+            }
+        }
 
         DirectPathResult {
             attenuation: total_atten,

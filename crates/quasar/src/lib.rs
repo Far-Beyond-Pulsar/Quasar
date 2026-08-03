@@ -287,7 +287,7 @@ impl SpatialAudioEngine {
         let params: Vec<SpatialCoefficients> = (0..inputs.len().min(self.num_sources))
             .map(|src| {
                 let ver = self.triple_buffers.read_version(src);
-                if ver != self.last_versions[src] {
+                if ver > self.last_versions[src] {
                     self.last_versions[src] = ver;
                     let latest = unsafe { self.triple_buffers.read(src) };
                     self.crossfaders[src].set_target(latest.clone());
@@ -653,14 +653,19 @@ impl SpatialAudioEngine {
     ///
     /// # Note
     ///
-    /// Uses `swap_remove`: removing a middle element relocates the last
-    /// element into the vacated slot, so that relocated element's ID no
-    /// longer equals its index (inherent to index-based IDs).
+    /// Order-preserving: surviving sources keep `SourceId == index`, and
+    /// surviving pulls referencing sources after `id` are renumbered down by
+    /// one so the patch bay's `source_id -> buffer index` mapping stays exact.
     pub fn unload_source(&mut self, id: SourceId) {
         let idx = self.source_index(id);
-        self.sources.swap_remove(idx);
+        self.sources.remove(idx); // order-preserving; keeps ID == index for survivors
         for output in &mut self.scene_outputs {
-            output.pulls.retain(|p| p.source_id != id);
+            output.pulls.retain(|p| p.source_id.0 != id.0);
+            for p in output.pulls.iter_mut() {
+                if p.source_id.0 > id.0 {
+                    p.source_id.0 -= 1; // shift surviving IDs down to stay sequential
+                }
+            }
         }
         self.next_source_id = self.sources.len() as u32;
         self.rebuild_scene_render();
@@ -685,12 +690,12 @@ impl SpatialAudioEngine {
     ///
     /// # Note
     ///
-    /// Uses `swap_remove`: removing a middle element relocates the last
-    /// element into the vacated slot, so that relocated element's ID no
-    /// longer equals its index (inherent to index-based IDs).
+    /// Order-preserving: surviving scene outputs keep `SceneOutputId == index`
+    /// and the render state is rebuilt so the patch bay and triple-buffer
+    /// flat indexing (`listener * n_out + output`) stay consistent.
     pub fn remove_scene_output(&mut self, id: SceneOutputId) {
         let idx = self.scene_output_index(id);
-        self.scene_outputs.swap_remove(idx);
+        self.scene_outputs.remove(idx);
         self.next_scene_output_id = self.scene_outputs.len() as u32;
         self.rebuild_scene_render();
     }
@@ -787,12 +792,12 @@ impl SpatialAudioEngine {
     ///
     /// # Note
     ///
-    /// Uses `swap_remove`: removing a middle element relocates the last
-    /// element into the vacated slot, so that relocated element's ID no
-    /// longer equals its index (inherent to index-based IDs).
+    /// Order-preserving: surviving listeners keep `ListenerId == index` and
+    /// the render state is rebuilt so the triple-buffer flat indexing
+    /// (`listener * n_out + output`) stays consistent.
     pub fn remove_listener(&mut self, id: ListenerId) {
         let idx = self.listener_index(id);
-        self.listeners.swap_remove(idx);
+        self.listeners.remove(idx);
         self.next_listener_id = self.listeners.len() as u32;
         self.rebuild_scene_render();
     }
