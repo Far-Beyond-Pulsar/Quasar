@@ -186,27 +186,41 @@ fn setup_audio_engine() -> AudioEngine {
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // 4-source stereo mix: each source pans across the field
+                // 4-source stereo mix via occlusion node
                 let mut l_acc = vec![0.0f32; block];
                 let mut r_acc = vec![0.0f32; block];
 
                 for src in 0..NUM_SOURCES.min(nch) {
-                    // Read this channel with per-sample position advancement
+                    let mut mono_in = AudioBuffer::new(1, block as u16);
+                    {
+                        let ch = mono_in.channel_mut(0);
+                        for i in 0..block {
+                            let pos = st.read_pos + i as f64 * ratio;
+                            let fa = pos.floor() as usize;
+                            let fb = fa + 1;
+                            let frac = (pos - fa as f64) as f32;
+                            let g = |f: usize| -> f32 {
+                                if f < total_raw / nch { st.samples[f * nch + src] } else { 0.0 }
+                            };
+                            ch[i] = g(fa) + (g(fb) - g(fa)) * frac;
+                        }
+                    }
+
+                    let mut occ_out = AudioBuffer::new(1, block as u16);
+                    let zero = SpatialCoefficients {
+                        source_id: 0, direct_gain: Band8::splat(0.0), direct_delay_samples: 0.0,
+                        early_reflections: Vec::new(), late_t60: Band8::splat(0.0),
+                        late_gain_db: 0.0, version: 0,
+                    };
+                    st.occ_nodes[src].process(&mono_in, &mut occ_out, &zero);
+
+                    let pan = (src as f32 / (NUM_SOURCES - 1).max(1) as f32) * 2.0 - 1.0;
+                    let t = (pan + 1.0) * 0.5;
+                    let angle = std::f32::consts::FRAC_PI_2 * t;
+                    let (lg, rg) = (angle.cos(), angle.sin());
+
                     for i in 0..block {
-                        let pos = st.read_pos + i as f64 * ratio;
-                        let fa = pos.floor() as usize;
-                        let fb = fa + 1;
-                        let frac = (pos - fa as f64) as f32;
-                        let g = |f: usize| -> f32 {
-                            if f < total_raw / nch { st.samples[f * nch + src] } else { 0.0 }
-                        };
-                        let s = g(fa) + (g(fb) - g(fa)) * frac;
-
-                        let pan = (src as f32 / (NUM_SOURCES - 1).max(1) as f32) * 2.0 - 1.0;
-                        let t = (pan + 1.0) * 0.5;
-                        let angle = std::f32::consts::FRAC_PI_2 * t;
-                        let (lg, rg) = (angle.cos(), angle.sin());
-
+                        let s = occ_out.channel(0)[i];
                         l_acc[i] += s * lg;
                         r_acc[i] += s * rg;
                     }
