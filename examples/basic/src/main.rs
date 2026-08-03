@@ -395,9 +395,6 @@ struct AppState {
     _wall_right_outer: MeshId,
     _wall_front: MeshId,
     _wall_back: MeshId,
-    // Colonnade arches (inner walls between nave and aisles, with gaps left for columns)
-    _colonnade_l: Vec<MeshId>, // wall segments between columns
-    _colonnade_r: Vec<MeshId>,
     // Columns
     _columns: Vec<MeshId>,
     // Altar
@@ -622,53 +619,6 @@ impl ApplicationHandler for App {
             glam::Mat4::from_translation(glam::Vec3::new(0.0, 10.5, -28.0)),
             11.0,
         );
-
-        // Colonnade: short wall segments between columns (between column z-positions)
-        // 7 segments per side: before first col, between each pair, after last col
-        let col_z_all: Vec<f32> = {
-            let mut v = vec![-28.0_f32]; // south wall
-            v.extend_from_slice(COLUMN_Z);
-            v.push(28.0); // north wall
-            v
-        };
-        let _colonnade_l: Vec<MeshId> = col_z_all
-            .windows(2)
-            .map(|w| {
-                let mid_z = (w[0] + w[1]) * 0.5;
-                let half_len = (w[1] - w[0]) * 0.5 - 0.9; // gap for column
-                let id = renderer.scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.25, 5.5, half_len.max(0.1)])))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(-5.5, 5.5, mid_z)),
-                    5.5,
-                );
-                id
-            })
-            .collect();
-        let _colonnade_r: Vec<MeshId> = col_z_all
-            .windows(2)
-            .map(|w| {
-                let mid_z = (w[0] + w[1]) * 0.5;
-                let half_len = (w[1] - w[0]) * 0.5 - 0.9;
-                let id = renderer.scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.25, 5.5, half_len.max(0.1)])))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(5.5, 5.5, mid_z)),
-                    5.5,
-                );
-                id
-            })
-            .collect();
 
         // Columns: 0.65 m square, 20 m tall, at x = ±5.5
         let _columns: Vec<MeshId> = COLUMN_Z
@@ -903,8 +853,6 @@ impl ApplicationHandler for App {
             _wall_right_outer,
             _wall_front,
             _wall_back,
-            _colonnade_l,
-            _colonnade_r,
             _columns,
             _altar_plinth,
             _altar_step,
