@@ -533,19 +533,28 @@ impl SpatialAudioEngine {
 
         // 5. Per-listener decode: VBAP the rendered mono onto the physical
         //    layout and sum into the listener's output bus.
+        //
+        //    The crossfader's `direct_azimuth` is a WORLD-space angle from the
+        //    listener position toward the source.  To pan correctly on the
+        //    physical speaker array we must rotate it by the listener's
+        //    heading (yaw) so that a source the listener faces is heard from
+        //    the front speakers regardless of the world rotation.
         let n_lis_proc = n_lis
             .min(self.scene.listener_layouts.len())
             .min(listener_outputs.len());
         let mut gains = [0.0_f32; MAX_AUDIO_CHANNELS];
         for l in 0..n_lis_proc {
+            let heading = self.listeners[l].heading;
+            let heading_yaw = heading[0].atan2(-heading[2]);
             let out = &mut listener_outputs[l];
             out.clear();
             let n_speakers = out.channels() as usize;
             for o in 0..n_out_proc {
                 let coeff = self.scene.crossfaders[l * n_out + o].current_coefficients();
+                let listener_azimuth = coeff.direct_azimuth - heading_yaw;
                 let n = vbap_gains(
                     &self.scene.listener_layouts[l],
-                    coeff.direct_azimuth,
+                    listener_azimuth,
                     coeff.direct_elevation,
                     &mut gains,
                 );
