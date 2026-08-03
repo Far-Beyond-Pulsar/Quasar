@@ -164,12 +164,12 @@ fn setup_audio_engine() -> AudioEngine {
                     positions: vec![
                         [-7.0, 5.5,-12.0], // 0: Front Left     — WAV ch 0
                         [ 7.0, 5.5,-12.0], // 1: Front Right    — WAV ch 1
-                        [-7.0, 0.5,-12.0], // 2: Center         — WAV ch 2
-                        [ 7.0, 0.5,-12.0], // 3: Back Left      — WAV ch 3
-                        [ 0.0, 3.0,-12.0], // 4: Back Right     — WAV ch 4
-                        [-7.0, 2.0, 12.0], // 5: Sub            — WAV ch 5
-                        [ 7.0, 2.0, 12.0], // 6: Aux Left       — WAV ch 6
-                        [ 0.0, 0.3, -7.0], // 7: Aux Right      — WAV ch 7
+                        [ 0.0, 3.0,-12.0], // 2: Center         — WAV ch 2
+                        [-7.0, 2.0, 12.0], // 3: Back Left      — WAV ch 3
+                        [ 7.0, 2.0, 12.0], // 4: Back Right     — WAV ch 4
+                        [ 0.0, 0.3, -7.0], // 5: Sub            — WAV ch 5
+                        [-7.0, 0.5,-12.0], // 6: Aux Left       — WAV ch 6
+                        [ 7.0, 0.5,-12.0], // 7: Aux Right      — WAV ch 7
                     ],
                 }}, sr,
             )));
@@ -1152,23 +1152,23 @@ impl AppState {
         let listener_pos = self.cam_pos;
         // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
         // Index order matches WAV channel → source_id mapping:
-        //  0: Left Front Top       — WAV ch 0 / source_id 0
-        //  1: Right Front Top      — WAV ch 1 / source_id 1
-        //  2: Left Front Bottom    — WAV ch 2 / source_id 2
-        //  3: Right Front Bottom   — WAV ch 3 / source_id 3
-        //  4: Center Front         — WAV ch 4 / source_id 4
-        //  5: Left Rear (Aux)      — WAV ch 5 / source_id 5
-        //  6: Right Rear (Aux)     — WAV ch 6 / source_id 6
-        //  7: Subwoofer / LFE      — WAV ch 7 / source_id 7
+        //  0: Front Left           — WAV ch 0 / source_id 0
+        //  1: Front Right          — WAV ch 1 / source_id 1
+        //  2: Center               — WAV ch 2 / source_id 2
+        //  3: Back Left            — WAV ch 3 / source_id 3
+        //  4: Back Right           — WAV ch 4 / source_id 4
+        //  5: Sub                  — WAV ch 5 / source_id 5
+        //  6: Aux Left             — WAV ch 6 / source_id 6
+        //  7: Aux Right            — WAV ch 7 / source_id 7
         let source_positions = [
-            glam::Vec3::new(-7.0, 5.5,-12.0), // 0: Left Front Top
-            glam::Vec3::new( 7.0, 5.5,-12.0), // 1: Right Front Top
-            glam::Vec3::new(-7.0, 0.5,-12.0), // 2: Left Front Bottom
-            glam::Vec3::new( 7.0, 0.5,-12.0), // 3: Right Front Bottom
-            glam::Vec3::new( 0.0, 3.0,-12.0), // 4: Center Front
-            glam::Vec3::new(-7.0, 2.0, 12.0), // 5: Left Rear (Aux)
-            glam::Vec3::new( 7.0, 2.0, 12.0), // 6: Right Rear (Aux)
-            glam::Vec3::new( 0.0, 0.3, -7.0), // 7: Subwoofer / LFE
+            glam::Vec3::new(-7.0, 5.5,-12.0), // 0: Front Left
+            glam::Vec3::new( 7.0, 5.5,-12.0), // 1: Front Right
+            glam::Vec3::new( 0.0, 3.0,-12.0), // 2: Center
+            glam::Vec3::new(-7.0, 2.0, 12.0), // 3: Back Left
+            glam::Vec3::new( 7.0, 2.0, 12.0), // 4: Back Right
+            glam::Vec3::new( 0.0, 0.3, -7.0), // 5: Sub
+            glam::Vec3::new(-7.0, 0.5,-12.0), // 6: Aux Left
+            glam::Vec3::new( 7.0, 0.5,-12.0), // 7: Aux Right
         ];
 
         // Update Quasar spatial audio with current positions
