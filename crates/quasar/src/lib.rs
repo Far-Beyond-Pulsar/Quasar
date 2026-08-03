@@ -702,13 +702,15 @@ impl SpatialAudioEngine {
 
     /// Move a scene output to a new world-space position.
     ///
+    /// Content-model only: does NOT rebuild the scene render state. Geometry is
+    /// re-resolved by the next [`update_scene_spatial`]; see [`update_listener`].
+    ///
     /// # Panics
     ///
     /// Panics if `id` does not refer to a registered scene output.
     pub fn set_scene_output_position(&mut self, id: SceneOutputId, pos: [f32; 3]) {
         let idx = self.scene_output_index(id);
         self.scene_outputs[idx].position = pos;
-        self.rebuild_scene_render();
     }
 
     // ── Patch bay ───────────────────────────────────────────────────────
@@ -804,6 +806,12 @@ impl SpatialAudioEngine {
 
     /// Update a listener's world position and heading.
     ///
+    /// Content-model only: does NOT rebuild the scene render state. Position and
+    /// heading feed [`update_scene_spatial`] (called separately, typically once
+    /// per frame), and the render state depends only on structure (counts,
+    /// layouts, pulls). Rebuilding here would recreate every crossfader and DSP
+    /// delay line on each call, causing level jumps and audible clicks.
+    ///
     /// # Panics
     ///
     /// Panics if `id` does not refer to a registered listener.
@@ -811,7 +819,6 @@ impl SpatialAudioEngine {
         let idx = self.listener_index(id);
         self.listeners[idx].position = position;
         self.listeners[idx].heading = heading;
-        self.rebuild_scene_render();
     }
 
     // ── Index helpers ────────────────────────────────────────────────────

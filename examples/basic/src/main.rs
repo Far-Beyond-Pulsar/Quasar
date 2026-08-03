@@ -19,7 +19,7 @@
 //!   T           — toggle Quasar probe grid overlay
 //!   Y           — toggle Quasar material zone colors
 //!   G           — swap Aux Left/Right channels (live patch-bay remap)
-//!   [ / ]       — master volume down / up (3 dB steps; default +12 dB)
+//!   [ / ]       — master volume down / up (3 dB steps; default +18 dB)
 //!   F2          — toggle performance overlay modes (GPU heatmaps)
 //!   F3          — toggle debug overlay (FPS, timings, texture stats)
 //!   Mouse drag  — look around (click to grab cursor)
@@ -148,12 +148,20 @@ fn setup_audio_engine() -> AudioEngine {
     let spec = reader.spec();
     let wav_sr = spec.sample_rate;
     let nch_wav = spec.channels as usize;
-    let samples: Vec<f32> = match spec.bits_per_sample {
+    let mut samples: Vec<f32> = match spec.bits_per_sample {
         16 => reader.into_samples::<i16>().filter_map(|s| s.ok()).map(|s| s as f32 / i16::MAX as f32).collect(),
         24 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / 8_388_608.0).collect(),
         32 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / i32::MAX as f32).collect(),
         b => panic!("unsupported bit depth: {b}"),
     };
+    // Normalize to a healthy 1 m reference level (peak ~0.9 FS) so the engine's
+    // inverse-distance attenuation across the cathedral stays clearly audible.
+    // Capped at +24 dB so a quiet file is not boosted into a noise wall.
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 0.0 && peak < 1.0 {
+        let gain = (0.9 / peak).min(16.0);
+        samples = samples.into_iter().map(|s| s * gain).collect();
+    }
 
     // Set up cpal
     let host = cpal::default_host();
@@ -295,7 +303,7 @@ fn setup_audio_engine() -> AudioEngine {
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
     let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 12.0,
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 18.0,
     }));
 
     let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));

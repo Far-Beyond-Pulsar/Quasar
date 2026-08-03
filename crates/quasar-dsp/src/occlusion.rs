@@ -163,13 +163,18 @@ impl AudioNode for AirAbsorptionOcclusionNode {
             let in_ch = input.channel(ch as u16);
             let out_ch = output.channel_mut(ch as u16);
 
+            // Occlusion / air absorption is already folded into the per-band
+            // `direct_gain` by the backend; the biquads only add the lowpass
+            // shading. Use the band with the HIGHEST cutoff (the gentle end of
+            // the shading) — cascading all 8 filters in series stacked their
+            // cutoffs (~21 Hz at long range) and killed every audible
+            // frequency above ~50 Hz.
+            let lp_idx = ch * 8 + 7;
+
             for i in 0..num_samples {
                 let mut sample = in_ch[i];
-                for band in 0..8 {
-                    let idx = ch * 8 + band;
-                    if idx < self.filters.len() {
-                        sample = self.filters[idx].process(sample);
-                    }
+                if lp_idx < self.filters.len() {
+                    sample = self.filters[lp_idx].process(sample);
                 }
                 self.delay_line.push(sample);
                 out_ch[i] = self.delay_line.tap(params.direct_delay_samples) * gain;
