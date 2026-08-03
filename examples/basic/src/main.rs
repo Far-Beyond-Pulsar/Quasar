@@ -31,7 +31,7 @@ use helio::{
 // (BillboardInstance referenced inline as helio::BillboardInstance)
 use helio_pass_perf_overlay::PerfOverlayMode;
 use helio_default_graphs::build_default_graph;
-use v3_demo_common::{box_mesh, make_material, plane_mesh, point_light};
+use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use quasar_core::bands::Band8;
@@ -159,7 +159,18 @@ fn setup_audio_engine() -> AudioEngine {
         }
         for src in 0..NUM_SOURCES {
             dec_idxs[src] = graph.add_node(Box::new(MasterSpatialDecoderNode::new(
-                DecoderMode::Vbap { layout: SpeakerLayout::Stereo }, sr,
+                DecoderMode::Vbap { layout: SpeakerLayout::Custom {
+                    positions: vec![
+                        [-3.0, 4.5, 5.0],  // 0: Left Front Top      — WAV ch 0
+                        [-3.0, 0.5, 5.0],  // 1: Left Front Bottom   — WAV ch 1
+                        [ 3.0, 4.5, 5.0],  // 2: Right Front Top     — WAV ch 2
+                        [ 3.0, 0.5, 5.0],  // 3: Right Front Bottom  — WAV ch 3
+                        [ 0.0, 2.5, 5.0],  // 4: Center Front        — WAV ch 4
+                        [-3.0, 1.6,-5.0],  // 5: Left Rear (Aux)     — WAV ch 5
+                        [ 3.0, 1.6,-5.0],  // 6: Right Rear (Aux)    — WAV ch 6
+                        [ 0.0, 0.3, 0.0],  // 7: Subwoofer / LFE     — WAV ch 7
+                    ],
+                }}, sr,
             )));
         }
         for src in 0..NUM_SOURCES {
@@ -773,6 +784,23 @@ impl ApplicationHandler for App {
             })
             .collect();
 
+        // Listener position marker — a Helio cube mesh that all speakers point toward
+        let listener_mat = renderer.scene_mut().insert_material(make_material(
+            [0.0, 1.0, 0.3, 1.0],
+            0.2,
+            0.0,
+            [0.0, 1.0, 0.3],
+            1.5,
+        ));
+        let listener_mesh = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(cube_mesh([0.0, 0.0, 0.0], 0.4))).as_mesh().unwrap();
+        let _ = v3_demo_common::insert_object(
+            &mut renderer,
+            listener_mesh,
+            listener_mat,
+            glam::Mat4::from_translation(glam::Vec3::new(0.0, 1.6, 0.0)),
+            0.4,
+        );
+
         // Register lights (chandelier & candle light_ids stored for per-frame flicker updates)
         let mut chandelier_light_ids = Vec::new();
         for &z in CHANDELIER_Z {
@@ -1163,20 +1191,24 @@ impl AppState {
 
         // ── Quasar spatial audio debug overlay ─────────────────────────
         let listener_pos = self.cam_pos;
-        // Stage speaker layout:
-        //  0: Left Front Top     1: Left Front Bottom
-        //  2: Right Front Top    3: Right Front Bottom
-        //  4: Left Rear          5: Right Rear
-        //  6: Center Cube        7: Center High
+        // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
+        //  0: Left Front Top      — WAV ch 0 / source_id 0
+        //  1: Left Front Bottom   — WAV ch 1 / source_id 1
+        //  2: Right Front Top     — WAV ch 2 / source_id 2
+        //  3: Right Front Bottom  — WAV ch 3 / source_id 3
+        //  4: Center Front        — WAV ch 4 / source_id 4
+        //  5: Left Rear (Aux)     — WAV ch 5 / source_id 5
+        //  6: Right Rear (Aux)    — WAV ch 6 / source_id 6
+        //  7: Subwoofer / LFE     — WAV ch 7 / source_id 7
         let source_positions = [
-            glam::Vec3::new(-8.0, 6.0, 5.0),  // left front top
-            glam::Vec3::new(-8.0, 1.0, 5.0),  // left front bottom
-            glam::Vec3::new( 8.0, 6.0, 5.0),  // right front top
-            glam::Vec3::new( 8.0, 1.0, 5.0),  // right front bottom
-            glam::Vec3::new(-6.0, 3.0,-8.0),  // left rear
-            glam::Vec3::new( 6.0, 3.0,-8.0),  // right rear
-            glam::Vec3::new( 0.0, 1.5, 0.0),  // center cube
-            glam::Vec3::new( 0.0, 4.5, 0.0),  // center high
+            glam::Vec3::new(-3.0, 4.5, 5.0),  // 0: Left Front Top
+            glam::Vec3::new(-3.0, 0.5, 5.0),  // 1: Left Front Bottom
+            glam::Vec3::new( 3.0, 4.5, 5.0),  // 2: Right Front Top
+            glam::Vec3::new( 3.0, 0.5, 5.0),  // 3: Right Front Bottom
+            glam::Vec3::new( 0.0, 2.5, 5.0),  // 4: Center Front
+            glam::Vec3::new(-3.0, 1.6,-5.0),  // 5: Left Rear (Aux)
+            glam::Vec3::new( 3.0, 1.6,-5.0),  // 6: Right Rear (Aux)
+            glam::Vec3::new( 0.0, 0.3, 0.0),  // 7: Subwoofer / LFE
         ];
 
         // Update Quasar spatial audio with current positions
@@ -1194,7 +1226,7 @@ impl AppState {
             let hue = i as f32 / source_positions.len() as f32;
             let color = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
             renderer.debug_sphere(pos.into(), 0.25, color, 16);
-            let dir = glam::Vec3::new((i as f32 * 1.5).sin(), -0.2, (i as f32 * 1.5).cos()).normalize();
+            let dir = (glam::Vec3::new(0.0, 1.6, 0.0) - pos).normalize();
             renderer.debug_cone((pos + dir * 0.3).into(), dir.into(), 1.5, 0.8, [color[0], color[1], color[2], 0.3], 12);
             renderer.debug_circle(pos.into(), 5.0, [color[0], color[1], color[2], 0.15], 32);
         }
