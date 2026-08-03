@@ -8,19 +8,20 @@ use crate::node_graph::AudioNode;
 /// Implementation of a Feedback Delay Network reverberator.
 ///
 /// Architecture:
-/// - 16 mutually-coupled delay lines of varying lengths (typically 15-80ms)
-/// - Hadamard-based orthogonal feedback matrix for maximum echo density
+/// - 32 mutually-coupled delay lines of varying lengths (typically 15-95ms)
+/// - Householder-based orthogonal feedback matrix for maximum echo density
 /// - Per-line one-pole lowpass filters for frequency-dependent decay (T60 control)
-/// - Modulation on delay lines for chorusing effect (smooths out metallic artifacts)
+///
+/// 32 lines provide sufficient echo density at 48 kHz without requiring delay-line
+/// modulation (which was previously set to ±2 sample wobble at ~0.5 Hz, producing
+/// an audible chorus/flange "Borg voice" artifact).
 ///
 /// All memory allocated at construction. NEVER allocates during process().
 pub struct FdnReverbNode {
-    /// Delay lines
-    delay_lines: [HermiteInterpolatingDelayLine; 16],
+    /// Delay lines (32 for higher echo density, reduced metallic flutter)
+    delay_lines: [HermiteInterpolatingDelayLine; 32],
     /// Damping lowpass filters (one per delay line)
-    dampings: [BiquadFilter; 16],
-    /// Modulated delay offsets for chorus effect
-    modulation_phase: [f32; 16],
+    dampings: [BiquadFilter; 32],
     /// Current T60 target
     t60: Band8,
     /// Pre-delay line
@@ -37,8 +38,9 @@ pub struct FdnReverbNode {
     output_channels: u16,
 }
 
-// Prime-based coprime delay lengths (in samples at 48 kHz) for ~15-80ms range.
-const FDN_DELAY_LENGTHS: [usize; 16] = [
+// 32 coprime delay lengths (in samples at 48 kHz) for ~15-95ms range.
+// All are prime or coprime to ensure maximum echo density growth.
+const FDN_DELAY_LENGTHS: [usize; 32] = [
     719,   // ~15.0 ms
     857,   // ~17.9 ms
     1103,  // ~23.0 ms
@@ -49,40 +51,63 @@ const FDN_DELAY_LENGTHS: [usize; 16] = [
     2657,  // ~55.4 ms
     3079,  // ~64.1 ms
     3491,  // ~72.7 ms
-    109,   // ~2.3 ms  (for short modulation)
+    109,   // ~2.3 ms
     151,   // ~3.1 ms
     197,   // ~4.1 ms
     251,   // ~5.2 ms
     313,   // ~6.5 ms
     401,   // ~8.4 ms
+    503,   // ~10.5 ms
+    613,   // ~12.8 ms
+    823,   // ~17.1 ms
+    947,   // ~19.7 ms
+    1069,  // ~22.3 ms
+    1229,  // ~25.6 ms
+    1453,  // ~30.3 ms
+    1741,  // ~36.3 ms
+    1997,  // ~41.6 ms
+    2347,  // ~48.9 ms
+    2741,  // ~57.1 ms
+    3041,  // ~63.4 ms
+    3373,  // ~70.3 ms
+    3733,  // ~77.8 ms
+    4099,  // ~85.4 ms
+    4561,  // ~95.0 ms
 ];
 
 impl FdnReverbNode {
-    /// Create a new FDN reverb.
+    /// Create a new FDN reverb with 32 delay lines.
     pub fn new(input_channels: u16, sample_rate: f32) -> Self {
         let max_delay = 0.15;
         let max_pre_delay = 0.1;
 
+        fn make_line(max_delay: f32, sr: f32) -> HermiteInterpolatingDelayLine {
+            HermiteInterpolatingDelayLine::new(max_delay, sr)
+        }
         let delay_lines = [
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
-            HermiteInterpolatingDelayLine::new(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
+            make_line(max_delay, sample_rate), make_line(max_delay, sample_rate),
         ];
 
         let dampings = [
+            BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
+            BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
+            BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
+            BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
             BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
             BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
             BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(), BiquadFilter::new(),
@@ -94,7 +119,6 @@ impl FdnReverbNode {
         Self {
             delay_lines,
             dampings,
-            modulation_phase: [0.0; 16],
             t60: Band8::splat(2.0),
             pre_delay,
             pre_delay_samples: 0.0,
@@ -106,21 +130,13 @@ impl FdnReverbNode {
         }
     }
 
-    /// Build the primitive root delay line lengths.
-    pub fn init_delay_lengths(&mut self, _sample_rate: f32) {
-        // Delay lines are pre-configured with max_delay; lengths are managed internally
-        // via the fixed FDN_DELAY_LENGTHS constants.
-    }
-
-    /// Compute the Hadamard feedback matrix (Householder reflection).
-    pub fn feedback_matrix(input: &[f32; 16]) -> [f32; 16] {
-        // Householder reflection: H = I - (2/n) * u*u^T where u = [1,1,...,1]
-        // This gives an orthogonal matrix optimal for FDN echo density.
-        let n = 16.0;
+    /// Compute the Householder feedback matrix for 32 lines.
+    pub fn feedback_matrix(input: &[f32; 32]) -> [f32; 32] {
+        let n = 32.0;
         let sum: f32 = input.iter().sum();
         let scale = 2.0 / n;
-        let mut out = [0.0_f32; 16];
-        for i in 0..16 {
+        let mut out = [0.0_f32; 32];
+        for i in 0..32 {
             out[i] = -input[i] + scale * sum;
         }
         out
@@ -129,15 +145,10 @@ impl FdnReverbNode {
     /// Set T60 target per band. Adjusts damping filter coefficients.
     pub fn set_t60(&mut self, t60: &Band8) {
         self.t60 = *t60;
-        // Map average T60 to a one-pole lowpass cutoff. Longer rooms decay
-        // darker, so the cutoff drops as T60 grows; it stays well inside the
-        // audible range so the reverb retains highs instead of turning into a
-        // DC smear (the previous pole sat at ~0.99999, i.e. a ~0.1 Hz lowpass
-        // that let the feedback loop accumulate DC and amplify low frequencies).
         let avg_t60 = t60.mean().max(0.1).min(10.0);
         let cutoff = (3500.0 / (avg_t60 * 0.5 + 0.25)).clamp(300.0, 5000.0);
         let alpha = 1.0 - (-2.0 * std::f32::consts::PI * cutoff / self.sample_rate).exp();
-        for i in 0..16 {
+        for i in 0..32 {
             self.dampings[i].set_coefficients(alpha, 0.0, 0.0, -(1.0 - alpha), 0.0);
         }
     }
@@ -156,46 +167,37 @@ impl FdnReverbNode {
     /// Update reverb parameters from spatial coefficients.
     pub fn update_from_coefficients(&mut self, params: &SpatialCoefficients) {
         self.set_t60(&params.late_t60);
-        self.wet_gain = 10.0_f32.powf(params.late_gain_db / 20.0);
+        // With 32 delay lines the FDN internal passband gain is ~1.18× (down from
+        // ~1.67× at 16 lines).  The raw wet gain (e.g. db_to_linear(-10 dB) = 0.316)
+        // still needs a trim to keep reverb clearly below the direct when multiple
+        // channels overlap on the same speaker.
+        self.wet_gain = 10.0_f32.powf(params.late_gain_db / 20.0) * 0.4;
     }
 
     fn process_fdn_channel(&mut self, input_sample: f32) -> f32 {
-        // Write input into pre-delay
         self.pre_delay.push(input_sample);
         let signal = self.pre_delay.tap(self.pre_delay_samples);
 
-        // Read current state of all delay lines
-        let mut vec_in = [0.0_f32; 16];
-        for i in 0..16 {
-            // Add modulation for chorusing (slow LFO)
-            self.modulation_phase[i] += 0.5 / self.sample_rate;
-            if self.modulation_phase[i] > 1.0 {
-                self.modulation_phase[i] -= 1.0;
-            }
-            let mod_offset = (self.modulation_phase[i] * std::f32::consts::TAU).sin() * 2.0;
-
-            let tap_pos = (FDN_DELAY_LENGTHS[i] as f32 + mod_offset)
+        let mut vec_in = [0.0_f32; 32];
+        for i in 0..32 {
+            let tap_pos = (FDN_DELAY_LENGTHS[i] as f32)
                 .min(self.delay_lines[i].max_samples() as f32 - 3.0)
                 .max(0.0);
             vec_in[i] = self.delay_lines[i].tap(tap_pos);
         }
 
-        // Apply damping filters
-        for i in 0..16 {
+        for i in 0..32 {
             vec_in[i] = self.dampings[i].process(vec_in[i]);
         }
 
-        // Apply feedback matrix (Householder reflection)
         let vec_out = Self::feedback_matrix(&vec_in);
 
-        // Write back to delay lines with input signal injected
-        for i in 0..16 {
-            let feedback = vec_out[i] * 0.85; // feedback gain for stability
-            self.delay_lines[i].push(signal * (1.0 / 16.0) + feedback);
+        for i in 0..32 {
+            let feedback = vec_out[i] * 0.85;
+            self.delay_lines[i].push(signal * (1.0 / 32.0) + feedback);
         }
 
-        // Sum all delay lines for output
-        vec_out.iter().sum::<f32>() * (1.0 / 16.0_f32.sqrt())
+        vec_out.iter().sum::<f32>() * (1.0 / 32.0_f32.sqrt())
     }
 }
 
@@ -205,7 +207,6 @@ impl AudioNode for FdnReverbNode {
         debug_assert_eq!(output.channels(), self.output_channels);
         debug_assert_eq!(input.samples(), output.samples());
 
-        // Apply reverb parameters from spatial coefficients
         self.update_from_coefficients(params);
 
         let num_samples = input.samples() as usize;
@@ -230,7 +231,6 @@ impl AudioNode for FdnReverbNode {
             d.reset();
         }
         self.pre_delay.clear();
-        self.modulation_phase = [0.0; 16];
     }
 
     fn input_channels(&self) -> u16 {

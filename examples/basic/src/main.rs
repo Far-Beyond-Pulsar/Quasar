@@ -129,6 +129,7 @@ struct WavPlayback {
     /// Presentation-stage makeup gain (dB). The engine models absolute SPL —
     /// inverse-distance attenuation across this ~30 m cathedral lands ~ −24 dB
     /// below the source — so the demo applies a master volume on top.
+    /// Range -60..+24 dB via [/]; default +24 is the loudest clean setting.
     master_gain_db: f32,
 }
 
@@ -303,7 +304,7 @@ fn setup_audio_engine() -> AudioEngine {
     let rate_ratio = wav_sr as f64 / out_sr as f64;
 
     let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 18.0,
+        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 24.0,
     }));
 
     let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));
