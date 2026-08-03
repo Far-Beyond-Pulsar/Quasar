@@ -15,6 +15,9 @@
 //! Controls:
 //!   WASD        — move forward/left/back/right
 //!   Space/Shift — move up/down
+//!   R           — toggle Quasar ray visualization
+//!   T           — toggle Quasar probe grid overlay
+//!   Y           — toggle Quasar material zone colors
 //!   F2          — toggle performance overlay modes (GPU heatmaps)
 //!   F3          — toggle debug overlay (FPS, timings, texture stats)
 //!   Mouse drag  — look around (click to grab cursor)
