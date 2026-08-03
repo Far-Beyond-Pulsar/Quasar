@@ -148,6 +148,37 @@ fn setup_quasar_audio() -> QuasarAudioDemo {
     }
 }
 
+// ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
+
+/// Replace the default billboard sprite (spotlight.png) with the procedural
+/// speaker icon in the render graph.
+///
+/// Must be called whenever the graph may have been rebuilt (see Helio #192:
+/// `rebuild_graph_if_sky_changed()` and `apply_resize_now()` both invoke the
+/// `GraphRebuilder`, which destroys custom pass replacements).  We re-apply
+/// the replacement on every frame after acquiring the render lock so that
+/// any graph rebuild is always caught.
+///
+/// Uses the *scene* camera buffer (`array<Camera,2>`, 736 bytes) — NOT the
+/// `debug_camera_buf` (`DebugCameraUniform`, 64 bytes) — because the billboard
+/// shader reads `cameras[0].view_proj` at offset 128 and
+/// `cameras[0].position_near` at offset 256, both past a 64-byte buffer.
+fn apply_billboard_replacement(
+    renderer: &mut Renderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let camera_buf = renderer.scene().gpu_scene().camera.buffer();
+    let fmt = renderer.renderer_config().surface_format;
+    let (rgba, w, h) = generate_speaker_icon();
+    if let Some(idx) = renderer.graph_pass_index::<helio_pass_billboard::BillboardPass>() {
+        let custom_pass = helio_pass_billboard::BillboardPass::new_with_sprite_rgba(
+            device, queue, camera_buf, fmt, &rgba, w, h,
+        );
+        renderer.replace_graph_pass(idx, Box::new(custom_pass));
+    }
+}
+
 /// Generate a simple 16x16 white speaker icon as RGBA pixel data.
 fn generate_speaker_icon() -> (Vec<u8>, u32, u32) {
     let w = 32u32; let h = 32u32;
@@ -163,6 +194,41 @@ fn generate_speaker_icon() -> (Vec<u8>, u32, u32) {
         }
     }}
     (pixels, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_icon_has_correct_dimensions() {
+        let (pixels, w, h) = generate_speaker_icon();
+        assert_eq!(w, 32);
+        assert_eq!(h, 32);
+        assert_eq!(pixels.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn speaker_icon_has_non_transparent_pixels() {
+        let (pixels, _w, _h) = generate_speaker_icon();
+        let opaque = pixels.chunks_exact(4).filter(|c| c[3] == 255).count();
+        // Should have many white pixels (the speaker shape), not all transparent
+        assert!(opaque > 0, "speaker icon must contain non-transparent pixels");
+        assert!(opaque < pixels.len() / 4, "speaker icon should have transparent background");
+    }
+
+    #[test]
+    fn speaker_icon_white_pixels() {
+        let (pixels, _w, _h) = generate_speaker_icon();
+        for chunk in pixels.chunks_exact(4) {
+            if chunk[3] == 255 {
+                // Opaque pixels must be fully white (the shader tints them)
+                assert_eq!(chunk[0], 255);
+                assert_eq!(chunk[1], 255);
+                assert_eq!(chunk[2], 255);
+            }
+        }
+    }
 }
 
 fn hsl_to_rgba(h: f32, s: f32, l: f32, a: f32) -> [f32; 4] {
@@ -260,7 +326,7 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Helio – Indoor Cathedral")
+                        .with_title("Helio & Quasar; Indoor Cathedral w/ Spatial Audio")
                         .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32)),
                 )
                 .expect("window"),
@@ -318,7 +384,24 @@ impl ApplicationHandler for App {
 
         let config = RendererConfig::new(size.width, size.height, format)
                 .with_shadow_quality(helio::ShadowQuality::Ultra);
-        let scene = Scene::new(device.clone(), queue.clone());
+        let mut scene = Scene::new(device.clone(), queue.clone());
+
+        // Sky MUST be added to scene BEFORE build_default_graph / Renderer::new,
+        // otherwise the first render() call triggers rebuild_graph_if_sky_changed()
+        // which calls the GraphRebuilder and destroys any pass replacements made
+        // after construction (see Helio issue #192).
+        scene.insert_actor(helio::SceneActor::Sky(
+            helio::SkyActor::indoor([0.05, 0.05, 0.1]).with_clouds(helio::VolumetricClouds {
+                coverage: 0.7,
+                density: 0.8,
+                base: 1200.0,
+                top: 1800.0,
+                wind_x: 0.8,
+                wind_z: 0.2,
+                speed: 1.3,
+                skylight_intensity: 0.25,
+            }),
+        ));
         let debug_camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Debug Camera Buffer"),
             size: std::mem::size_of::<helio::DebugCameraUniform>() as u64,
@@ -348,18 +431,9 @@ impl ApplicationHandler for App {
             0.0,
         ));
 
-        renderer.scene_mut().insert_actor(helio::SceneActor::Sky(
-            helio::SkyActor::indoor([0.05, 0.05, 0.1]).with_clouds(helio::VolumetricClouds {
-                coverage: 0.7,
-                density: 0.8,
-                base: 1200.0,
-                top: 1800.0,
-                wind_x: 0.8,
-                wind_z: 0.2,
-                speed: 1.3,
-                skylight_intensity: 0.25,
-            }),
-        ));
+        // Sky was added to the Scene directly before Renderer creation above.
+        // This avoids Helio issue #192: graph rebuild on sky-change that would
+        // destroy any custom pass replacements made after construction.
 
         // Nave + aisles: total width = 22m (x: -11..+11), length = 60m (z: -28..+28), height = 21m
         // Expand floor to cover full cathedral footprint. 32m radius = 64m square.
@@ -631,14 +705,10 @@ impl ApplicationHandler for App {
         // run full tiled PCF every frame even though they're fixed.
         renderer.auto_bake(BakeConfig::fast("indoor_cathedral"));
 
-        // Replace default billboard sprite with speaker icon
-        if let Some(idx) = renderer.graph_pass_index::<helio_pass_billboard::BillboardPass>() {
-            let (rgba, w, h) = generate_speaker_icon();
-            let custom_pass = helio_pass_billboard::BillboardPass::new_with_sprite_rgba(
-                device.as_ref(), queue.as_ref(), &debug_camera_buf, format, &rgba, w, h,
-            );
-            renderer.replace_graph_pass(idx, Box::new(custom_pass));
-        }
+        // Replace default billboard sprite (spotlight.png) with speaker icon.
+        // Also re-applied every frame (see render()) to survive graph rebuilds
+        // triggered by resize or sky-change (Helio issue #192).
+        apply_billboard_replacement(&mut renderer, &device, &queue);
 
         let audio_engine = setup_quasar_audio();
 
@@ -959,6 +1029,10 @@ impl AppState {
                 HelioAction::DebugClear => renderer.debug_clear(),
             }
         }
+
+        // Re-apply billboard sprite replacement every frame to survive graph
+        // rebuilds triggered by resize or sky-change (Helio issue #192).
+        apply_billboard_replacement(&mut renderer, &*self.device, &*self.queue);
 
         // Chandeliers flicker slightly
         let flicker = 1.0 + (time * 9.1).sin() * 0.03 + (time * 5.7).cos() * 0.02;
