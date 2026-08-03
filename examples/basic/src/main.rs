@@ -113,6 +113,7 @@ struct AudioEngine {
     engine: Arc<Mutex<SpatialAudioEngine>>,
     _state: Arc<Mutex<WavPlayback>>,
     _stream: cpal::Stream,
+    levels: Arc<Mutex<[f32; NUM_SOURCES]>>,
 }
 
 fn zero_coeffs() -> SpatialCoefficients {
@@ -198,8 +199,10 @@ fn setup_audio_engine() -> AudioEngine {
         samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio,
     }));
 
+    let levels = Arc::new(Mutex::new([0.0_f32; NUM_SOURCES]));
     let eng_cb = engine.clone();
     let state_cb = state.clone();
+    let levels_cb = levels.clone();
     let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
 
@@ -237,6 +240,14 @@ fn setup_audio_engine() -> AudioEngine {
                     }
                     inputs.push(buf);
                 }
+                // Compute RMS per source for billboard flash feedback
+                if let Ok(mut lvls) = levels_cb.lock() {
+                    for src in 0..inputs.len() {
+                        let ch = inputs[src].channel(0);
+                        let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
+                        lvls[src] = (sum_sq / block as f32).sqrt();
+                    }
+                }
                 w.read_pos += block as f64 * ratio;
                 if w.read_pos >= (total_raw / nch) as f64 { w.read_pos = 0.0; }
 
@@ -260,7 +271,7 @@ fn setup_audio_engine() -> AudioEngine {
     ).expect("build output stream");
     stream.play().expect("play stream");
 
-    AudioEngine { engine, _state: state, _stream: stream }
+    AudioEngine { engine, _state: state, _stream: stream, levels }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -1234,12 +1245,22 @@ impl AppState {
         let look_dir = (glam::Vec3::ZERO - listener_pos).normalize();
         renderer.debug_cone((listener_pos + look_dir * 0.2).into(), look_dir.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
 
-        // Billboard speaker icons at each source position
+        // Billboard speaker icons at each source position, flash on audio activity
+        let src_levels = if let Ok(lvls) = self._audio_engine.levels.lock() { *lvls } else { [0.0; NUM_SOURCES] };
         let billboards: Vec<helio::BillboardInstance> = source_positions.iter().enumerate().map(|(i, &pos)| {
-            let c = hsl_to_rgba(i as f32 / source_positions.len() as f32, 0.9, 0.6, 1.0);
+            let lvl = src_levels[i];
+            let active = lvl > 0.005;
+            let scale = if active { (0.5 + lvl * 4.0).min(1.5) } else { 0.5 };
+            let mut c = hsl_to_rgba(i as f32 / source_positions.len() as f32, 0.9, 0.6, 1.0);
+            if active {
+                let boost = (lvl * 6.0).min(1.0);
+                c[0] = c[0] * (1.0 - boost) + boost;
+                c[1] = c[1] * (1.0 - boost) + boost;
+                c[2] = c[2] * (1.0 - boost) + boost;
+            }
             helio::BillboardInstance {
                 world_pos: [pos.x, pos.y + 1.2, pos.z, 1.0],
-                scale_flags: [0.5, 0.5, 0.0, 0.0],
+                scale_flags: [scale, scale, 0.0, 0.0],
                 color: c,
             }
         }).collect();
