@@ -144,10 +144,18 @@ impl AudioNodeGraph {
             }
         }
 
-        // Phase 3: sum all scratch buffers into output
+        // Phase 3: sum only leaf nodes (nodes with no outgoing connections)
+        // into output. Intermediate buffers (occlusion, reverb) are not output.
+        let mut is_source = vec![false; self.nodes.len()];
+        for conn in &self.connections {
+            if conn.from_node < is_source.len() {
+                is_source[conn.from_node] = true; // has outgoing connection
+            }
+        }
         for ch in 0..output.channels() as usize {
             let out_ch = output.channel_mut(ch as u16);
             for src_idx in 0..self.scratch.len() {
+                if is_source[src_idx] { continue; } // skip intermediate nodes
                 let sc = &self.scratch[src_idx];
                 let src_chs = sc.channels() as usize;
                 if ch < src_chs {
