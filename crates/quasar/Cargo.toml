@@ -13,3 +13,9 @@ quasar-core = { workspace = true }
 quasar-materials = { workspace = true }
 quasar-dsp = { workspace = true }
 quasar-backends = { workspace = true }
+log = { workspace = true }
+hound = { version = "3", optional = true }
+
+[features]
+default = []
+streaming = ["hound"]

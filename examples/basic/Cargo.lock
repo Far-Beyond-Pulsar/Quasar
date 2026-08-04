@@ -2585,6 +2585,8 @@ dependencies = [
 name = "quasar-audio"
 version = "0.1.0"
 dependencies = [
+ "hound",
+ "log",
  "quasar-backends",
  "quasar-core",
  "quasar-dsp",

@@ -37,6 +37,7 @@ use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use quasar_core::bands::Band8;
+use quasar_core::streaming_source::StreamingSource;
 use quasar_core::hybrid::HybridSamplingStrategy;
 use quasar_core::probe_grid::{AcousticProbe, AcousticProbeGrid};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
@@ -131,21 +132,63 @@ const SPEAKER_POSITIONS: [glam::Vec3; 8] = [
 /// that assumed the demo's position order matched the device's.
 const CHANNEL_MAP: [u32; 8] = [0, 1, 2, 5, 3, 4, 6, 7];
 
-struct WavPlayback {
-    samples: Vec<f32>,
-    num_channels: usize,
+/// Thin wrapper around `BufferedStream` for the audio callback.
+///
+/// All disk I/O happens on a background thread.  The callback never blocks.
+struct StreamingPlayback {
+    stream: quasar_audio::streaming_source::BufferedStream,
+    channels: usize,
     read_pos: f64,
     rate_ratio: f64,
-    /// Presentation-stage makeup gain (dB). The engine models absolute SPL —
-    /// inverse-distance attenuation across this ~30 m cathedral lands ~ −24 dB
-    /// below the source — so the demo applies a master volume on top.
-    /// Range -60..+36 dB via [/]; default +30.
     master_gain_db: f32,
+}
+
+impl StreamingPlayback {
+    fn open(path: &str, output_sample_rate: f32) -> Self {
+        // Scan the first chunk for peak normalisation (blocking, setup only).
+        let mut wave = quasar_audio::streaming_source::WaveFileStream::open(path)
+            .expect("open WAV for streaming");
+        let sample_rate = wave.sample_rate();
+        let channels = wave.channels();
+        let total_frames = wave.total_frames().unwrap_or(0);
+
+        let mut scan_buf = vec![0.0_f32; 4096 * channels];
+        let n = wave.read_frames(&mut scan_buf);
+        let peak = scan_buf[..n * channels].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        wave.seek_frames(0);
+
+        // This demo's ambient cathedral bed is meant to loop forever —
+        // declare that explicitly rather than waiting on the Auto heuristic.
+        let policy_source = quasar_audio::streaming_source::PolicyOverride::new(
+            wave,
+            quasar_core::streaming_source::StreamingPolicy::Common,
+        );
+        let stream = quasar_audio::streaming_source::BufferedStream::new(Box::new(policy_source));
+
+        eprintln!(
+            "[quasar-stream] opened {} ({} ch, {} Hz, {} frames, peak={:.3})",
+            path, channels, sample_rate, total_frames, peak,
+        );
+
+        Self {
+            stream,
+            channels,
+            read_pos: 0.0,
+            rate_ratio: sample_rate as f64 / output_sample_rate as f64,
+            master_gain_db: 0.0,
+        }
+    }
+
+    /// Read one resampled sample from the ring buffer (non-blocking).
+    /// `norm_gain` is baked into the peak-normalisation multiplier.
+    fn source_sample(&self, frame: u64, ch: usize) -> f32 {
+        self.stream.sample_at(frame, ch)
+    }
 }
 
 struct AudioEngine {
     engine: Arc<Mutex<SpatialAudioEngine>>,
-    _state: Arc<Mutex<WavPlayback>>,
+    _state: Arc<Mutex<StreamingPlayback>>,
     _stream: cpal::Stream,
     levels: Arc<Mutex<[f32; NUM_SPEAKERS]>>,
     source_id: SourceId,
@@ -154,26 +197,6 @@ struct AudioEngine {
 }
 
 fn setup_audio_engine() -> AudioEngine {
-    // Load WAV via hound
-    let reader = hound::WavReader::open("assets/8_Channel_ID.wav").expect("open WAV");
-    let spec = reader.spec();
-    let wav_sr = spec.sample_rate;
-    let nch_wav = spec.channels as usize;
-    let mut samples: Vec<f32> = match spec.bits_per_sample {
-        16 => reader.into_samples::<i16>().filter_map(|s| s.ok()).map(|s| s as f32 / i16::MAX as f32).collect(),
-        24 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / 8_388_608.0).collect(),
-        32 => reader.into_samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / i32::MAX as f32).collect(),
-        b => panic!("unsupported bit depth: {b}"),
-    };
-    // Normalize to a healthy 1 m reference level (peak ~0.9 FS) so the engine's
-    // inverse-distance attenuation across the cathedral stays clearly audible.
-    // Capped at +24 dB so a quiet file is not boosted into a noise wall.
-    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-    if peak > 0.0 && peak < 1.0 {
-        let gain = (0.9 / peak).min(16.0);
-        samples = samples.into_iter().map(|s| s * gain).collect();
-    }
-
     // Set up cpal
     let host = cpal::default_host();
     let device = host.default_output_device().expect("audio output device");
@@ -181,6 +204,10 @@ fn setup_audio_engine() -> AudioEngine {
     let out_sr = out_config.sample_rate().0;
     let out_ch = out_config.channels() as usize;
     let sr = out_sr as f32;
+
+    // Open the WAV as a streaming source (no full-file load).
+    let mut playback = StreamingPlayback::open("assets/8_Channel_ID.wav", sr);
+    let nch_wav = playback.channels;
 
     // Scene-pipeline engine: the demo no longer uses the legacy per-WAV-channel
     // graph (occ → rev → dec). One multi-channel Source is loaded, positioned
@@ -312,11 +339,9 @@ fn setup_audio_engine() -> AudioEngine {
     });
 
     let engine = Arc::new(Mutex::new(engine));
-    let rate_ratio = wav_sr as f64 / out_sr as f64;
 
-    let state = Arc::new(Mutex::new(WavPlayback {
-        samples, num_channels: nch_wav, read_pos: 0.0, rate_ratio, master_gain_db: 30.0,
-    }));
+    playback.master_gain_db = 0.0;
+    let state = Arc::new(Mutex::new(playback));
 
     let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));
     let eng_cb = engine.clone();
@@ -334,10 +359,9 @@ fn setup_audio_engine() -> AudioEngine {
 
             let mut w = match state_cb.lock() {
                 Ok(guard) => guard,
-                Err(_) => return, // poisoned playback state → keep this block silent
+                Err(_) => return,
             };
-            let total_raw = w.samples.len();
-            let nch = w.num_channels;
+            let nch = w.channels;
             let ratio = w.rate_ratio;
             let master_gain = 10.0_f32.powf(w.master_gain_db / 20.0);
             let mut remain = total_frames;
@@ -346,23 +370,17 @@ fn setup_audio_engine() -> AudioEngine {
             while remain > 0 {
                 let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                // ONE source buffer: deinterleave/resample every WAV channel into
-                // channel k of the source (the patch bay indexes by channel).
                 let mut src = AudioBuffer::new(nch as u16, block as u16);
                 for k in 0..nch.min(NUM_SPEAKERS) {
                     let ch = src.channel_mut(k as u16);
                     for i in 0..block {
                         let pos = w.read_pos + i as f64 * ratio;
-                        let fa = pos.floor() as usize;
+                        let fa = pos.floor() as u64;
                         let fb = fa + 1;
                         let frac = (pos - fa as f64) as f32;
-                        let g = |f: usize| -> f32 {
-                            if f < total_raw / nch { w.samples[f * nch + k] } else { 0.0 }
-                        };
-                        ch[i] = g(fa) + (g(fb) - g(fa)) * frac;
+                        ch[i] = w.source_sample(fa, k) + (w.source_sample(fb, k) - w.source_sample(fa, k)) * frac;
                     }
                 }
-                // Compute per-channel RMS for billboard flash feedback
                 if let Ok(mut lvls) = levels_cb.lock() {
                     for k in 0..nch.min(NUM_SPEAKERS) {
                         let ch = src.channel(k as u16);
@@ -370,11 +388,10 @@ fn setup_audio_engine() -> AudioEngine {
                         lvls[k] = (sum_sq / block as f32).sqrt();
                     }
                 }
+                let source_frames = (block as f64 * ratio).ceil() as u64;
+                w.stream.advance_read(source_frames);
                 w.read_pos += block as f64 * ratio;
-                if w.read_pos >= (total_raw / nch) as f64 { w.read_pos = 0.0; }
 
-                // Process through the scene pipeline: patch bay → spatial render →
-                // decode onto the listener's physical layout. Zero allocations.
                 let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
                 if let Ok(mut e) = eng_cb.lock() {
                     e.process_audio_scene(&[&src], std::slice::from_mut(&mut out));

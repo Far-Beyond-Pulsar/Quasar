@@ -3,6 +3,10 @@ pub use quasar_materials;
 pub use quasar_dsp;
 pub use quasar_backends;
 
+/// Streaming source implementations (behind `streaming` feature).
+#[cfg(feature = "streaming")]
+pub mod streaming_source;
+
 pub mod prelude {
     pub use quasar_core::*;
     pub use quasar_dsp::*;

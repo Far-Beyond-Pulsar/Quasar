@@ -7,7 +7,7 @@ edition = "2021"
 description = "Quasar spatial audio debug visualization demo (based on Helio indoor_cathedral)"
 
 [dependencies]
-quasar-audio = { path = "../../crates/quasar" }
+quasar-audio = { path = "../../crates/quasar", features = ["streaming"] }
 quasar-core = { path = "../../crates/quasar-core" }
 quasar-materials = { path = "../../crates/quasar-materials" }
 quasar-dsp = { path = "../../crates/quasar-dsp" }

@@ -41,10 +41,7 @@ impl AirAbsorptionOcclusionNode {
         debug_assert_eq!(input.samples(), output.samples());
 
         let num_samples = input.samples() as usize;
-        // 2× makeup so the direct path is clearly audible through distance
-        // attenuation (1/(1+d) ≈ 6 % at 14 m) without pushing the master
-        // gain into extreme values.
-        let gain = params.direct_gain.mean() * 2.0;
+        let gain = params.direct_gain.mean();
 
         for ch in 0..self.input_channels as usize {
             let in_ch = input.channel(ch as u16);
