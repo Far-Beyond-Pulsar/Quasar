@@ -10,6 +10,8 @@ A **high-performance, ultra-modular spatial audio engine** designed for deep int
 
 https://github.com/user-attachments/assets/b06229b1-589d-4fb2-ba1e-74ac4bad6793
 
+**Applications: game engine spatial audio, virtual production sound design, interactive installation acoustics, architectural acoustic simulation, VR/AR audio pipelines, real-time reverberation for music performance software, multi-speaker exhibit audio routing, and any system needing lock-free channel-level routing between arbitrary sources and physical speaker layouts.**
+
 ---
 
 ## Core Concept
