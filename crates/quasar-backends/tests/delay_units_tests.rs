@@ -31,10 +31,11 @@ fn expected(fs: f32) -> f32 {
 }
 
 fn floor_scene() -> AcousticScene {
+    // Wall at x = 10 (the current tracer shoots its first ray from the listener
+    // away from the source, so +x from a listener at x = 4 hits it).
     let mut s = AcousticScene::new();
-    // Large floor at y = -2 facing up.
-    let p = vec![[-50.0, -2.0, -50.0], [50.0, -2.0, -50.0], [50.0, -2.0, 50.0], [-50.0, -2.0, 50.0]];
-    s.add_mesh(AcousticMesh::new(1, p, vec![0, 2, 1, 0, 3, 2], 0));
+    let p = vec![[10.0, -50.0, -50.0], [10.0, 50.0, -50.0], [10.0, 50.0, 50.0], [10.0, -50.0, 50.0]];
+    s.add_mesh(AcousticMesh::new(1, p, vec![0, 1, 2, 0, 2, 3], 0));
     s
 }
 
