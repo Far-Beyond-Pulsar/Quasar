@@ -9,6 +9,7 @@ pub mod early_reflections;
 pub mod late_reverb;
 pub mod master_decoder;
 pub mod patch_bay;
+pub mod vbap;
 
 pub use audio_buffer::*;
 pub use crossfader::*;
@@ -20,3 +21,4 @@ pub use early_reflections::*;
 pub use late_reverb::*;
 pub use master_decoder::*;
 pub use patch_bay::*;
+pub use vbap::*;

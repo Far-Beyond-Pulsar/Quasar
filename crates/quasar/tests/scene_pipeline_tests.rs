@@ -166,3 +166,54 @@ fn no_pulls_renders_silence() {
 
     assert_eq!(last.peak(), 0.0, "no pulls → no audible content");
 }
+
+// ── pan_change_is_ramped_per_sample ──────────────────────────────────
+
+/// A pan move must change speaker gains with a per-sample ramp, not a
+/// per-block step: the stream stays smooth across block boundaries (a
+/// block-constant gain would step by ~0.1+ at every boundary during the fade).
+#[test]
+fn pan_change_is_ramped_per_sample() {
+    let mut engine = engine_with_backend();
+    let src = engine.load_source(source("mono.wav", 1)).expect("load source");
+    let out = engine.add_scene_output(SceneOutputConfig::new([3.0, 0.0, -3.0], Movability::Static));
+    engine.connect_pull(out, ChannelPull::new(src, 0, 0.0));
+    engine.add_listener(ListenerConfig {
+        position: [0.0, 0.0, 0.0],
+        heading: [0.0, 0.0, -1.0],
+        physical_layout: PhysicalOutputLayout::Stereo,
+    });
+    engine.update_scene_spatial();
+
+    let source_buf = dc(1.0);
+    let sources = [&source_buf];
+    // Settle (delay line fill, lowpass, initial fade).
+    let settled = render_blocks(&mut engine, &sources, 40);
+    let (l0, r0) = (sum_channel(&settled, 0), sum_channel(&settled, 1));
+    assert!(r0 > l0, "source front-right must start right-heavy");
+
+    // Swing the emitter to the left and record the whole transition.
+    engine.set_scene_output_position(out, [-3.0, 0.0, -3.0]);
+    engine.update_scene_spatial();
+    let mut out_buf = stereo_out();
+    let mut stream: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    for _ in 0..24 {
+        out_buf.clear();
+        engine.process_audio_scene(&sources, std::slice::from_mut(&mut out_buf));
+        for ch in 0..2u16 {
+            stream[ch as usize].extend_from_slice(out_buf.channel(ch));
+        }
+    }
+    let mut max_step = 0.0_f32;
+    for ch in 0..2 {
+        for w in stream[ch].windows(2) {
+            max_step = max_step.max((w[1] - w[0]).abs());
+        }
+    }
+    let (l1, r1) = (sum_channel(&out_buf, 0), sum_channel(&out_buf, 1));
+    assert!(l1 > r1, "pan must have swung left (L={l1}, R={r1})");
+    assert!(
+        max_step < 0.01,
+        "gain must ramp per sample, not step per block (max sample step {max_step})"
+    );
+}

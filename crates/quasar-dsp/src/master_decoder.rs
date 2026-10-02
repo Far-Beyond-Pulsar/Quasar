@@ -1,6 +1,7 @@
 use quasar_core::param_exchange::SpatialCoefficients;
 use crate::audio_buffer::{AudioBuffer, MAX_AUDIO_CHANNELS};
 use crate::node_graph::AudioNode;
+use crate::vbap::VbapPanner;
 
 /// Speaker layout for VBAP panning.
 #[derive(Clone, Debug)]
@@ -31,6 +32,11 @@ pub struct MasterSpatialDecoderNode {
     input_channels: u16,
     output_channels: u16,
     sample_rate: f32,
+    /// Shared constant-power VBAP panner (`Some` only for `Vbap` mode).
+    panner: Option<VbapPanner>,
+    /// Speaker gains at the end of the previous block (for per-sample ramps).
+    prev_gains: [f32; MAX_AUDIO_CHANNELS],
+    prev_valid: bool,
 }
 
 impl MasterSpatialDecoderNode {
@@ -38,10 +44,16 @@ impl MasterSpatialDecoderNode {
     pub fn new(mode: DecoderMode, sample_rate: f32) -> Self {
         let output_channels = Self::output_channels_for_mode(&mode);
         Self {
-            mode,
             input_channels: 2,
             output_channels,
             sample_rate,
+            panner: match &mode {
+                DecoderMode::Vbap { layout } => Some(layout_panner(layout)),
+                _ => None,
+            },
+            prev_gains: [0.0; MAX_AUDIO_CHANNELS],
+            prev_valid: false,
+            mode,
         }
     }
 
@@ -111,72 +123,36 @@ impl AudioNode for MasterSpatialDecoderNode {
                 let azimuth = params.direct_azimuth;
                 Self::binaural_render(mono, out_interleaved, azimuth, params.direct_elevation, self.sample_rate);
             }
-            DecoderMode::Vbap { layout } => {
-                // Resolve every layout to an explicit speaker-position set so all
-                // VBAP layouts share one panner. Named layouts use unit-vector
-                // directions; Custom layouts use the user's world-space positions.
-                let positions: Vec<[f32; 3]> = match layout {
-                    SpeakerLayout::Stereo => vec![
-                        [-0.5, 0.0, -0.866], // FL (-30°)
-                        [ 0.5, 0.0, -0.866], // FR (+30°)
-                    ],
-                    SpeakerLayout::Surround51 => vec![
-                        [-0.5, 0.0, -0.866],      // FL
-                        [ 0.5, 0.0, -0.866],      // FR
-                        [ 0.0, 0.0, -1.0],        // C
-                        [ 0.0, -0.707, -0.707],   // LFE (below center)
-                        [-0.94, 0.0, 0.342],      // SL (-110°)
-                        [ 0.94, 0.0, 0.342],      // SR (+110°)
-                    ],
-                    SpeakerLayout::Surround714 => vec![
-                        [-0.5, 0.0, -0.866],      // FL
-                        [ 0.5, 0.0, -0.866],      // FR
-                        [ 0.0, 0.0, -1.0],        // C
-                        [ 0.0, -0.707, -0.707],   // LFE (below center)
-                        [-0.94, 0.0, 0.342],      // SL (-110°)
-                        [ 0.94, 0.0, 0.342],      // SR (+110°)
-                        [-0.5, 0.0, 0.866],       // BL (-150°)
-                        [ 0.5, 0.0, 0.866],       // BR (+150°)
-                    ],
-                    SpeakerLayout::Quad => vec![
-                        [-0.707, 0.0, -0.707],   // FL (-45°)
-                        [ 0.707, 0.0, -0.707],   // FR (+45°)
-                        [-0.707, 0.0, 0.707],    // BL (-135°)
-                        [ 0.707, 0.0, 0.707],    // BR (+135°)
-                    ],
-                    SpeakerLayout::Custom { positions } => positions.clone(),
-                };
-
-                // Reconstruct the source direction from the spatial azimuth/elevation
-                // (azimuth 0 = straight ahead / -Z, +X = right), then give each speaker
-                // a gain proportional to how well its position matches that direction
-                // (measured from the listener origin), with cosine falloff.
-                let src_dir = [
-                    params.direct_azimuth.sin() * params.direct_elevation.cos(),
-                    params.direct_elevation.sin(),
-                    -params.direct_azimuth.cos() * params.direct_elevation.cos(),
-                ];
-                let mut gains = vec![0.0f32; positions.len()];
-                for (i, p) in positions.iter().enumerate() {
-                    let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-                    if len <= 1e-6 { continue; }
-                    let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
-                    let d = dot.clamp(-1.0, 1.0);
-                    gains[i] = d.max(0.0).powi(2);
+            DecoderMode::Vbap { .. } => {
+                // Constant-power VBAP via the shared panner (LFE slots stay silent),
+                // with a per-sample linear gain ramp from the previous block's gains
+                // so block-rate pan changes do not zipper.
+                let mut target = [0.0_f32; MAX_AUDIO_CHANNELS];
+                let out_chs = (output.channels() as usize).min(MAX_AUDIO_CHANNELS);
+                if let Some(panner) = &self.panner {
+                    panner.gains(params.direct_azimuth, params.direct_elevation, &mut target[..out_chs]);
                 }
-                let sum: f32 = gains.iter().sum();
-                if sum > 1e-6 {
-                    for g in gains.iter_mut() { *g /= sum; }
+                if !self.prev_valid {
+                    self.prev_gains = target;
+                    self.prev_valid = true;
                 }
-                let out_chs = output.channels() as usize;
-                for i in 0..num_samples {
-                    let mut mono = 0.0;
-                    for ch in 0..input.channels() as usize {
-                        mono += input.channel(ch as u16)[i];
+                let in_chs = input.channels() as usize;
+                let inv_in = 1.0 / in_chs.max(1) as f32;
+                for ch in 0..out_chs {
+                    let g0 = self.prev_gains[ch];
+                    let g1 = target[ch];
+                    self.prev_gains[ch] = g1;
+                    if g0 == 0.0 && g1 == 0.0 {
+                        continue;
                     }
-                    mono /= input.channels() as f32;
-                    for (ch, &g) in gains.iter().enumerate().take(out_chs) {
-                        output.channel_mut(ch as u16)[i] = mono * g;
+                    let step = (g1 - g0) / num_samples.max(1) as f32;
+                    let dst = output.channel_mut(ch as u16);
+                    for i in 0..num_samples {
+                        let mut mono = 0.0;
+                        for c in 0..in_chs {
+                            mono += input.channel(c as u16)[i];
+                        }
+                        dst[i] = mono * inv_in * (g0 + step * (i + 1) as f32);
                     }
                 }
             }
@@ -195,7 +171,7 @@ impl AudioNode for MasterSpatialDecoderNode {
     }
 
     fn reset(&mut self) {
-        // No state to reset
+        self.prev_valid = false;
     }
 
     fn input_channels(&self) -> u16 {
@@ -207,35 +183,35 @@ impl AudioNode for MasterSpatialDecoderNode {
     }
 }
 
-// ── Zero-alloc VBAP helpers (scene pipeline) ─────────────────────────────
+// ── VBAP layout helpers (scene pipeline) ─────────────────────────────────
 
-/// Unit-vector speaker directions for the named layouts.
-///
-/// Must stay in lock-step with the inline tables in
-/// [`MasterSpatialDecoderNode`]'s VBAP branch (see `process`).
+/// Unit-vector speaker directions for the named layouts (azimuth 0 = -Z,
+/// +azimuth toward +X). Slot order follows the WASAPI / SMPTE channel order.
 const STEREO_POSITIONS: [[f32; 3]; 2] = [
     [-0.5, 0.0, -0.866], // FL (-30°)
     [ 0.5, 0.0, -0.866], // FR (+30°)
 ];
 
+/// 5.1: FL FR C LFE BL BR (surrounds at ±110°). LFE (slot 3) is never panned to.
 const SURROUND51_POSITIONS: [[f32; 3]; 6] = [
-    [-0.5, 0.0, -0.866],      // FL
-    [ 0.5, 0.0, -0.866],      // FR
+    [-0.5, 0.0, -0.866],      // FL (-30°)
+    [ 0.5, 0.0, -0.866],      // FR (+30°)
     [ 0.0, 0.0, -1.0],        // C
-    [ 0.0, -0.707, -0.707],   // LFE (below center)
-    [-0.94, 0.0, 0.342],      // SL (-110°)
-    [ 0.94, 0.0, 0.342],      // SR (+110°)
+    [ 0.0, 0.0, -1.0],        // LFE (position unused)
+    [-0.94, 0.0, 0.342],      // BL (-110°)
+    [ 0.94, 0.0, 0.342],      // BR (+110°)
 ];
 
+/// 7.1: FL FR C LFE BL BR SL SR (standard order). LFE (slot 3) is never panned to.
 const SURROUND714_POSITIONS: [[f32; 3]; 8] = [
-    [-0.5, 0.0, -0.866],      // FL
-    [ 0.5, 0.0, -0.866],      // FR
+    [-0.5, 0.0, -0.866],      // FL (-30°)
+    [ 0.5, 0.0, -0.866],      // FR (+30°)
     [ 0.0, 0.0, -1.0],        // C
-    [ 0.0, -0.707, -0.707],   // LFE (below center)
-    [-0.94, 0.0, 0.342],      // SL (-110°)
-    [ 0.94, 0.0, 0.342],      // SR (+110°)
+    [ 0.0, 0.0, -1.0],        // LFE (position unused)
     [-0.5, 0.0, 0.866],       // BL (-150°)
     [ 0.5, 0.0, 0.866],       // BR (+150°)
+    [-1.0, 0.0, 0.0],         // SL (-90°)
+    [ 1.0, 0.0, 0.0],         // SR (+90°)
 ];
 
 const QUAD_POSITIONS: [[f32; 3]; 4] = [
@@ -247,9 +223,8 @@ const QUAD_POSITIONS: [[f32; 3]; 4] = [
 
 /// Resolve a speaker layout to explicit speaker directions (unit vectors).
 ///
-/// Named layouts use the exact unit-vector positions already in
-/// [`MasterSpatialDecoderNode`] (Stereo ±30°, 5.1, 7.1, Quad); Custom uses the
-/// caller's positions. API thread only (allocates).
+/// Named layouts use fixed unit-vector positions; Custom uses the caller's
+/// positions. API thread only (allocates).
 pub fn layout_positions(layout: &SpeakerLayout) -> Vec<[f32; 3]> {
     match layout {
         SpeakerLayout::Stereo => STEREO_POSITIONS.to_vec(),
@@ -260,46 +235,19 @@ pub fn layout_positions(layout: &SpeakerLayout) -> Vec<[f32; 3]> {
     }
 }
 
-/// Fill `out[0..n]` with per-speaker VBAP gains for the given resolved speaker
-/// directions. Returns the number of speakers written (`n`).
+/// Output slots that carry the LFE channel (never receive panned signal).
 ///
-/// Zero allocation. Reuses the same math as [`MasterSpatialDecoderNode`]'s VBAP
-/// branch: `src_dir = [sin(az)·cos(el), sin(el), -cos(az)·cos(el)]`; per-speaker
-/// gain = `(dot(src_dir, pos)/len(pos)).max(0)²`, normalized to sum 1.
-///
-/// `positions` comes from [`layout_positions`] (precomputed per listener on the
-/// API thread); `out` is caller-owned stack scratch.
-pub fn vbap_gains(
-    positions: &[[f32; 3]],
-    azimuth: f32,
-    elevation: f32,
-    out: &mut [f32; MAX_AUDIO_CHANNELS],
-) -> usize {
-    let n = positions.len().min(out.len());
-
-    let src_dir = [
-        azimuth.sin() * elevation.cos(),
-        elevation.sin(),
-        -azimuth.cos() * elevation.cos(),
-    ];
-
-    for (i, p) in positions.iter().enumerate().take(n) {
-        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-        if len <= 1e-6 {
-            out[i] = 0.0;
-            continue;
-        }
-        let dot = (src_dir[0] * p[0] + src_dir[1] * p[1] + src_dir[2] * p[2]) / len;
-        let d = dot.clamp(-1.0, 1.0);
-        out[i] = d.max(0.0).powi(2);
+/// Named 5.1 and 7.1 layouts have LFE at index 3; every other layout
+/// (including Custom) has none.
+pub fn layout_lfe(layout: &SpeakerLayout) -> &'static [usize] {
+    match layout {
+        SpeakerLayout::Surround51 | SpeakerLayout::Surround714 => &[3],
+        _ => &[],
     }
+}
 
-    let sum: f32 = out.iter().take(n).sum();
-    if sum > 1e-6 {
-        for g in out.iter_mut().take(n) {
-            *g /= sum;
-        }
-    }
-
-    n
+/// Build the constant-power VBAP panner for a layout (positions + LFE slots).
+/// API thread only (allocates).
+pub fn layout_panner(layout: &SpeakerLayout) -> VbapPanner {
+    VbapPanner::new(&layout_positions(layout), layout_lfe(layout))
 }

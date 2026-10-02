@@ -33,7 +33,8 @@ use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNE
 use quasar_dsp::crossfader::EqualPowerCrossfader;
 use quasar_dsp::early_reflections::EarlyReflectionDelayNode;
 use quasar_dsp::late_reverb::FdnReverbNode;
-use quasar_dsp::master_decoder::{layout_positions, vbap_gains, SpeakerLayout};
+use quasar_dsp::master_decoder::{layout_panner, SpeakerLayout};
+use quasar_dsp::vbap::VbapPanner;
 use quasar_dsp::node_graph::{AudioNode, AudioNodeGraph};
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayNode, PatchEntry};
@@ -122,8 +123,13 @@ struct SceneRenderState {
     /// causes a 1700-sample jump at every block boundary during the 15 ms
     /// transition, producing a 188 Hz click train).
     direct_delays: Vec<f32>,
-    /// Per-listener cached resolved speaker positions (from listener.physical_layout).
-    listener_layouts: Vec<Vec<[f32; 3]>>,
+    /// Per-listener VBAP panner (from listener.physical_layout; LFE slots excluded).
+    listener_panners: Vec<VbapPanner>,
+    /// Speaker gains applied at the end of the previous block, one row per
+    /// (listener x output) (flat index listener * n_out + output), for per-sample ramps.
+    prev_gains: Vec<[f32; MAX_AUDIO_CHANNELS]>,
+    /// False until the pair has rendered once after a rebuild (first block uses target directly).
+    prev_valid: Vec<bool>,
     /// Preallocated scratch (all mono unless noted), sized to DEFAULT_BLOCK_SIZE.
     mixed: Vec<AudioBuffer>,        // patch bay output per scene output
     filtered: Vec<AudioBuffer>,     // occ output per scene output
@@ -152,7 +158,9 @@ impl SceneRenderState {
             occ: Vec::new(),
             early: Vec::new(),
             rev: Vec::new(),
-            listener_layouts: Vec::new(),
+            listener_panners: Vec::new(),
+            prev_gains: Vec::new(),
+            prev_valid: Vec::new(),
             direct_delays: Vec::new(),
             mixed: Vec::new(),
             filtered: Vec::new(),
@@ -609,42 +617,56 @@ impl SpatialAudioEngine {
             }
         }
 
-        // 5. Per-listener decode: VBAP the rendered mono onto the physical
-        //    layout and sum into the listener's output bus.
+        // 5. Per-listener decode: constant-power VBAP the rendered mono onto
+        //    the physical layout and sum into the listener's output bus.
         //
-        //    The crossfader's `direct_azimuth` is a WORLD-space angle from the
-        //    listener position toward the source.  To pan correctly on the
-        //    physical speaker array we must rotate it by the listener's
-        //    heading (yaw) so that a source the listener faces is heard from
-        //    the front speakers regardless of the world rotation.
+        //    The crossfader's `direct_azimuth`/`direct_elevation` are WORLD-space
+        //    angles from the listener toward the source. They are turned into a
+        //    direction vector and rotated into the listener's frame (full basis
+        //    from `heading`, so pitch counts too; roll is not modelled) before
+        //    panning. Speaker gains are ramped linearly per sample from the
+        //    previous block's gains to this block's target (no zipper noise).
         let n_lis_proc = n_lis
-            .min(self.scene.listener_layouts.len())
+            .min(self.scene.listener_panners.len())
             .min(listener_outputs.len());
-        let mut gains = [0.0_f32; MAX_AUDIO_CHANNELS];
+        let mut target = [0.0_f32; MAX_AUDIO_CHANNELS];
         for l in 0..n_lis_proc {
-            let heading = self.listeners[l].heading;
-            let heading_yaw = heading[0].atan2(-heading[2]);
+            let basis = ListenerBasis::from_heading(self.listeners[l].heading);
             let out = &mut listener_outputs[l];
             out.clear();
             let n_speakers = out.channels() as usize;
+            let panner = &self.scene.listener_panners[l];
+            let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
             for o in 0..n_out_proc {
-                let coeff = self.scene.crossfaders[l * n_out + o].current_coefficients();
-                let listener_azimuth = coeff.direct_azimuth - heading_yaw;
-                let n = vbap_gains(
-                    &self.scene.listener_layouts[l],
-                    listener_azimuth,
-                    coeff.direct_elevation,
-                    &mut gains,
-                );
+                let idx = l * n_out + o;
+                let coeff = self.scene.crossfaders[idx].current_coefficients();
+                let (az, el) = basis.to_listener_angles(coeff.direct_azimuth, coeff.direct_elevation);
+                panner.gains(az, el, &mut target[..n]);
+
+                let prev = &mut self.scene.prev_gains[idx];
+                if !self.scene.prev_valid[idx] {
+                    // First block after a rebuild: start at the target, don't ramp from garbage.
+                    prev[..n].copy_from_slice(&target[..n]);
+                    self.scene.prev_valid[idx] = true;
+                }
                 let combined_ch = self.scene.combined[o].channel(0);
-                for sp in 0..n.min(n_speakers) {
-                    let g = gains[sp];
-                    if g == 0.0 {
+                for sp in 0..n {
+                    let g0 = prev[sp];
+                    let g1 = target[sp];
+                    prev[sp] = g1;
+                    if sp >= n_speakers || (g0 == 0.0 && g1 == 0.0) {
                         continue;
                     }
                     let ch = out.channel_mut(sp as u16);
-                    for i in 0..block {
-                        ch[i] += combined_ch[i] * g;
+                    if g0 == g1 {
+                        for i in 0..block {
+                            ch[i] += combined_ch[i] * g1;
+                        }
+                    } else {
+                        let step = (g1 - g0) / block.max(1) as f32;
+                        for i in 0..block {
+                            ch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
+                        }
                     }
                 }
             }
@@ -712,10 +734,10 @@ impl SpatialAudioEngine {
             .collect();
         let rev = (0..n_out).map(|_| FdnReverbNode::new(1, sr)).collect();
 
-        let listener_layouts = self
+        let listener_panners: Vec<VbapPanner> = self
             .listeners
             .iter()
-            .map(|l| layout_positions(&physical_to_speaker_layout(&l.physical_layout)))
+            .map(|l| layout_panner(&physical_to_speaker_layout(&l.physical_layout)))
             .collect();
         // Direct-path delays: pre-allocated, written by update_scene_spatial.
         let direct_delays = vec![0.0_f32; n_out];
@@ -739,7 +761,9 @@ impl SpatialAudioEngine {
             occ,
             early,
             rev,
-            listener_layouts,
+            listener_panners,
+            prev_gains: vec![[0.0; MAX_AUDIO_CHANNELS]; n_out * n_lis],
+            prev_valid: vec![false; n_out * n_lis],
             direct_delays,
             mixed,
             filtered,
@@ -1028,3 +1052,37 @@ fn physical_to_speaker_layout(layout: &PhysicalOutputLayout) -> SpeakerLayout {
     }
 }
 
+
+/// Listener-space basis built from a heading vector (forward), world up = +Y.
+///
+/// `right = forward x up`, `up' = right x forward`. When looking (almost)
+/// straight up/down the right axis falls back to world +X.
+struct ListenerBasis {
+    fwd: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+}
+
+impl ListenerBasis {
+    fn from_heading(heading: [f32; 3]) -> Self {
+        let norm = |v: [f32; 3]| -> Option<[f32; 3]> {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if l > 1e-4 && l.is_finite() { Some([v[0] / l, v[1] / l, v[2] / l]) } else { None }
+        };
+        let cross = |a: [f32; 3], b: [f32; 3]| {
+            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        };
+        let fwd = norm(heading).unwrap_or([0.0, 0.0, -1.0]);
+        let right = norm(cross(fwd, [0.0, 1.0, 0.0])).unwrap_or([1.0, 0.0, 0.0]);
+        let up = cross(right, fwd);
+        Self { fwd, right, up }
+    }
+
+    /// Convert world-space (azimuth, elevation) from the listener to listener-space angles.
+    fn to_listener_angles(&self, az: f32, el: f32) -> (f32, f32) {
+        let s = [az.sin() * el.cos(), el.sin(), -az.cos() * el.cos()];
+        let d = |b: &[f32; 3]| b[0] * s[0] + b[1] * s[1] + b[2] * s[2];
+        let (x, y, f) = (d(&self.right), d(&self.up), d(&self.fwd));
+        (x.atan2(f), y.atan2(x.hypot(f)))
+    }
+}
