@@ -31,7 +31,7 @@ impl EarlyReflectionDelayNode {
     /// `max_reflections`: maximum number of early reflection taps to support.
     pub fn new(input_channels: u16, sample_rate: f32, max_delay_secs: f32, max_reflections: usize) -> Self {
         let delay_line = HermiteInterpolatingDelayLine::new(max_delay_secs, sample_rate);
-        let taps = Vec::with_capacity(max_reflections);
+        let taps = Vec::with_capacity(max_reflections.max(crate::crossfader::MAX_CROSSFADE_REFLECTIONS));
         Self {
             delay_line,
             taps,
@@ -44,12 +44,17 @@ impl EarlyReflectionDelayNode {
 
     /// Update reflection taps from spatial coefficients.
     pub fn update_reflections(&mut self, reflections: &[EarlyReflectionCoeffs]) {
+        // Called every block from the audio thread: never grow the Vec (the
+        // crossfader's in-flight set can hold the union of two reflection
+        // lists, up to `MAX_CROSSFADE_REFLECTIONS`), and never read past the
+        // delay line (release builds wrap into garbage instead of asserting).
         self.taps.clear();
-        for r in reflections {
+        let max_delay = (self.delay_line.max_samples() - 3) as f32;
+        for r in reflections.iter().take(self.taps.capacity()) {
             // Mono early-reflection contribution; pan (azimuth) is spatialized in P3.
             let avg_gain = r.gain.0.iter().sum::<f32>() / 8.0;
             self.taps.push(ReflectionTap {
-                delay_samples: r.delay_samples,
+                delay_samples: r.delay_samples.clamp(0.0, max_delay),
                 gain: avg_gain,
             });
         }

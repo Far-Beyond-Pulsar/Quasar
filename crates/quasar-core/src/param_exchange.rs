@@ -41,6 +41,10 @@ pub struct EarlyReflectionCoeffs {
     pub gain: Band8,
 }
 
+/// Slot-index mask / "freshly published" flag for the exchange slot.
+const SLOT_MASK: u32 = 0b011;
+const SLOT_DIRTY: u32 = 0b100;
+
 /// Lock-free triple-buffered parameter exchange for multiple sources.
 ///
 /// Each source has its own set of 3 slots (write / read / staging) and its own
@@ -57,7 +61,8 @@ pub struct ParameterTripleBuffer {
     write_indices: Vec<AtomicU32>,
     /// Per-source read index (consumer).
     read_indices: Vec<AtomicU32>,
-    /// Per-source staging index (exchange slot).
+    /// Per-source exchange slot: low 2 bits = slot index, `SLOT_DIRTY` set when
+    /// the producer has published data the consumer has not taken yet.
     staging_indices: Vec<AtomicU32>,
     /// Global latest version (per-source versions are tracked individually).
     _latest_version: AtomicU64,
@@ -121,18 +126,30 @@ impl ParameterTripleBuffer {
         unsafe {
             (*self.buffers[source_id][write_idx].get()).version = version;
         }
-        let staging = self.staging_indices[source_id]
-            .swap(write_idx as u32, Ordering::AcqRel);
-        self.write_indices[source_id].store(staging, Ordering::Release);
+        // Hand our slot to the exchange (marked dirty) and take back whatever
+        // slot was parked there. One atomic swap: no window for the consumer.
+        let prev = self.staging_indices[source_id]
+            .swap(write_idx as u32 | SLOT_DIRTY, Ordering::AcqRel);
+        self.write_indices[source_id].store(prev & SLOT_MASK, Ordering::Release);
     }
 
     /// Advance to the latest published data for all sources.
     /// Called from the audio thread once per block.
+    ///
+    /// Only takes the exchange slot when the producer has published since the
+    /// last call (DIRTY set); otherwise the read slot is left alone, so the
+    /// consumer never goes back to older data.
     pub fn update(&self) {
         for src in 0..self.buffers.len() {
-            let staging = self.staging_indices[src].load(Ordering::Acquire);
-            let read = self.read_indices[src].swap(staging, Ordering::AcqRel);
-            self.staging_indices[src].store(read, Ordering::Release);
+            if self.staging_indices[src].load(Ordering::Acquire) & SLOT_DIRTY == 0 {
+                continue;
+            }
+            let read = self.read_indices[src].load(Ordering::Relaxed);
+            // Give back our (clean) read slot; the producer can only ever
+            // replace the exchange value with another dirty one, so the slot
+            // we receive here is always the newest published.
+            let taken = self.staging_indices[src].swap(read, Ordering::AcqRel);
+            self.read_indices[src].store(taken & SLOT_MASK, Ordering::Release);
         }
     }
 

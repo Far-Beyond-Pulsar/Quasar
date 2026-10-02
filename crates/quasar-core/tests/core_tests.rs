@@ -275,7 +275,23 @@ fn probe_grid_trilinear() {
     assert_eq!(grid.len(), 8);
 
     let sample = grid.sample(&[0.5, 0.5, 0.5]).expect("should be inside grid");
-    assert!((sample.t60.0[0] - 1.5).abs() < 1e-4);
+    // Corner values are (x+y+z)*0.5, so the cell-centre mean is 1.5 * 0.5 = 0.75.
+    assert!((sample.t60.0[0] - 0.75).abs() < 1e-4);
+
+    // Weights must sum to 1 along z: with only z varying, t60 is linear in z.
+    let zprobes: Vec<_> = (0..8usize).map(|i| AcousticProbe {
+        position: [0.0; 3],
+        rir_samples: Vec::new(),
+        sample_rate: 48000,
+        t60: Band8::splat(if i >= 4 { 8.0 } else { 4.0 }),
+        broadband_t60: 0.0,
+        early_late_split_secs: 0.05,
+    }).collect();
+    let zg = AcousticProbeGrid::new(zprobes, [0.0; 3], [1.0; 3], [2, 2, 2]).unwrap();
+    for (z, want) in [(0.0_f32, 4.0_f32), (0.25, 5.0), (0.5, 6.0), (0.75, 7.0), (1.0, 8.0)] {
+        let s = zg.sample(&[0.5, 0.5, z]).unwrap();
+        assert!((s.t60.0[0] - want).abs() < 1e-4, "z={z}: {} != {want}", s.t60.0[0]);
+    }
     assert!((sample.interpolation_quality - 1.0).abs() < 1e-4);
 }
 

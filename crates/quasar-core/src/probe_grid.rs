@@ -187,13 +187,10 @@ impl AcousticProbeGrid {
             .scale(ix * wy * wz)
             .add(&self.probes[corner_indices[7]].t60.scale(wx * wy * wz));
 
-        let c0 = c00.add(&c01);
-        let c1 = c10.add(&c11);
-
-        // Final interpolation along z.
-        let iz_wz = iz;
-        let wz = wz;
-        c0.scale(iz_wz).add(&c1.scale(wz))
+        // The z weights (iz / wz) are already folded into every corner term
+        // above, so the two layers are simply summed; scaling again would
+        // apply the z weight twice (weights summing to iz² + wz², not 1).
+        c00.add(&c01).add(&c10.add(&c11))
     }
 
     /// Number of probes in the grid.

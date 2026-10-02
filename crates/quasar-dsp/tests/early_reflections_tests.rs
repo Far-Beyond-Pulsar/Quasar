@@ -82,3 +82,37 @@ fn renders_mono_taps_at_expected_delays() {
     // Total energy = 2 taps × 0.5².
     assert!((energy - 0.5).abs() < 1e-4, "total energy {energy}");
 }
+
+// ── shrinking / oversized lists (crossfader union during a fade) ─────
+
+#[test]
+fn update_does_not_allocate_or_read_past_line_for_large_or_shrinking_lists() {
+    let mut node = EarlyReflectionDelayNode::new(1, 48_000.0, 0.2, 16);
+    let refl = |delay: f32, g: f32| EarlyReflectionCoeffs {
+        azimuth: 0.0,
+        elevation: 0.0,
+        delay_samples: delay,
+        gain: Band8::splat(g),
+    };
+
+    // Union-sized list (> the 16 requested), one tap far beyond the 0.2 s line.
+    let big: Vec<_> = (0..64).map(|i| refl(20.0 + i as f32, 0.01)).collect();
+    node.update_reflections(&big);
+    let mut out = AudioBuffer::new(1, SAMPLES as u16);
+    node.process(&impulse(), &mut out, &default_params());
+
+    let mut far = big.clone();
+    far.push(refl(1.0e6, 1.0));
+    node.update_reflections(&far);
+    node.process(&impulse(), &mut out, &default_params());
+    assert!(out.channel(0).iter().all(|s| s.is_finite()));
+
+    // Shrinking to a single tap and then to none is clean.
+    node.update_reflections(&[refl(10.0, 0.5)]);
+    let mut out = AudioBuffer::new(1, SAMPLES as u16);
+    node.process(&impulse(), &mut out, &default_params());
+    node.update_reflections(&[]);
+    let mut out2 = AudioBuffer::new(1, SAMPLES as u16);
+    node.process(&AudioBuffer::new(1, SAMPLES as u16), &mut out2, &default_params());
+    assert!(out2.channel(0).iter().all(|s| *s == 0.0 || s.is_finite()));
+}
