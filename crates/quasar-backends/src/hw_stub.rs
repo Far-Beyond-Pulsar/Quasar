@@ -1,5 +1,5 @@
 use quasar_core::backend::{
-    DirectPathResult, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery,
+    DirectPathResult, DEFAULT_SAMPLE_RATE, SPEED_OF_SOUND, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery,
     SpatialQueryResult,
 };
 use quasar_core::bands::Band8;
@@ -16,12 +16,13 @@ use quasar_core::scene::AcousticScene;
 /// Thread-safe: uses only immutable self (no internal state).
 pub struct HardwareAcceleratorStub {
     has_scene: bool,
+    sample_rate: f32,
 }
 
 impl HardwareAcceleratorStub {
     /// Create a new `HardwareAcceleratorStub` with no scene loaded.
     pub fn new() -> Self {
-        Self { has_scene: false }
+        Self { has_scene: false, sample_rate: DEFAULT_SAMPLE_RATE }
     }
 }
 
@@ -43,7 +44,7 @@ impl IAcousticComputeBackend for HardwareAcceleratorStub {
                     source_id: q.source_id,
                     direct_path: DirectPathResult {
                         attenuation: Band8::splat(1.0 / (1.0 + dist)),
-                        delay_samples: dist * 48_000.0 / 343.0,
+                        delay_samples: dist * self.sample_rate / SPEED_OF_SOUND,
                         distance: dist,
                         occluded: false,
                         occlusion_factor: 1.0,
@@ -57,6 +58,12 @@ impl IAcousticComputeBackend for HardwareAcceleratorStub {
                 }
             })
             .collect()
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        if sample_rate.is_finite() && sample_rate > 0.0 {
+            self.sample_rate = sample_rate;
+        }
     }
 
     fn supports_dynamic_geometry(&self) -> bool {

@@ -106,35 +106,42 @@ fn audio_buffer_rms_peak() {
     assert!((buf.peak() - 0.9).abs() < 1e-6);
 }
 
+/// Build coefficients with the given identity / direct-path fields; everything
+/// else is neutral. Keeps the tests independent of struct-literal churn.
+fn coeffs(source_id: u32, gain: f32, delay: f32, azimuth: f32, version: u64) -> SpatialCoefficients {
+    SpatialCoefficients {
+        source_id,
+        direct_gain: Band8::splat(gain),
+        direct_delay_samples: delay,
+        direct_azimuth: azimuth,
+        direct_elevation: 0.0,
+        early_reflections: Vec::new(),
+        late_t60: Band8::splat(0.5),
+        late_gain_db: -10.0,
+        version,
+    }
+}
+
+/// 10 ms fade at 48 kHz = 480 frames.
+const FADE_FRAMES: usize = 480;
+
 // ── equal_power_crossfader_snap ───────────────────────────────────────
 
 #[test]
 fn equal_power_crossfader_snap() {
-    let initial = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(0.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, initial);
+    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, coeffs(0, 0.0, 0.0, 0.0, 0));
 
-    let target = SpatialCoefficients {
-        source_id: 1,
-        direct_gain: Band8::splat(0.9),
-        direct_delay_samples: 10.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(2.0),
-        late_gain_db: -3.0,
-        version: 1,
-    };
+    let mut target = coeffs(1, 0.9, 10.0, 0.0, 1);
+    target.late_t60 = Band8::splat(2.0);
+    target.late_gain_db = -3.0;
     xfader.snap_to(target);
 
-    let coeffs = xfader.current_coefficients();
-    assert_eq!(coeffs.source_id, 1);
-    assert!((coeffs.direct_gain.0[0] - 0.9).abs() < 1e-6);
+    let c = xfader.current_coefficients();
+    assert_eq!(c.source_id, 1);
+    assert!((c.direct_gain.0[0] - 0.9).abs() < 1e-6);
+    assert!((c.direct_delay_samples - 10.0).abs() < 1e-6);
+    assert!((c.late_t60.0[3] - 2.0).abs() < 1e-6);
+    assert!((c.late_gain_db + 3.0).abs() < 1e-6);
     assert!(xfader.is_complete());
 }
 
@@ -142,77 +149,72 @@ fn equal_power_crossfader_snap() {
 
 #[test]
 fn equal_power_crossfader_transition() {
-    let initial = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(0.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, initial);
+    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, coeffs(0, 0.0, 0.0, 0.0, 0));
+    xfader.set_target(&coeffs(0, 1.0, 0.0, 0.0, 1));
+    assert!(!xfader.is_complete());
 
-    let target = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 1,
-    };
-    xfader.set_target(target);
-
-    let fade_frames = ((10.0_f64 / 1000.0) * 48000.0).round() as u32;
-    for _ in 0..fade_frames {
-        xfader.advance();
-    }
+    // A whole fade worth of frames in one block completes it.
+    let t = xfader.advance(FADE_FRAMES);
+    assert!((t - 1.0).abs() < 1e-6);
     assert!(xfader.is_complete());
-
-    let coeffs = xfader.current_coefficients();
-    assert!((coeffs.direct_gain.0[0] - 1.0).abs() < 1e-3);
+    assert!((xfader.current_coefficients().direct_gain.0[0] - 1.0).abs() < 1e-3);
 }
 
-// ── equal_power_crossfader_constant_power ─────────────────────────────
+// ── crossfader parameter blend (replaces the old cos^2 + sin^2 identity) ─
 
+/// Parameters are blended linearly with t = frames / fade_frames. Advancing in
+/// 256-frame blocks must hit exactly t = 256/480 and then t = 1 (target).
 #[test]
-fn equal_power_crossfader_constant_power() {
-    let initial = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(0.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, initial.clone());
+fn crossfader_blend_is_linear_in_frames() {
+    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, coeffs(0, 0.0, 0.0, 0.0, 0));
+    xfader.set_target(&coeffs(0, 1.0, 100.0, 0.0, 1));
 
-    let target = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    xfader.snap_to(initial);
-    // Re-set target to trigger crossfade
-    let _ = xfader.current_coefficients();
+    let t1 = xfader.advance(256);
+    assert!((t1 - 256.0 / 480.0).abs() < 1e-6);
+    let c = xfader.current_coefficients();
+    assert!((c.direct_gain.0[0] - t1).abs() < 1e-5, "gain {} vs t {t1}", c.direct_gain.0[0]);
+    assert!((c.direct_delay_samples - 100.0 * t1).abs() < 1e-3);
+    assert!(!xfader.is_complete());
 
-    xfader.set_target(target);
+    let t2 = xfader.advance(256);
+    assert!((t2 - 1.0).abs() < 1e-6);
+    assert!(xfader.is_complete());
+    assert!((xfader.current_coefficients().direct_gain.0[0] - 1.0).abs() < 1e-6);
+}
 
-    let fade_frames = ((10.0_f64 / 1000.0) * 48000.0).round() as u32;
-    // Check power sum is ~constant at midpoint
-    for step in 0..fade_frames {
-        xfader.advance();
-        let t = step as f32 / fade_frames as f32;
-        let expected = (std::f32::consts::PI * t / 2.0).cos().powi(2)
-            + (std::f32::consts::PI * t / 2.0).sin().powi(2);
-        assert!((expected - 1.0).abs() < 1e-5, "constant power violation at step {step}");
+/// A parameter that does not change must stay constant through a fade (an
+/// equal-power sin/cos weighting would overshoot it by up to sqrt(2)); a
+/// changing one must be monotonic.
+#[test]
+fn crossfader_constant_parameter_does_not_overshoot() {
+    let mut a = coeffs(0, 0.0, 0.0, 0.0, 0);
+    a.late_t60 = Band8::splat(1.5);
+    let mut b = coeffs(0, 1.0, 0.0, 0.0, 1);
+    b.late_t60 = Band8::splat(1.5);
+
+    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, a);
+    xfader.set_target(&b);
+
+    let mut prev = 0.0_f32;
+    for _ in 0..FADE_FRAMES / 16 {
+        xfader.advance(16);
+        let c = xfader.current_coefficients();
+        assert!((c.late_t60.0[0] - 1.5).abs() < 1e-5, "constant parameter drifted: {}", c.late_t60.0[0]);
+        let g = c.direct_gain.0[0];
+        assert!(g >= prev - 1e-6 && g <= 1.0 + 1e-6, "gain not monotonic within [0,1]: {g}");
+        prev = g;
     }
+    assert!(xfader.is_complete());
+}
+
+/// A different source_id means a different emitter: no fade, snap.
+#[test]
+fn crossfader_source_change_snaps() {
+    let mut xfader = EqualPowerCrossfader::new(10.0, 48000.0, coeffs(0, 0.0, 0.0, 0.0, 0));
+    xfader.set_target(&coeffs(7, 1.0, 0.0, 0.0, 1));
+    assert!(xfader.is_complete());
+    assert_eq!(xfader.current_coefficients().source_id, 7);
+    assert!((xfader.current_coefficients().direct_gain.0[0] - 1.0).abs() < 1e-6);
 }
 
 // ── hermite_delay_impulse_response ────────────────────────────────────
@@ -222,14 +224,15 @@ fn hermite_delay_impulse_response() {
     let mut dl = HermiteInterpolatingDelayLine::new(0.1, 48000.0);
     let delay = 100.0;
 
-    // Write an impulse at position 0
+    // Impulse followed by 100 zeros: the impulse is exactly 100 pushes old.
     dl.push(1.0);
     for _ in 1..=delay as usize {
         dl.push(0.0);
     }
 
-    let output = dl.tap(delay);
-    assert!((output - 1.0).abs() < 0.1, "impulse at integer delay: expected ~1.0 got {output}");
+    assert!((dl.tap(delay) - 1.0).abs() < 1e-6, "impulse at integer delay");
+    assert!(dl.tap(delay - 1.0).abs() < 1e-6);
+    assert!(dl.tap(delay + 1.0).abs() < 1e-6);
 }
 
 // ── hermite_delay_fractional ──────────────────────────────────────────
@@ -237,15 +240,17 @@ fn hermite_delay_impulse_response() {
 #[test]
 fn hermite_delay_fractional() {
     let mut dl = HermiteInterpolatingDelayLine::new(0.1, 48000.0);
-    let delay = 100.5;
 
+    // Impulse that is 101 pushes old, read at 100.5 (halfway to it).
     dl.push(1.0);
     for _ in 1..=101 {
         dl.push(0.0);
     }
 
-    let output = dl.tap(delay);
-    assert!(output > 0.0 && output < 1.0, "fractional delay should produce interpolated value, got {output}");
+    // Catmull-Rom of a unit impulse at the next-older neighbour, t = 0.5:
+    // h01(0.5) + h10(0.5) * 0.5 = 0.5 + 0.125 * 0.5.
+    let output = dl.tap(100.5);
+    assert!((output - 0.5625).abs() < 1e-5, "expected 0.5625, got {output}");
 }
 
 // ── hermite_delay_accuracy ────────────────────────────────────────────
@@ -267,7 +272,7 @@ fn hermite_delay_accuracy() {
     let mut output = vec![0.0; n];
     dl.process_channel(&input, &mut output, delay_samples);
 
-    // Compare phase — output should be delayed version of input
+    // Output must be the input delayed by exactly 50 samples.
     let delay_int = delay_samples as usize;
     let mut error_power = 0.0;
     let mut signal_power = 0.0;
@@ -281,7 +286,7 @@ fn hermite_delay_accuracy() {
     } else {
         -200.0
     };
-    assert!(db < -40.0, "delay accuracy too low: {db:.1} dB");
+    assert!(db < -100.0, "delay accuracy too low: {db:.1} dB");
 }
 
 // ── biquad_filter_lowpass ─────────────────────────────────────────────
@@ -325,6 +330,7 @@ fn biquad_filter_response() {
     assert!((dc_gain - 1.0).abs() < 0.05, "DC gain should be ~1.0, got {dc_gain}");
 }
 
+
 // ── fdn_reverb_stability ──────────────────────────────────────────────
 
 #[test]
@@ -334,15 +340,9 @@ fn fdn_reverb_stability() {
 
     let mut output = AudioBuffer::new(1, 256);
 
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(0.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(2.0),
-        late_gain_db: 0.0,
-        version: 0,
-    };
+    let mut params = coeffs(0, 0.0, 0.0, 0.0, 0);
+    params.late_t60 = Band8::splat(2.0);
+    params.late_gain_db = 0.0;
 
     // First block: impulse
     let mut impulse_buf = AudioBuffer::new(1, 256);
@@ -372,15 +372,9 @@ fn fdn_t60_approximation() {
     let target_t60 = 1.0;
     reverb.set_t60(&Band8::splat(target_t60));
 
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(0.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(target_t60),
-        late_gain_db: 0.0,
-        version: 0,
-    };
+    let mut params = coeffs(0, 0.0, 0.0, 0.0, 0);
+    params.late_t60 = Band8::splat(target_t60);
+    params.late_gain_db = 0.0;
 
     // Inject impulse and measure decay
     let mut impulse_buf = AudioBuffer::new(1, 256);
@@ -400,10 +394,10 @@ fn fdn_t60_approximation() {
     }
 
     let db_drop = 20.0 * (final_rms / initial_rms).log10();
-    assert!(
-        db_drop < 0.0,
-        "energy should decay (drop={db_drop:.1} dB)"
-    );
+    // The first block includes the dry impulse, so this is a coarse bound (the
+    // current FDN measures ~-80 dB here); exact T60 accuracy belongs to the
+    // reverb work, not this test.
+    assert!(db_drop < -40.0, "energy should decay by 1 s (drop={db_drop:.1} dB)");
 }
 
 // ── directivity_omni_uniform ──────────────────────────────────────────
@@ -411,84 +405,93 @@ fn fdn_t60_approximation() {
 #[test]
 fn directivity_omni_uniform() {
     let mut node = DirectivityDspNode::new(DirectivityPattern::Omnidirectional, 1);
-    let input = AudioBuffer::new(1, 64);
+    let mut input = AudioBuffer::new(1, 64);
+    for i in 0..64 {
+        input.set(0, i, (i as f32 * 0.1).sin());
+    }
     let mut output = AudioBuffer::new(1, 64);
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    node.process(&input, &mut output, &params);
-    // Process doesn't crash; omni should pass through with uniform gain
-    assert_eq!(output.channels(), 1);
+    // Omni radiates equally everywhere, whatever the source id maps to.
+    for id in [0u32, 5, 31] {
+        node.process(&input, &mut output, &coeffs(id, 1.0, 0.0, 0.0, 0));
+        for i in 0..64 {
+            assert!((output.get(0, i) - input.get(0, i)).abs() < 1e-6, "omni must pass through");
+        }
+    }
 }
 
 // ── directivity_cardioid_null ─────────────────────────────────────────
 
+/// NOTE: `DirectivityDspNode::process` still derives its azimuth from
+/// `source_id * 0.1` (placeholder in the node), so the on-axis / rear angles
+/// are selected through the id: id 0 -> 0 rad, id 31 -> 3.1 rad (~177 deg).
 #[test]
 fn directivity_cardioid_null() {
-    // pattern_gain is called internally by DirectivityDspNode
-    // We test the static method indirectly via the gain computation
     let mut cardioid = DirectivityDspNode::new(DirectivityPattern::Cardioid, 1);
-    let input = AudioBuffer::new(1, 64);
+    let mut input = AudioBuffer::new(1, 64);
+    for i in 0..64 {
+        input.set(0, i, 1.0);
+    }
     let mut output = AudioBuffer::new(1, 64);
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    cardioid.process(&input, &mut output, &params);
-    assert_eq!(output.channels(), 1);
+
+    cardioid.process(&input, &mut output, &coeffs(0, 1.0, 0.0, 0.0, 0));
+    assert!((output.get(0, 10) - 1.0).abs() < 1e-6, "cardioid on-axis gain is 1");
+
+    cardioid.process(&input, &mut output, &coeffs(31, 1.0, 0.0, 0.0, 0));
+    let rear = output.get(0, 10);
+    assert!(rear >= 0.0 && rear < 1e-2, "cardioid rear is (almost) a null, got {rear}");
+
+    // Side (id 16 -> 1.6 rad ~ 91.7 deg) is about half amplitude.
+    cardioid.process(&input, &mut output, &coeffs(16, 1.0, 0.0, 0.0, 0));
+    assert!((output.get(0, 10) - 0.5 * (1.0 + 1.6_f32.cos())).abs() < 1e-5);
 }
 
 // ── master_decoder_stereo_pan ─────────────────────────────────────────
 
-#[test]
-fn master_decoder_stereo_pan() {
-    let mut node = MasterSpatialDecoderNode::new(
-        DecoderMode::Vbap {
-            layout: SpeakerLayout::Stereo,
-        },
-        48000.0,
-    );
-    assert_eq!(node.input_channels(), 2);
-    assert_eq!(node.output_channels(), 2);
+fn stereo_decoder() -> MasterSpatialDecoderNode {
+    MasterSpatialDecoderNode::new(DecoderMode::Vbap { layout: SpeakerLayout::Stereo }, 48000.0)
+}
 
+fn render_dc(azimuth: f32) -> (f32, f32) {
+    let mut node = stereo_decoder();
     let mut input = AudioBuffer::new(1, 64);
     for i in 0..64 {
         input.set(0, i, 1.0);
     }
     let mut output = AudioBuffer::new(2, 64);
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
-    node.process(&input, &mut output, &params);
+    node.process(&input, &mut output, &coeffs(0, 1.0, 0.0, azimuth, 0));
+    (output.get(0, 63), output.get(1, 63))
+}
 
-    // With source_id=0, azimuth is 0*0.2=0 which is center → equal L/R
-    assert!(output.get(0, 0) > 0.0);
-    assert!(output.get(1, 0) > 0.0);
+#[test]
+fn master_decoder_stereo_pan() {
+    let node = stereo_decoder();
+    assert_eq!(node.input_channels(), 2);
+    assert_eq!(node.output_channels(), 2);
+
+    // Centre: equal L/R, constant power (1/sqrt(2) each).
+    let (l, r) = render_dc(0.0);
+    assert!((l - r).abs() < 1e-4, "centre should be balanced: {l} vs {r}");
+    assert!((l * l + r * r - 1.0).abs() < 1e-3, "constant power at centre: {}", l * l + r * r);
+
+    // +azimuth is toward +X = right; -azimuth left; power stays constant.
+    for az in [0.2_f32, 0.4] {
+        let (l, r) = render_dc(az);
+        assert!(r > l, "az {az}: right should dominate ({l}, {r})");
+        assert!((l * l + r * r - 1.0).abs() < 1e-3);
+        let (l2, r2) = render_dc(-az);
+        assert!(l2 > r2, "az {}: left should dominate ({l2}, {r2})", -az);
+        assert!((l - r2).abs() < 1e-4 && (r - l2).abs() < 1e-4, "pan must be symmetric");
+    }
+
+    // Hard right at the speaker: left is silent.
+    let (l, r) = render_dc(30.0_f32.to_radians());
+    assert!(l.abs() < 1e-3 && (r - 1.0).abs() < 1e-3, "at the right speaker: ({l}, {r})");
 }
 
 // ── audio_node_graph_process ──────────────────────────────────────────
 
 #[test]
 fn audio_node_graph_process() {
-    use quasar_dsp::node_graph::AudioNode;
-
     struct GainNode {
         gain: f32,
         ch: u16,
@@ -521,19 +524,14 @@ fn audio_node_graph_process() {
 
     let mut src = AudioBuffer::new(1, 64);
     src.set(0, 0, 1.0);
+    src.set(0, 5, -0.5);
 
     let mut output = AudioBuffer::new(1, 64);
-    let params = SpatialCoefficients {
-        source_id: 0,
-        direct_gain: Band8::splat(1.0),
-        direct_delay_samples: 0.0,
-        early_reflections: Vec::new(),
-        late_t60: Band8::splat(0.5),
-        late_gain_db: -10.0,
-        version: 0,
-    };
+    let params = coeffs(0, 1.0, 0.0, 0.0, 0);
 
     graph.process(&[&src], &[params], &mut output);
+    // 0.5 * 2.0 = unity through the chain; only the leaf node is mixed out.
     assert!((output.get(0, 0) - 1.0).abs() < 1e-3);
+    assert!((output.get(0, 5) + 0.5).abs() < 1e-3);
+    assert!(output.get(0, 1).abs() < 1e-6);
 }
-

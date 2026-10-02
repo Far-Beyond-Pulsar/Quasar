@@ -1,5 +1,5 @@
 use crate::backend::{
-    DirectPathResult, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery,
+    DirectPathResult, DEFAULT_SAMPLE_RATE, SPEED_OF_SOUND, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery,
     SpatialQueryResult,
 };
 use crate::error::SpatialAudioError;
@@ -25,6 +25,9 @@ pub struct HybridProbeSampler {
     strategy: HybridSamplingStrategy,
     probe_grid: Option<AcousticProbeGrid>,
     realtime_backend: Option<Box<dyn IAcousticComputeBackend>>,
+    /// Audio device sample rate; `delay_samples` the sampler itself produces
+    /// (BakedOnly) is `distance * sample_rate / SPEED_OF_SOUND`.
+    sample_rate: f32,
 }
 
 impl HybridProbeSampler {
@@ -34,7 +37,21 @@ impl HybridProbeSampler {
             strategy,
             probe_grid: None,
             realtime_backend: None,
+            sample_rate: DEFAULT_SAMPLE_RATE,
         }
+    }
+
+    /// Set the device sample rate (also forwarded to the real-time backend).
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        if let Some(b) = self.realtime_backend.as_mut() {
+            b.set_sample_rate(sample_rate);
+        }
+    }
+
+    /// The sample rate delays are expressed in.
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
     }
 
     /// Set the baked probe grid data.
@@ -43,7 +60,8 @@ impl HybridProbeSampler {
     }
 
     /// Set the real-time compute backend.
-    pub fn set_realtime_backend(&mut self, backend: Box<dyn IAcousticComputeBackend>) {
+    pub fn set_realtime_backend(&mut self, mut backend: Box<dyn IAcousticComputeBackend>) {
+        backend.set_sample_rate(self.sample_rate);
         self.realtime_backend = Some(backend);
     }
 
@@ -109,7 +127,7 @@ impl HybridProbeSampler {
                     source_id: query.source_id,
                     direct_path: DirectPathResult {
                         attenuation: attenuations,
-                        delay_samples: distance * 0.0029, // ~343 m/s → ms, then to fractional samples
+                        delay_samples: distance * self.sample_rate / SPEED_OF_SOUND,
                         distance,
                         occluded: false,
                         occlusion_factor: 1.0,

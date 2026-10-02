@@ -37,6 +37,11 @@ pub struct CpuSimdConfig {
     pub temperature_celsius: f32,
     /// Relative humidity percentage (default: 50.0).
     pub humidity_percent: f32,
+    /// Audio device sample rate in Hz (default: 48000). Every `delay_samples` the
+    /// backend returns is `path_length * sample_rate / speed_of_sound`. The engine
+    /// overwrites it with its own rate through
+    /// [`IAcousticComputeBackend::set_sample_rate`] when the backend is installed.
+    pub sample_rate: f32,
 }
 
 impl Default for CpuSimdConfig {
@@ -48,6 +53,7 @@ impl Default for CpuSimdConfig {
             speed_of_sound: 343.0,
             temperature_celsius: 20.0,
             humidity_percent: 50.0,
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -563,7 +569,7 @@ impl CpuSimdComputeBackend {
 
         DirectPathResult {
             attenuation: total_atten,
-            delay_samples: dist * 48_000.0 / self.config.speed_of_sound,
+            delay_samples: dist * self.config.sample_rate / self.config.speed_of_sound,
             distance: dist,
             occluded,
             occlusion_factor,
@@ -641,7 +647,7 @@ impl CpuSimdComputeBackend {
 
             reflections.push(EarlyReflection {
                 direction: refl_dir_from_listener,
-                delay_samples: total_dist * 48_000.0 / self.config.speed_of_sound,
+                delay_samples: total_dist * self.config.sample_rate / self.config.speed_of_sound,
                 gain,
                 order,
             });
@@ -797,6 +803,12 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
             .collect();
 
         results
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        if sample_rate.is_finite() && sample_rate > 0.0 {
+            self.config.sample_rate = sample_rate;
+        }
     }
 
     fn supports_dynamic_geometry(&self) -> bool {

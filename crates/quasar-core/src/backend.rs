@@ -3,6 +3,13 @@ use crate::error::SpatialAudioError;
 use crate::rays::{Ray, RayHit, RayInteractionContext};
 use crate::scene::AcousticScene;
 
+/// Speed of sound in air (m/s) used when a backend has no configured value.
+pub const SPEED_OF_SOUND: f32 = 343.0;
+
+/// Sample rate (Hz) assumed until the engine calls
+/// [`IAcousticComputeBackend::set_sample_rate`] / `HybridProbeSampler::set_sample_rate`.
+pub const DEFAULT_SAMPLE_RATE: f32 = 48_000.0;
+
 /// A spatial audio query for one source-listener pair.
 #[derive(Clone, Debug)]
 pub struct SpatialQuery {
@@ -88,6 +95,14 @@ pub trait IAcousticComputeBackend: Send + Sync {
         queries: &[SpatialQuery],
         materials: &dyn MaterialProvider,
     ) -> Vec<SpatialQueryResult>;
+
+    /// Tell the backend the audio device sample rate so every `delay_samples` it
+    /// returns is expressed in samples at that rate (default: 48 kHz).
+    ///
+    /// Called by the engine when the backend is installed (and whenever the
+    /// engine rate changes), never from the audio thread. Backends that do not
+    /// produce delays may ignore it.
+    fn set_sample_rate(&mut self, _sample_rate: f32) {}
 
     /// Whether this backend supports dynamic scene updates.
     fn supports_dynamic_geometry(&self) -> bool {

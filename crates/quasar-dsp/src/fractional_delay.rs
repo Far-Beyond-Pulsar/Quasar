@@ -39,25 +39,31 @@ impl HermiteInterpolatingDelayLine {
 
     /// Read a sample at the given delay (fractional).
     ///
-    /// `delay_samples`: fractional sample delay. Must be in `[0, max_samples - 3]`.
-    /// Uses 4-point Hermite interpolation.
+    /// `delay_samples`: fractional sample delay in `[0, max_samples - 3]`
+    /// (clamped, also in release builds; NaN reads as 0). Delay 0 is the most
+    /// recently pushed sample, delay `n` the sample pushed `n` pushes earlier.
+    /// Uses 4-point Hermite (Catmull-Rom) interpolation.
     pub fn tap(&self, delay_samples: f32) -> f32 {
-        debug_assert!(delay_samples >= 0.0);
-        debug_assert!(delay_samples <= (self.max_samples - 3) as f32);
-
+        let max_delay = (self.max_samples - 3) as f32;
+        // `max`/`min` also map NaN to a finite value.
+        let delay_samples = delay_samples.max(0.0).min(max_delay);
         let int_delay = delay_samples as usize;
         let frac = delay_samples - int_delay as f32;
 
-        // Read positions (wrapping)
-        let idx = |offset: isize| -> f32 {
-            let pos = (self.write_pos as isize - offset - 1).rem_euclid(self.max_samples as isize) as usize;
+        // `idx(k)` is the sample that is `k` samples old (k = 0: newest).
+        let idx = |k: usize| -> f32 {
+            let pos = (self.write_pos + self.max_samples - 1 - k) % self.max_samples;
             self.buffer[pos]
         };
 
-        let v_m1 = idx(int_delay as isize + 1);
-        let v0 = idx(int_delay as isize);
-        let v1 = idx(int_delay as isize - 1);
-        let v2 = idx(int_delay as isize - 2);
+        // Neighbours in age order: v_m1 is newer than v0, v1/v2 are older.
+        // The interpolation runs from v0 (age n) towards v1 (age n + 1) with
+        // t = frac, so a larger fraction means a longer delay.
+        let v0 = idx(int_delay);
+        let v1 = idx(int_delay + 1);
+        let v2 = idx(int_delay + 2);
+        // At delay 0 there is no newer sample yet; extrapolate linearly.
+        let v_m1 = if int_delay == 0 { 2.0 * v0 - v1 } else { idx(int_delay - 1) };
 
         // Catmull-Rom tangents
         let m0 = (v1 - v_m1) * 0.5;

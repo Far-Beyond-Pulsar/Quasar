@@ -301,6 +301,9 @@ impl SpatialAudioEngine {
 
     /// Set the real-time compute backend.
     pub fn set_backend(&mut self, backend: Box<dyn IAcousticComputeBackend>) {
+        // The sampler forwards the engine rate to the backend so every
+        // `delay_samples` it reports is in samples at the device rate.
+        self.hybrid_sampler.set_sample_rate(self.sample_rate);
         self.hybrid_sampler.set_realtime_backend(backend);
     }
 

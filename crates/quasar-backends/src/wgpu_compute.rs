@@ -552,6 +552,12 @@ impl IAcousticComputeBackend for WgpuComputeBackend {
         self.dispatch_and_readback(queries, materials)
     }
 
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        if sample_rate.is_finite() && sample_rate > 0.0 {
+            self.sample_rate = sample_rate;
+        }
+    }
+
     fn supports_dynamic_geometry(&self) -> bool {
         true
     }

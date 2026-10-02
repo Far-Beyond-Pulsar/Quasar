@@ -262,6 +262,7 @@ fn setup_audio_engine() -> AudioEngine {
     let cfg = CpuSimdConfig {
         max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
         speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
+        sample_rate: 48_000.,
     };
     engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
 
