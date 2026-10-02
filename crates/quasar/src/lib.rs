@@ -381,7 +381,7 @@ impl SpatialAudioEngine {
                 if ver > self.last_versions[src] {
                     self.last_versions[src] = ver;
                     let latest = unsafe { self.triple_buffers.read(src) };
-                    self.crossfaders[src].set_target(latest.clone());
+                    self.crossfaders[src].set_target(latest);
                 }
                 self.crossfaders[src].current_coefficients().clone()
             })
@@ -548,7 +548,7 @@ impl SpatialAudioEngine {
             if ver > self.scene.last_versions[idx] {
                 self.scene.last_versions[idx] = ver;
                 let latest = unsafe { self.scene.triple_buffers.read(idx) };
-                self.scene.crossfaders[idx].set_target(latest.clone());
+                self.scene.crossfaders[idx].set_target(latest);
             }
         }
 

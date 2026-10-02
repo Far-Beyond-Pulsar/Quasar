@@ -68,7 +68,9 @@ use std::collections::HashSet;
 // ── Scene data ────────────────────────────────────────────────────────────────
 
 // Column positions along the nave (Z axis), symmetric at x = ±5.5
-const COLUMN_Z: &[f32] = &[-22.0, 18.0];
+/// Minimum seconds between `update_scene_spatial()` calls (~30 Hz).
+const SPATIAL_UPDATE_INTERVAL: f32 = 1.0 / 30.0;
+const COLUMN_Z: &[f32] =&[-22.0, 18.0];
 
 // Stained glass window lights: (x_wall_side, y, z, r, g, b)
 // Positive x = right-side windows, negative = left-side; placed just inside the wall
@@ -526,6 +528,8 @@ struct AppState {
     renderer: Arc<Mutex<Renderer>>,
     action_rx: Receiver<HelioAction>,
     last_frame: std::time::Instant,
+    /// Seconds accumulated since the last `update_scene_spatial()` call.
+    spatial_accum: f32,
 
     // Major structural surfaces
     _floor: MeshId,
@@ -988,6 +992,8 @@ impl ApplicationHandler for App {
             renderer,
             action_rx,
             last_frame: std::time::Instant::now(),
+            // Start at the interval so the first frame computes immediately.
+            spatial_accum: SPATIAL_UPDATE_INTERVAL,
             _floor,
             _nave_ceiling,
             _aisle_ceil_l,
@@ -1408,7 +1414,13 @@ impl AppState {
         // resolve every (scene output, listener) pair (compute thread side).
         if let Ok(mut engine) = self._audio_engine.engine.lock() {
             engine.update_listener(self._audio_engine.listener_id, self.cam_pos.to_array(), forward.to_array());
-            engine.update_scene_spatial();
+            // Throttle the (crossfade-restarting) spatial compute to ~30 Hz;
+            // running it every render frame keeps the fade perpetually at t≈0.
+            self.spatial_accum += dt;
+            if self.spatial_accum >= SPATIAL_UPDATE_INTERVAL {
+                self.spatial_accum = 0.0;
+                engine.update_scene_spatial();
+            }
         }
         renderer.debug_clear();
         for (i, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
