@@ -18,7 +18,13 @@
 //!
 //! Coverage:
 //! * Planar layouts (all speakers within [`PLANAR_MAX_ELEVATION`] of the
-//!   horizon): elevation is ignored and panning is done on azimuth only.
+//!   horizon): pairs are chosen on azimuth only. Elevation does not move the
+//!   image but widens it: beyond the planar band a power fraction
+//!   `w = sin^2(pi/2 * t)` (`t` = elevation excess normalised to the pole) of a
+//!   diffuse image (all speakers equal, `1/M` power each) is mixed in, so
+//!   `g_i = sqrt((1 - w) g_pair_i^2 + w / M)`. Power stays 1, gains are
+//!   continuous in az and el, and at the poles `w = 1` so every azimuth gives
+//!   the same diffuse gains (an overhead source is "everywhere on the ring").
 //!   Where two azimuth-adjacent speakers are >= 180 degrees apart (e.g. the
 //!   rear of a stereo pair) VBAP is undefined, so that arc is covered by a
 //!   constant-power sine/cosine crossfade linear in angle between the two
@@ -28,9 +34,13 @@
 //!   Imaginary speakers are added at +-Y (unless a real speaker sits there) so
 //!   the hull closes over the whole sphere; energy panned to an imaginary
 //!   speaker is spread equally over its hull neighbours and renormalised.
-//!   Layouts that do not surround the listener at all leave part of the sphere
-//!   uncovered; there the best-matching triplet is used with negative gains
-//!   clamped (still bounded and power-normalised, but continuity is best-effort).
+//!   Layouts that do not surround the listener at all (front-only, half domes)
+//!   leave part of the sphere outside that hull. Those are closed with further
+//!   imaginary speakers (axis / cube-diagonal directions, farthest-first, until
+//!   the origin is strictly inside the hull), so the triplets tile the whole
+//!   sphere and the gains are continuous everywhere by construction: a rear
+//!   source in a front-only layout is carried by the real speakers bordering
+//!   the imaginary ones that cover it.
 
 use std::f64::consts::PI as PI64;
 
@@ -41,6 +51,42 @@ pub const PLANAR_MAX_ELEVATION: f32 = 0.0873;
 const MAX_VBAP_GAP: f32 = std::f32::consts::PI - 1e-3;
 /// Tolerance for "inside the triplet" tests.
 const INSIDE_EPS: f32 = 1e-6;
+/// Upper bound on imaginary speakers: the number of distinct closing candidates
+/// (6 axes + 8 cube diagonals), the +-Y poles included.
+const MAX_IMAGINARY: usize = 14;
+
+/// Candidate directions for imaginary speakers: the 6 axes and 8 cube diagonals.
+fn imaginary_candidates() -> impl Iterator<Item = [f64; 3]> {
+    let h = 1.0_f64 / 3.0_f64.sqrt();
+    let axes = [
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+    ];
+    let diag = [
+        [h, h, h], [-h, h, h], [h, h, -h], [-h, h, -h],
+        [h, -h, h], [-h, -h, h], [h, -h, -h], [-h, -h, -h],
+    ];
+    axes.into_iter().chain(diag)
+}
+
+/// Power fraction `w` of the diffuse (all-speakers-equal) image mixed into a
+/// planar layout's pair panning for a source at elevation `el`.
+///
+/// Zero inside the planar band (`|el| <= PLANAR_MAX_ELEVATION`, so speakers that
+/// sit a few degrees off the horizon still get exact gain 1), then
+/// `sin^2(pi/2 * t)` of the normalised excess elevation: C1 at both ends and
+/// exactly 1 at the poles, where azimuth is undefined and every azimuth must
+/// give the same gains.
+fn planar_spread(el: f32) -> f32 {
+    let lo = PLANAR_MAX_ELEVATION;
+    let t = ((el.abs() - lo) / (std::f32::consts::FRAC_PI_2 - lo)).clamp(0.0, 1.0);
+    let s = (t * std::f32::consts::FRAC_PI_2).sin();
+    s * s
+}
 
 #[derive(Clone, Debug)]
 struct PlanarPair {
@@ -66,15 +112,19 @@ struct Triplet {
 enum Kind {
     Silent,
     Mono(usize),
-    Planar(Vec<PlanarPair>),
+    Planar {
+        pairs: Vec<PlanarPair>,
+        /// Output slots of every active speaker (diffuse spread for elevated sources).
+        slots: Vec<usize>,
+    },
     Hull {
         /// Output slot of every real point.
         pt_out: Vec<usize>,
         /// Unit direction of every real point (nearest-speaker fallback).
         pt_dir: Vec<[f32; 3]>,
         tris: Vec<Triplet>,
-        /// Real output slots adjacent to imaginary speaker `k` (0 = +Y, 1 = -Y slots in use order).
-        imag_nbrs: [Vec<usize>; 2],
+        /// Real output slots standing in for imaginary speaker `k` (point `pt_out.len() + k`).
+        imag_nbrs: Vec<Vec<usize>>,
     },
 }
 
@@ -185,33 +235,16 @@ impl VbapPanner {
             };
             pairs.push(PlanarPair { a, b, start: az_a as f32, gap: gap as f32, inv });
         }
-        Kind::Planar(pairs)
+        Kind::Planar { pairs, slots: act.iter().map(|(i, _)| *i).collect() }
     }
 
-    fn build_hull(act: &[(usize, [f64; 3])]) -> Kind {
-        let mut pts: Vec<[f64; 3]> = act.iter().map(|(_, u)| *u).collect();
-        let pt_out: Vec<usize> = act.iter().map(|(i, _)| *i).collect();
-        let nreal = pts.len();
-        // Imaginary speakers at the poles unless a real one is (almost) there.
-        let mut has_imag = [false; 2];
-        for (k, y) in [1.0_f64, -1.0].iter().enumerate() {
-            if !pts.iter().take(nreal).any(|p| p[1] * y >= 1.0 - 1e-6) {
-                pts.push([0.0, *y, 0.0]);
-                has_imag[k] = true;
-            }
-        }
-        // Map imaginary k -> point index.
-        let mut imag_pt = [usize::MAX; 2];
-        let mut next = nreal;
-        for k in 0..2 {
-            if has_imag[k] {
-                imag_pt[k] = next;
-                next += 1;
-            }
-        }
+    /// Hull triplets of `pts` that can span a source cone (origin on the inner
+    /// side), plus whether the origin lies strictly inside the hull (i.e. the
+    /// triplets tile the whole sphere of directions).
+    fn hull_triplets(pts: &[[f64; 3]]) -> (Vec<Triplet>, bool) {
         let n = pts.len();
         const EPS: f64 = 1e-7;
-
+        let mut enclosed = n >= 4;
         let mut tris: Vec<Triplet> = Vec::new();
         for i in 0..n {
             for j in (i + 1)..n {
@@ -226,31 +259,42 @@ impl VbapPanner {
                     }
                     nrm = [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl];
                     let mut d = dot(nrm, a);
-                    if d < 0.0 {
-                        nrm = [-nrm[0], -nrm[1], -nrm[2]];
-                        d = -d;
-                    }
-                    // Plane through (or behind) the origin cannot span a source cone.
-                    if d < 1e-4 {
-                        continue;
-                    }
-                    let mut ok = true;
-                    let mut coplanar: Vec<usize> = Vec::new();
+                    // Orient the normal outward: every other point on the inner side.
+                    let (mut all_below, mut all_above) = (true, true);
                     for (p, pt) in pts.iter().enumerate() {
                         if p == i || p == j || p == k {
                             continue;
                         }
                         let v = dot(nrm, *pt) - d;
                         if v > EPS {
-                            ok = false;
-                            break;
+                            all_below = false;
                         }
-                        if v >= -EPS {
-                            coplanar.push(p);
+                        if v < -EPS {
+                            all_above = false;
                         }
                     }
-                    if !ok {
+                    if !all_below && !all_above {
+                        continue; // not a hull face
+                    }
+                    if !all_below {
+                        nrm = [-nrm[0], -nrm[1], -nrm[2]];
+                        d = -d;
+                    }
+                    // A hull face whose plane passes through (or behind) the
+                    // origin cannot span a source cone, and means the hull does
+                    // not surround the listener.
+                    if d < 1e-4 {
+                        enclosed = false;
                         continue;
+                    }
+                    let mut coplanar: Vec<usize> = Vec::new();
+                    for (p, pt) in pts.iter().enumerate() {
+                        if p == i || p == j || p == k {
+                            continue;
+                        }
+                        if dot(nrm, *pt) - d >= -EPS {
+                            coplanar.push(p);
+                        }
                     }
                     if !coplanar.is_empty() {
                         // Cocircular set: canonical fan triangulation from its lowest index.
@@ -296,47 +340,85 @@ impl VbapPanner {
                 }
             }
         }
+        let tiled = enclosed && !tris.is_empty();
+        (tris, tiled)
+    }
 
-        // Neighbours of each imaginary speaker (real outputs sharing a triplet).
-        let mut imag_nbrs: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
-        for k in 0..2 {
-            if !has_imag[k] {
-                continue;
+    fn build_hull(act: &[(usize, [f64; 3])]) -> Kind {
+        let mut pts: Vec<[f64; 3]> = act.iter().map(|(_, u)| *u).collect();
+        let pt_out: Vec<usize> = act.iter().map(|(i, _)| *i).collect();
+        let nreal = pts.len();
+        // Imaginary speakers at the poles unless a real one is (almost) there.
+        for y in [1.0_f64, -1.0] {
+            if !pts.iter().any(|p| p[1] * y >= 1.0 - 1e-6) {
+                pts.push([0.0, y, 0.0]);
             }
-            for t in &tris {
-                if t.idx.contains(&imag_pt[k]) {
+        }
+        // Layouts that do not surround the listener (front-only, half domes, ...)
+        // leave part of the sphere outside the hull. Close it with further
+        // imaginary speakers (greedy: the candidate farthest from every existing
+        // point first) until the origin is strictly inside the hull. The hull of
+        // real + imaginary points then tiles the whole sphere, so the gains are
+        // continuous everywhere by construction.
+        let (mut tris, mut enclosed) = Self::hull_triplets(&pts);
+        while !enclosed && pts.len() - nreal < MAX_IMAGINARY {
+            let mut best: Option<([f64; 3], f64)> = None;
+            for c in imaginary_candidates() {
+                let nearest = pts.iter().map(|p| dot(*p, c)).fold(f64::NEG_INFINITY, f64::max);
+                if nearest >= 1.0 - 1e-6 {
+                    continue; // already a point there
+                }
+                if best.map_or(true, |(_, b)| nearest < b - 1e-9) {
+                    best = Some((c, nearest));
+                }
+            }
+            let Some((c, _)) = best else { break };
+            pts.push(c);
+            let r = Self::hull_triplets(&pts);
+            tris = r.0;
+            enclosed = r.1;
+        }
+
+        // Real output slots that stand in for each imaginary speaker: the real
+        // points sharing a triplet with it (widening through neighbouring
+        // imaginary points if it has none).
+        let n_imag = pts.len() - nreal;
+        let mut imag_nbrs: Vec<Vec<usize>> = Vec::with_capacity(n_imag);
+        for k in 0..n_imag {
+            let mut visited = vec![false; pts.len()];
+            visited[nreal + k] = true;
+            let mut nbrs: Vec<usize> = Vec::new();
+            loop {
+                let mut grew = false;
+                for t in &tris {
+                    if !t.idx.iter().any(|&p| visited[p]) {
+                        continue;
+                    }
                     for &p in &t.idx {
-                        if p < nreal && !imag_nbrs[k].contains(&pt_out[p]) {
-                            imag_nbrs[k].push(pt_out[p]);
+                        if p < nreal {
+                            if !nbrs.contains(&pt_out[p]) {
+                                nbrs.push(pt_out[p]);
+                            }
+                        } else if !visited[p] && nbrs.is_empty() {
+                            visited[p] = true;
+                            grew = true;
                         }
                     }
                 }
-            }
-        }
-        // Imaginary slot mapping: runtime treats point index nreal as imaginary 0
-        // and nreal+1 as imaginary 1 only when both exist; remap triplet indices so
-        // imaginary `k` is always point `nreal + k`.
-        let mut remap_tris = tris;
-        if has_imag[1] && !has_imag[0] {
-            // only -Y exists at index nreal -> it is imaginary slot 1.
-            for t in remap_tris.iter_mut() {
-                for p in t.idx.iter_mut() {
-                    if *p == nreal {
-                        *p = nreal + 1;
-                    }
+                if !nbrs.is_empty() || !grew {
+                    break;
                 }
             }
+            imag_nbrs.push(nbrs);
         }
 
-        if remap_tris.is_empty() {
-            // Degenerate (e.g. all speakers in a vertical plane through the origin).
-            // Fall back to nearest-speaker selection.
-        }
+        // With no triplets at all (e.g. every speaker in one vertical plane
+        // through the origin) `gains` falls back to the nearest speaker.
         let pt_dir = act
             .iter()
             .map(|(_, u)| [u[0] as f32, u[1] as f32, u[2] as f32])
             .collect();
-        Kind::Hull { pt_out, pt_dir, tris: remap_tris, imag_nbrs }
+        Kind::Hull { pt_out, pt_dir, tris, imag_nbrs }
     }
 
     /// Fill `out` with per-speaker gains for a source at (`az`, `el`) radians.
@@ -358,7 +440,7 @@ impl VbapPanner {
                     out[*i] = 1.0;
                 }
             }
-            Kind::Planar(pairs) => {
+            Kind::Planar { pairs, slots } => {
                 if pairs.is_empty() {
                     return;
                 }
@@ -394,6 +476,17 @@ impl VbapPanner {
                     }
                     if chosen.b < n {
                         out[chosen.b] += gb / norm;
+                    }
+                    // Elevation: widen toward a diffuse (all speakers equal) image as
+                    // |el| grows, in the power domain so sum(g^2) stays 1.
+                    let w = planar_spread(el);
+                    if w > 0.0 && !slots.is_empty() {
+                        let d2 = w / slots.len() as f32;
+                        for &s in slots.iter() {
+                            if s < n {
+                                out[s] = ((1.0 - w) * out[s] * out[s] + d2).sqrt();
+                            }
+                        }
                     }
                 }
             }
@@ -434,7 +527,7 @@ impl VbapPanner {
                     }
                     return;
                 };
-                let mut imag = [0.0_f32; 2];
+                let mut imag = [0.0_f32; MAX_IMAGINARY];
                 for v in 0..3 {
                     let gv = g[v].max(0.0);
                     let p = t.idx[v];
@@ -444,10 +537,10 @@ impl VbapPanner {
                             out[o] += gv;
                         }
                     } else {
-                        imag[(p - nreal).min(1)] += gv;
+                        imag[(p - nreal).min(MAX_IMAGINARY - 1)] += gv;
                     }
                 }
-                for k in 0..2 {
+                for k in 0..imag_nbrs.len().min(MAX_IMAGINARY) {
                     if imag[k] > 0.0 && !imag_nbrs[k].is_empty() {
                         let w = imag[k] / (imag_nbrs[k].len() as f32).sqrt();
                         for &o in imag_nbrs[k].iter() {

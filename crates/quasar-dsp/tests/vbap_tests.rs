@@ -291,3 +291,173 @@ fn layout_panner_matches_layout_outputs() {
         assert_eq!(layout_panner(&l).num_outputs(), n as usize);
     }
 }
+
+// ── L3: planar layouts and elevation ─────────────────────────────────────
+
+fn active_count(pos: &[[f32; 3]], lfe: &[usize]) -> usize {
+    (0..pos.len()).filter(|i| !lfe.contains(i)).count()
+}
+
+#[test]
+fn planar_elevation_is_ignored_inside_the_planar_band() {
+    let (pos, lfe) = named(SpeakerLayout::Stereo);
+    let p = VbapPanner::new(&pos, &lfe);
+    let a = gains_of(&p, deg(20.0), 0.0, 2);
+    let b = gains_of(&p, deg(20.0), deg(4.0), 2);
+    for k in 0..2 {
+        assert!((a[k] - b[k]).abs() < 1e-6, "gain moved inside the planar band");
+    }
+}
+
+#[test]
+fn planar_elevation_widens_the_image_and_converges_at_the_poles() {
+    for l in [SpeakerLayout::Stereo, SpeakerLayout::Quad, SpeakerLayout::Surround51, SpeakerLayout::Surround714] {
+        let (pos, lfe) = named(l);
+        let m = active_count(&pos, &lfe) as f32;
+        let p = VbapPanner::new(&pos, &lfe);
+        let n = pos.len();
+        for &pole in &[PI / 2.0, -PI / 2.0] {
+            let reference = gains_of(&p, 0.0, pole, n);
+            let mut az = -PI;
+            while az <= PI {
+                let g = gains_of(&p, az, pole, n);
+                for k in 0..n {
+                    assert!((g[k] - reference[k]).abs() < 1e-4, "pole gain depends on az (slot {k}, az {az})");
+                    if !lfe.contains(&k) {
+                        assert!((g[k] - 1.0 / m.sqrt()).abs() < 1e-4, "pole gain {} != 1/sqrt(M)", g[k]);
+                    } else {
+                        assert_eq!(g[k], 0.0);
+                    }
+                }
+                az += deg(9.0);
+            }
+        }
+        // The panned image flattens monotonically as the source rises: the loudest
+        // speaker for a source at the first active speaker's azimuth falls with elevation.
+        let first = (0..n).find(|i| !lfe.contains(i)).unwrap();
+        let az0 = pos[first][0].atan2(-pos[first][2]);
+        let mut last = f32::INFINITY;
+        let mut el = 0.0;
+        while el <= PI / 2.0 + 1e-6 {
+            let g = gains_of(&p, az0, el, n);
+            assert!((power(&g) - 1.0).abs() < 1e-4);
+            assert!(g[first] <= last + 1e-6, "peak gain rose with elevation");
+            last = g[first];
+            el += deg(2.0);
+        }
+    }
+}
+
+// ── L4: layouts that do not surround the listener ────────────────────────
+
+fn dir3(az: f32, el: f32) -> [f32; 3] {
+    let (a, e) = (deg(az), deg(el));
+    [a.sin() * e.cos(), e.sin(), -a.cos() * e.cos()]
+}
+
+/// 3D layout confined to a +-30 degree front sector (lower + upper row).
+fn front_only_3d() -> Vec<[f32; 3]> {
+    vec![dir3(-30.0, 0.0), dir3(30.0, 0.0), dir3(0.0, 0.0), dir3(-30.0, 35.0), dir3(30.0, 35.0), dir3(0.0, 35.0)]
+}
+
+/// Front half dome: ear-level front half ring, an upper row and a zenith speaker.
+fn half_dome() -> Vec<[f32; 3]> {
+    vec![
+        dir3(-90.0, 0.0),
+        dir3(-45.0, 0.0),
+        dir3(0.0, 0.0),
+        dir3(45.0, 0.0),
+        dir3(90.0, 0.0),
+        dir3(-60.0, 45.0),
+        dir3(0.0, 45.0),
+        dir3(60.0, 45.0),
+        dir3(0.0, 90.0),
+    ]
+}
+
+/// Largest per-step gain change over dense azimuth sweeps (several elevations,
+/// incl. the poles' neighbourhood) and elevation sweeps (several azimuths).
+fn max_sweep_step<F: Fn(f32, f32) -> Vec<f32>>(f: F) -> f32 {
+    let step = deg(0.1);
+    let mut worst = 0.0f32;
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    for &el in &[-85.0f32, -60.0, -30.0, -10.0, 0.0, 10.0, 30.0, 60.0, 85.0] {
+        let mut prev = f(-PI, deg(el));
+        let mut az = -PI + step;
+        while az <= PI + 1e-6 {
+            let g = f(az, deg(el));
+            worst = worst.max(diff(&g, &prev));
+            prev = g;
+            az += step;
+        }
+    }
+    for &az in &[-180.0f32, -150.0, -100.0, -60.0, -30.0, 0.0, 15.0, 45.0, 90.0, 135.0, 179.0] {
+        let mut prev = f(deg(az), -PI / 2.0);
+        let mut el = -PI / 2.0 + step;
+        while el <= PI / 2.0 {
+            let g = f(deg(az), el);
+            worst = worst.max(diff(&g, &prev));
+            prev = g;
+            el += step;
+        }
+    }
+    worst
+}
+
+#[test]
+fn non_surrounding_3d_layouts_have_full_coverage() {
+    for (name, pos) in [("front-only", front_only_3d()), ("half-dome", half_dome())] {
+        let p = VbapPanner::new(&pos, &[]);
+        let n = pos.len();
+        let mut az = -PI;
+        while az <= PI {
+            let mut el = -PI / 2.0;
+            while el <= PI / 2.0 + 1e-6 {
+                let g = gains_of(&p, az, el, n);
+                assert!(g.iter().all(|x| *x >= 0.0 && x.is_finite()), "{name}: bad gain {g:?} at az={az} el={el}");
+                assert!((power(&g) - 1.0).abs() < 1e-4, "{name}: power {} at az={az} el={el}", power(&g));
+                el += deg(5.0);
+            }
+            az += deg(3.0);
+        }
+        // Directly behind and below are in the formerly uncovered region: still audible.
+        for &(a, e) in &[(180.0f32, 0.0f32), (180.0, 60.0), (0.0, -60.0), (120.0, -20.0)] {
+            let g = gains_of(&p, deg(a), deg(e), n);
+            assert!((power(&g) - 1.0).abs() < 1e-4, "{name}: silent at az={a} el={e}");
+        }
+        // Real speakers still win exactly where they sit.
+        for (i, s) in pos.iter().enumerate() {
+            let g = gains_of(&p, s[0].atan2(-s[2]), s[1].atan2(s[0].hypot(s[2])), n);
+            assert!(g[i] > 0.9995, "{name}: speaker {i} gain {}", g[i]);
+        }
+    }
+}
+
+#[test]
+fn non_surrounding_3d_layouts_are_continuous_over_dense_sweeps() {
+    for (name, pos) in [("front-only", front_only_3d()), ("half-dome", half_dome())] {
+        let p = VbapPanner::new(&pos, &[]);
+        let n = pos.len();
+        let worst = max_sweep_step(|az, el| gains_of(&p, az, el, n));
+        assert!(worst < 0.05, "{name}: max gain step {worst} per 0.1 degree");
+    }
+}
+
+/// Sanity check of the continuity metric itself: an artificially discontinuous
+/// gain function (hard swap of two speakers past az = 0.3 rad) must be flagged
+/// by the same sweep that passes the real panner.
+#[test]
+fn continuity_metric_detects_an_artificial_discontinuity() {
+    let (pos, lfe) = named(SpeakerLayout::Stereo);
+    let p = VbapPanner::new(&pos, &lfe);
+    let good = max_sweep_step(|az, el| gains_of(&p, az, el, 2));
+    let bad = max_sweep_step(|az, el| {
+        let mut g = gains_of(&p, az, el, 2);
+        if az > 0.3 && az < 2.0 {
+            g.swap(0, 1);
+        }
+        g
+    });
+    assert!(good < 0.05, "real panner step {good}");
+    assert!(bad > 0.2, "metric failed to flag the discontinuity (step {bad})");
+}

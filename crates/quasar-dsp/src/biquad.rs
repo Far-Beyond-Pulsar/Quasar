@@ -63,6 +63,63 @@ impl BiquadFilter {
 
         self.set_coefficients(b0, b1, b2, a1, a2);
     }
+
+    /// Current coefficients `[b0, b1, b2, a1, a2]` (for per-sample interpolation).
+    pub fn coefficients(&self) -> [f32; 5] {
+        [self.b0, self.b1, self.b2, self.a1, self.a2]
+    }
+
+    /// Configure as a 2nd-order lowpass with an explicit Q (RBJ cookbook).
+    ///
+    /// Two sections with Q = 0.5412 and 1.3066 form a 4th-order Butterworth.
+    pub fn set_lowpass_q(&mut self, cutoff_hz: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * q.max(1e-3));
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        let b0 = (1.0 - cos_w0) * 0.5 * inv_a0;
+        self.set_coefficients(
+            b0,
+            (1.0 - cos_w0) * inv_a0,
+            b0,
+            (-2.0 * cos_w0) * inv_a0,
+            (1.0 - alpha) * inv_a0,
+        );
+    }
+
+    /// Configure as a peaking (bell) EQ: `gain_db` at `center_hz`, bandwidth set by `q` (RBJ cookbook).
+    pub fn set_peaking(&mut self, center_hz: f32, q: f32, gain_db: f32, sample_rate: f32) {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * center_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * q.max(1e-3));
+        let inv_a0 = 1.0 / (1.0 + alpha / a);
+        self.set_coefficients(
+            (1.0 + alpha * a) * inv_a0,
+            (-2.0 * cos_w0) * inv_a0,
+            (1.0 - alpha * a) * inv_a0,
+            (-2.0 * cos_w0) * inv_a0,
+            (1.0 - alpha / a) * inv_a0,
+        );
+    }
+
+    /// Configure as a high shelf: `gain_db` above `corner_hz` (shelf slope S = 1, RBJ cookbook).
+    pub fn set_high_shelf(&mut self, corner_hz: f32, gain_db: f32, sample_rate: f32) {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * corner_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        // S = 1  =>  alpha = sin(w0)/2 * sqrt(2)
+        let alpha = sin_w0 * 0.5 * std::f32::consts::SQRT_2;
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let inv_a0 = 1.0 / ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+        self.set_coefficients(
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha) * inv_a0,
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0) * inv_a0,
+            a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos_w0) * inv_a0,
+            ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
+        );
+    }
 }
 
 impl Default for BiquadFilter {

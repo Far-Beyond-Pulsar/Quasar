@@ -319,12 +319,20 @@ fn setup_audio_engine() -> AudioEngine {
         outputs[dev_ch] = out_id;
     }
 
-    // Physical device layout derived from the real output channel count.
+    // The Sub/LFE output (device slot 3) is never panned *to* a speaker slot by the
+    // engine; instead its rendered signal is sent to the listener's LFE channel
+    // through the engine's 120 Hz LFE low-pass bus (a no-op on layouts without an
+    // LFE slot). The Sub emitter is still also panned like any other emitter.
+    engine.set_scene_output_lfe_send(outputs[3], 1.0);
+
+    // Physical device layout derived from the real output channel count. These are
+    // the REAL device layouts (standard channel orders), not the stage speaker
+    // positions: 7.1 is FL FR C LFE BL BR SL SR with LFE excluded from panning.
     let physical_layout = match out_ch {
         2 => PhysicalOutputLayout::Stereo,
         4 => PhysicalOutputLayout::Quad,
         6 => PhysicalOutputLayout::Surround51,
-        8 => PhysicalOutputLayout::Custom { positions: SPEAKER_POSITIONS.map(|p| p.to_array()).to_vec() },
+        8 => PhysicalOutputLayout::Surround714,
         n => PhysicalOutputLayout::Custom {
             positions: (0..n)
                 .map(|i| {
@@ -1400,15 +1408,16 @@ impl AppState {
         // ── Quasar spatial audio debug overlay ─────────────────────────
         let listener_pos = self.cam_pos;
         // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
-        // Index order matches WAV channel → scene output mapping (SPEAKER_POSITIONS):
+        // Index = scene output = device channel (SPEAKER_POSITIONS), mapped to WAV
+        // channels through CHANNEL_MAP:
         //  0: Front Left           — WAV ch 0 / scene output 0
         //  1: Front Right          — WAV ch 1 / scene output 1
         //  2: Center               — WAV ch 2 / scene output 2
-        //  3: Back Left            — WAV ch 3 / scene output 3
-        //  4: Back Right           — WAV ch 4 / scene output 4
-        //  5: Sub                  — WAV ch 5 / scene output 5
-        //  6: Aux Left             — WAV ch 6 / scene output 6
-        //  7: Aux Right            — WAV ch 7 / scene output 7
+        //  3: Sub / LFE            — WAV ch 5 / scene output 3
+        //  4: Back Left            — WAV ch 3 / scene output 4
+        //  5: Back Right           — WAV ch 4 / scene output 5
+        //  6: Side Left            — WAV ch 6 / scene output 6
+        //  7: Side Right           — WAV ch 7 / scene output 7
 
         // Update the scene pipeline: move the listener with the camera, then
         // resolve every (scene output, listener) pair (compute thread side).

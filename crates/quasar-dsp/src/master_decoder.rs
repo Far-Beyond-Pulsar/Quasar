@@ -1,5 +1,6 @@
 use quasar_core::param_exchange::SpatialCoefficients;
-use crate::audio_buffer::{AudioBuffer, MAX_AUDIO_CHANNELS};
+use crate::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNELS};
+use crate::binaural::{BinauralRenderer, ParametricBinauralRenderer};
 use crate::node_graph::AudioNode;
 use crate::vbap::VbapPanner;
 
@@ -16,7 +17,7 @@ pub enum SpeakerLayout {
 /// Decoding mode for the master output.
 #[derive(Clone, Debug)]
 pub enum DecoderMode {
-    /// Binaural rendering via HRTF convolution.
+    /// Binaural rendering via the parametric model in [`crate::binaural`] (not a measured HRTF).
     BinauralHrtf,
     /// Vector-Based Amplitude Panning for speaker arrays.
     Vbap { layout: SpeakerLayout },
@@ -31,12 +32,17 @@ pub struct MasterSpatialDecoderNode {
     mode: DecoderMode,
     input_channels: u16,
     output_channels: u16,
+    #[allow(dead_code)]
     sample_rate: f32,
     /// Shared constant-power VBAP panner (`Some` only for `Vbap` mode).
     panner: Option<VbapPanner>,
     /// Speaker gains at the end of the previous block (for per-sample ramps).
     prev_gains: [f32; MAX_AUDIO_CHANNELS],
     prev_valid: bool,
+    /// Parametric binaural renderer (`Some` only for `BinauralHrtf` mode).
+    binaural: Option<ParametricBinauralRenderer>,
+    /// Mono downmix scratch for the binaural path (preallocated, one block).
+    mono_scratch: Vec<f32>,
 }
 
 impl MasterSpatialDecoderNode {
@@ -53,6 +59,11 @@ impl MasterSpatialDecoderNode {
             },
             prev_gains: [0.0; MAX_AUDIO_CHANNELS],
             prev_valid: false,
+            binaural: match &mode {
+                DecoderMode::BinauralHrtf => Some(ParametricBinauralRenderer::with_sample_rate(sample_rate)),
+                _ => None,
+            },
+            mono_scratch: vec![0.0; DEFAULT_BLOCK_SIZE],
             mode,
         }
     }
@@ -71,32 +82,6 @@ impl MasterSpatialDecoderNode {
             DecoderMode::AmbisonicDecode { order } => ((order + 1) * (order + 1)) as u16,
         }
     }
-
-    /// Stereo pan: convert azimuth [-1,1] to left/right gains using equal-power panning.
-    ///
-    /// `azimuth`: -1 = full left, 0 = center, 1 = full right.
-    fn stereo_pan(azimuth: f32) -> (f32, f32) {
-        let t = (azimuth + 1.0) * 0.5; // [0, 1]
-        let angle = std::f32::consts::FRAC_PI_2 * t;
-        (angle.cos(), angle.sin())
-    }
-
-    /// Simple HRTF simulation: apply ITD + diffuse-field EQ.
-    ///
-    /// `azimuth`: radians, `elevation`: radians.
-    fn binaural_render(input: &[f32], output: &mut [f32], azimuth: f32, _elevation: f32, _sample_rate: f32) {
-        // Simplified binaural rendering: equal-power pan across azimuth
-        let pan = azimuth / std::f32::consts::PI; // [-1, 1]
-        let (left_gain, right_gain) = Self::stereo_pan(pan);
-
-        let len = output.len().min(input.len());
-        // Interleaved output: index 0 = left, index 1 = right
-        for i in 0..(len / 2) {
-            let s = if i < input.len() { input[i] } else { 0.0 };
-            output[i * 2] = s * left_gain;
-            output[i * 2 + 1] = s * right_gain;
-        }
-    }
 }
 
 impl AudioNode for MasterSpatialDecoderNode {
@@ -109,19 +94,32 @@ impl AudioNode for MasterSpatialDecoderNode {
 
         match &self.mode {
             DecoderMode::BinauralHrtf => {
-                // Mix input to mono, then apply binaural rendering
-                let mut mono_buf = AudioBuffer::new(1, input.samples());
-                for i in 0..num_samples {
-                    let mut mono = 0.0;
-                    for ch in 0..input.channels() as usize {
-                        mono += input.channel(ch as u16)[i];
+                // Mix input to mono (preallocated scratch), then render it through
+                // the parametric binaural model (see `crate::binaural`) into L/R.
+                let in_chs = input.channels() as usize;
+                let inv_in = 1.0 / in_chs.max(1) as f32;
+                let (left, right) = output.stereo_mut();
+                if let Some(bin) = self.binaural.as_mut() {
+                    let mut done = 0;
+                    while done < num_samples {
+                        let n = (num_samples - done).min(self.mono_scratch.len());
+                        for i in 0..n {
+                            let mut mono = 0.0;
+                            for c in 0..in_chs {
+                                mono += input.channel(c as u16)[done + i];
+                            }
+                            self.mono_scratch[i] = mono * inv_in;
+                        }
+                        bin.render_add(
+                            &self.mono_scratch[..n],
+                            params.direct_azimuth,
+                            params.direct_elevation,
+                            &mut left[done..done + n],
+                            &mut right[done..done + n],
+                        );
+                        done += n;
                     }
-                    mono_buf.set(0, i as u16, mono / input.channels() as f32);
                 }
-                let mono = mono_buf.channel(0);
-                let out_interleaved = output.channel_mut(0);
-                let azimuth = params.direct_azimuth;
-                Self::binaural_render(mono, out_interleaved, azimuth, params.direct_elevation, self.sample_rate);
             }
             DecoderMode::Vbap { .. } => {
                 // Constant-power VBAP via the shared panner (LFE slots stay silent),
@@ -172,6 +170,9 @@ impl AudioNode for MasterSpatialDecoderNode {
 
     fn reset(&mut self) {
         self.prev_valid = false;
+        if let Some(b) = self.binaural.as_mut() {
+            b.reset();
+        }
     }
 
     fn input_channels(&self) -> u16 {

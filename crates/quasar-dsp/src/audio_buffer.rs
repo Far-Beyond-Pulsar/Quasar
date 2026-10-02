@@ -68,6 +68,18 @@ impl AudioBuffer {
         &mut self.data[idx][..self.num_samples as usize]
     }
 
+    /// Mutable access to channels 0 and 1 at once (stereo output buses).
+    ///
+    /// A channel the buffer does not have comes back as an empty slice.
+    pub fn stereo_mut(&mut self) -> (&mut [f32], &mut [f32]) {
+        let n = self.num_samples as usize;
+        let have = self.num_channels as usize;
+        let (a, b) = self.data.split_at_mut(1);
+        let l = if have >= 1 { &mut a[0][..n] } else { &mut a[0][..0] };
+        let r = if have >= 2 { &mut b[0][..n] } else { &mut b[0][..0] };
+        (l, r)
+    }
+
     /// Get sample at (channel, sample).
     pub fn get(&self, channel: u16, sample: u16) -> f32 {
         let ch = channel as usize;

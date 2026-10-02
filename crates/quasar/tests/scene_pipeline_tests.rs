@@ -210,10 +210,11 @@ fn pan_change_is_ramped_per_sample() {
             max_step = max_step.max((w[1] - w[0]).abs());
         }
     }
+    eprintln!("pan_change_is_ramped_per_sample: max sample step = {max_step}");
     let (l1, r1) = (sum_channel(&out_buf, 0), sum_channel(&out_buf, 1));
     assert!(l1 > r1, "pan must have swung left (L={l1}, R={r1})");
     assert!(
-        max_step < 0.01,
+        max_step < 0.005,
         "gain must ramp per sample, not step per block (max sample step {max_step})"
     );
 }

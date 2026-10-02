@@ -30,15 +30,20 @@ use quasar_core::scene_output::{
     SceneOutputId, SourceConfig, SourceId,
 };
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNELS};
+use quasar_dsp::biquad::BiquadFilter;
+use quasar_dsp::binaural::{BinauralConfig, BinauralRenderer, ParametricBinauralRenderer};
 use quasar_dsp::crossfader::EqualPowerCrossfader;
 use quasar_dsp::early_reflections::EarlyReflectionDelayNode;
 use quasar_dsp::late_reverb::FdnReverbNode;
-use quasar_dsp::master_decoder::{layout_panner, SpeakerLayout};
+use quasar_dsp::master_decoder::{layout_lfe, layout_panner, SpeakerLayout};
 use quasar_dsp::vbap::VbapPanner;
 use quasar_dsp::node_graph::{AudioNode, AudioNodeGraph};
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayNode, PatchEntry};
 use quasar_materials::registry::AcousticMaterialRegistry;
+
+/// Corner frequency of the per-listener LFE low-pass (4th-order Butterworth, two biquads).
+pub const LFE_CUTOFF_HZ: f32 = 120.0;
 
 /// Atomic instrumentation for `process_audio_scene`.  All fields are relaxed-
 /// ordered atomics written from the audio callback and read from the demo's
@@ -130,6 +135,21 @@ struct SceneRenderState {
     prev_gains: Vec<[f32; MAX_AUDIO_CHANNELS]>,
     /// False until the pair has rendered once after a rebuild (first block uses target directly).
     prev_valid: Vec<bool>,
+    /// Binaural renderer per (listener x output) (flat index listener * n_out + output);
+    /// `Some` only for listeners whose layout is `PhysicalOutputLayout::Hrtf`.
+    binaural: Vec<Option<Box<dyn BinauralRenderer>>>,
+    /// LFE slots of each listener's layout (empty = no LFE channel).
+    listener_lfe: Vec<&'static [usize]>,
+    /// Per-listener LFE low-pass (4th order = two biquads) fed by the per-output sends.
+    lfe_filters: Vec<[BiquadFilter; 2]>,
+    /// True while a listener's LFE filters may still hold signal (tail decay after sends stop).
+    lfe_hot: Vec<bool>,
+    /// Per-output LFE send (linear), mirrors `SpatialAudioEngine::lfe_sends`.
+    lfe_send: Vec<f32>,
+    /// LFE send applied at the end of the previous block, flat (listener x output), for ramps.
+    lfe_send_prev: Vec<f32>,
+    /// Mono scratch for the summed LFE send of one listener (one block).
+    lfe_scratch: Vec<f32>,
     /// Preallocated scratch (all mono unless noted), sized to DEFAULT_BLOCK_SIZE.
     mixed: Vec<AudioBuffer>,        // patch bay output per scene output
     filtered: Vec<AudioBuffer>,     // occ output per scene output
@@ -161,6 +181,13 @@ impl SceneRenderState {
             listener_panners: Vec::new(),
             prev_gains: Vec::new(),
             prev_valid: Vec::new(),
+            binaural: Vec::new(),
+            listener_lfe: Vec::new(),
+            lfe_filters: Vec::new(),
+            lfe_hot: Vec::new(),
+            lfe_send: Vec::new(),
+            lfe_send_prev: Vec::new(),
+            lfe_scratch: Vec::new(),
             direct_delays: Vec::new(),
             mixed: Vec::new(),
             filtered: Vec::new(),
@@ -202,6 +229,9 @@ pub struct SpatialAudioEngine {
     scene_outputs: Vec<SceneOutputConfig>,
     /// Listener configurations, indexed by `ListenerId`.
     listeners: Vec<ListenerConfig>,
+    /// LFE send (linear) per scene output, parallel to `scene_outputs`. Kept here,
+    /// not in `SceneOutputConfig`, so the config struct stays source compatible.
+    lfe_sends: Vec<f32>,
     /// Next ID to hand out for a freshly loaded source.
     next_source_id: u32,
     /// Next ID to hand out for a freshly added scene output.
@@ -260,6 +290,7 @@ impl SpatialAudioEngine {
             sources: Vec::new(),
             scene_outputs: Vec::new(),
             listeners: Vec::new(),
+            lfe_sends: Vec::new(),
             next_source_id: 0,
             next_scene_output_id: 0,
             next_listener_id: 0,
@@ -617,15 +648,20 @@ impl SpatialAudioEngine {
             }
         }
 
-        // 5. Per-listener decode: constant-power VBAP the rendered mono onto
-        //    the physical layout and sum into the listener's output bus.
+        // 5. Per-listener decode: render each scene output's mono onto the
+        //    listener's physical layout and sum into the listener's output bus.
+        //    Speaker layouts use constant-power VBAP; `Hrtf` listeners use the
+        //    parametric binaural renderer (2 channels). Layouts with an LFE slot
+        //    additionally get the per-output LFE sends through a low-pass bus.
         //
         //    The crossfader's `direct_azimuth`/`direct_elevation` are WORLD-space
         //    angles from the listener toward the source. They are turned into a
         //    direction vector and rotated into the listener's frame (full basis
         //    from `heading`, so pitch counts too; roll is not modelled) before
-        //    panning. Speaker gains are ramped linearly per sample from the
-        //    previous block's gains to this block's target (no zipper noise).
+        //    panning / binaural rendering. VBAP speaker gains are ramped linearly
+        //    per sample from the previous block's gains to this block's target
+        //    (no zipper noise); the binaural renderer ramps its own delays and
+        //    filters.
         let n_lis_proc = n_lis
             .min(self.scene.listener_panners.len())
             .min(listener_outputs.len());
@@ -641,6 +677,20 @@ impl SpatialAudioEngine {
                 let idx = l * n_out + o;
                 let coeff = self.scene.crossfaders[idx].current_coefficients();
                 let (az, el) = basis.to_listener_angles(coeff.direct_azimuth, coeff.direct_elevation);
+
+                if let Some(bin) = self.scene.binaural[idx].as_mut() {
+                    let (left, right) = out.stereo_mut();
+                    let nb = block.min(left.len()).min(right.len());
+                    bin.render_add(
+                        &self.scene.combined[o].channel(0)[..nb],
+                        az,
+                        el,
+                        &mut left[..nb],
+                        &mut right[..nb],
+                    );
+                    continue;
+                }
+
                 panner.gains(az, el, &mut target[..n]);
 
                 let prev = &mut self.scene.prev_gains[idx];
@@ -667,6 +717,56 @@ impl SpatialAudioEngine {
                         for i in 0..block {
                             ch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
                         }
+                    }
+                }
+            }
+
+            // LFE bus: sum the per-output sends (already distance attenuated; ramped
+            // per sample), low-pass once (the sum is linear), add to the LFE slot(s).
+            let lfe_slots = self.scene.listener_lfe[l];
+            if !lfe_slots.is_empty() {
+                let scratch = &mut self.scene.lfe_scratch[..block];
+                scratch.fill(0.0);
+                let mut any = false;
+                for o in 0..n_out_proc {
+                    let idx = l * n_out + o;
+                    let g1 = self.scene.lfe_send[o];
+                    let g0 = self.scene.lfe_send_prev[idx];
+                    self.scene.lfe_send_prev[idx] = g1;
+                    if g0 == 0.0 && g1 == 0.0 {
+                        continue;
+                    }
+                    any = true;
+                    let combined_ch = self.scene.combined[o].channel(0);
+                    let step = (g1 - g0) / block.max(1) as f32;
+                    for i in 0..block {
+                        scratch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
+                    }
+                }
+                if any {
+                    self.scene.lfe_hot[l] = true;
+                }
+                if self.scene.lfe_hot[l] {
+                    let [f1, f2] = &mut self.scene.lfe_filters[l];
+                    let mut peak = 0.0_f32;
+                    for i in 0..block {
+                        let y = f2.process(f1.process(scratch[i]));
+                        scratch[i] = y;
+                        peak = peak.max(y.abs());
+                    }
+                    for &slot in lfe_slots {
+                        if slot < n_speakers {
+                            let ch = out.channel_mut(slot as u16);
+                            for i in 0..block {
+                                ch[i] += scratch[i];
+                            }
+                        }
+                    }
+                    if !any && peak < 1e-9 {
+                        // Tail has decayed: stop filtering and drop the (denormal) state.
+                        self.scene.lfe_hot[l] = false;
+                        f1.reset();
+                        f2.reset();
                     }
                 }
             }
@@ -739,6 +839,33 @@ impl SpatialAudioEngine {
             .iter()
             .map(|l| layout_panner(&physical_to_speaker_layout(&l.physical_layout)))
             .collect();
+        // Binaural renderers (Hrtf listeners only), per (listener x output).
+        let binaural: Vec<Option<Box<dyn BinauralRenderer>>> = (0..n_lis * n_out.max(0))
+            .map(|idx| {
+                let l = idx / n_out.max(1);
+                if self.listeners[l].physical_layout == PhysicalOutputLayout::Hrtf {
+                    Some(Box::new(ParametricBinauralRenderer::new(BinauralConfig::new(sr))) as Box<dyn BinauralRenderer>)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // LFE: per-listener slots, low-pass (4th-order Butterworth @ LFE_CUTOFF_HZ) and per-output sends.
+        let listener_lfe: Vec<&'static [usize]> = self
+            .listeners
+            .iter()
+            .map(|l| layout_lfe(&physical_to_speaker_layout(&l.physical_layout)))
+            .collect();
+        let lfe_filters: Vec<[BiquadFilter; 2]> = (0..n_lis)
+            .map(|_| {
+                let (mut a, mut b) = (BiquadFilter::new(), BiquadFilter::new());
+                a.set_lowpass_q(LFE_CUTOFF_HZ, 0.5412, sr);
+                b.set_lowpass_q(LFE_CUTOFF_HZ, 1.3066, sr);
+                [a, b]
+            })
+            .collect();
+        let mut lfe_send = self.lfe_sends.clone();
+        lfe_send.resize(n_out, 0.0);
         // Direct-path delays: pre-allocated, written by update_scene_spatial.
         let direct_delays = vec![0.0_f32; n_out];
 
@@ -764,6 +891,13 @@ impl SpatialAudioEngine {
             listener_panners,
             prev_gains: vec![[0.0; MAX_AUDIO_CHANNELS]; n_out * n_lis],
             prev_valid: vec![false; n_out * n_lis],
+            binaural,
+            listener_lfe,
+            lfe_filters,
+            lfe_hot: vec![false; n_lis],
+            lfe_send_prev: lfe_send.iter().cycle().take(n_out * n_lis).copied().collect(),
+            lfe_send,
+            lfe_scratch: vec![0.0; DEFAULT_BLOCK_SIZE],
             direct_delays,
             mixed,
             filtered,
@@ -841,6 +975,7 @@ impl SpatialAudioEngine {
         let id = SceneOutputId(self.next_scene_output_id);
         self.next_scene_output_id += 1;
         self.scene_outputs.push(cfg);
+        self.lfe_sends.push(0.0);
         self.rebuild_scene_render();
         id
     }
@@ -859,6 +994,7 @@ impl SpatialAudioEngine {
     pub fn remove_scene_output(&mut self, id: SceneOutputId) {
         let idx = self.scene_output_index(id);
         self.scene_outputs.remove(idx);
+        self.lfe_sends.remove(idx);
         self.next_scene_output_id = self.scene_outputs.len() as u32;
         self.rebuild_scene_render();
     }
@@ -874,6 +1010,40 @@ impl SpatialAudioEngine {
     pub fn set_scene_output_position(&mut self, id: SceneOutputId, pos: [f32; 3]) {
         let idx = self.scene_output_index(id);
         self.scene_outputs[idx].position = pos;
+    }
+
+    /// Set a scene output's LFE send (linear gain, `>= 0`; default 0 = none).
+    ///
+    /// For every listener whose layout has an LFE slot (named 5.1 / 7.1), the
+    /// output's rendered mono (already distance attenuated) times `linear` is
+    /// summed with the other outputs' sends, low-passed once at
+    /// [`LFE_CUTOFF_HZ`] (4th-order Butterworth) and added to the LFE channel.
+    /// This is the only way signal reaches an LFE slot: it is never panned to.
+    /// The send is independent of the output's normal panning (it is additive),
+    /// and the change is ramped per sample over the next block. Listeners
+    /// without an LFE slot (stereo, quad, custom, HRTF) ignore it.
+    ///
+    /// Content-model/config only: does NOT rebuild the render state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn set_scene_output_lfe_send(&mut self, id: SceneOutputId, linear: f32) {
+        let idx = self.scene_output_index(id);
+        let g = if linear.is_finite() { linear.max(0.0) } else { 0.0 };
+        self.lfe_sends[idx] = g;
+        if let Some(s) = self.scene.lfe_send.get_mut(idx) {
+            *s = g;
+        }
+    }
+
+    /// Current LFE send (linear) of a scene output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn scene_output_lfe_send(&self, id: SceneOutputId) -> f32 {
+        self.lfe_sends[self.scene_output_index(id)]
     }
 
     // ── Patch bay ───────────────────────────────────────────────────────
@@ -1036,7 +1206,9 @@ fn db_to_linear(db: f32) -> f32 {
 
 /// Map a listener's physical output layout to a VBAP [`SpeakerLayout`].
 ///
-/// HRTF decoding is deferred to P3; for now it falls back to Stereo.
+/// `Hrtf` listeners are rendered by the binaural path, never by this panner; the
+/// Stereo mapping only gives them a placeholder (2-slot) panner so the per-listener
+/// vectors stay uniform.
 fn physical_to_speaker_layout(layout: &PhysicalOutputLayout) -> SpeakerLayout {
     match layout {
         PhysicalOutputLayout::Stereo => SpeakerLayout::Stereo,

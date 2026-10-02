@@ -1,5 +1,6 @@
 pub mod audio_buffer;
 pub mod biquad;
+pub mod binaural;
 pub mod crossfader;
 pub mod fractional_delay;
 pub mod node_graph;
@@ -12,6 +13,7 @@ pub mod patch_bay;
 pub mod vbap;
 
 pub use audio_buffer::*;
+pub use binaural::*;
 pub use crossfader::*;
 pub use fractional_delay::*;
 pub use node_graph::*;
