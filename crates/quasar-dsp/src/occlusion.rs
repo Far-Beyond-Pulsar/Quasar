@@ -64,6 +64,9 @@ pub struct AirAbsorptionOcclusionNode {
     /// Per channel, per section transposed-direct-form-II state `[z1, z2]`.
     states: Vec<[[f32; 2]; BANDS]>,
     design: ShapeDesigner,
+    /// Last solved design (a pure function of the band gains): `(gain bits, scalar, coefficients)`.
+    /// A steady scene presents the same gains every block, so the solve is skipped.
+    design_cache: Option<([u32; BANDS], f32, [[f32; 5]; BANDS])>,
     /// Coefficients `[b0, b1, b2, a1, a2]` per section at the end of the last block.
     cur_coefs: [[f32; 5]; BANDS],
     /// Broadband gain at the end of the last block.
@@ -91,6 +94,7 @@ impl AirAbsorptionOcclusionNode {
             delay_lines,
             states: vec![[[0.0; 2]; BANDS]; channels],
             design: ShapeDesigner::new(sr as f64),
+            design_cache: None,
             cur_coefs: IDENTITY_COEFS,
             cur_scalar: 1.0,
             cur_delay: 0.0,
@@ -243,6 +247,21 @@ impl AirAbsorptionOcclusionNode {
     /// Solve the cascade for `gains`: returns the broadband scalar and the
     /// section coefficients.
     fn design_for(&mut self, gains: &Band8) -> (f32, [[f32; 5]; BANDS]) {
+        let mut key = [0u32; BANDS];
+        for (k, v) in key.iter_mut().zip(gains.0.iter()) {
+            *k = v.to_bits();
+        }
+        if let Some((ck, s, c)) = &self.design_cache {
+            if *ck == key {
+                return (*s, *c);
+            }
+        }
+        let (scalar, coefs) = self.design_uncached(gains);
+        self.design_cache = Some((key, scalar, coefs));
+        (scalar, coefs)
+    }
+
+    fn design_uncached(&mut self, gains: &Band8) -> (f32, [[f32; 5]; BANDS]) {
         let mut g = [0.0_f64; BANDS];
         let mut scalar = 0.0_f64;
         for (i, v) in g.iter_mut().enumerate() {
