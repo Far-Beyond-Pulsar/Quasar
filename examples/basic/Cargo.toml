@@ -4,7 +4,7 @@
 name = "quasar-audio-example-basic"
 version = "0.1.0"
 edition = "2021"
-description = "Quasar spatial audio debug visualization demo (based on Helio indoor_cathedral)"
+description = "Quasar spatial audio demo in Helio's large HLFS cathedral (acoustic geometry read from the SceneDB)"
 
 [dependencies]
 quasar-audio = { path = "../../crates/quasar", features = ["streaming"] }
@@ -13,21 +13,43 @@ quasar-materials = { path = "../../crates/quasar-materials" }
 quasar-dsp = { path = "../../crates/quasar-dsp" }
 quasar-backends = { path = "../../crates/quasar-backends", features = ["cpu-simd"] }
 
-helio =                    { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16", features = ["bake"] }
-helio-core =               { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-libhelio =                 { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-helio-default-graphs =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-helio-pass-perf-overlay =  { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-helio-pass-debug-overlay = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-helio-pass-postprocess =   { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
-helio-pass-billboard =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+# Helio, all at one rev (HEAD of origin/main when this example was ported).
+helio =                      { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-core =                 { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-mats =                 { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-default-graphs =       { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-gbuffer =         { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-forward-lit =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-sky =             { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-portal-cull =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-postprocess =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-volumetric-fog =  { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-tsr =             { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-hlfs =            { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-object-batch =    { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-transparent =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-perf-overlay =    { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-debug-overlay =   { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
+helio-pass-billboard =       { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "05c2f7d71099e8abb99684693176096bea0d198c" }
 
-wgpu = "30"
+# SceneDB: same pin and [patch] as Helio's workspace root (a [patch] in a
+# dependency's own workspace is ignored, so it is replicated here).
+pulsar_scenedb =        { git = "https://github.com/Far-Beyond-Pulsar/SceneDB", rev = "8f98f83", features = ["gpu"] }
+pulsar_scenedb_derive = { git = "https://github.com/Far-Beyond-Pulsar/SceneDB", rev = "8f98f83" }
+
+wgpu = { version = "30.0.0", default-features = true, features = ["vulkan", "vulkan-portability", "metal", "dx12", "gles", "webgpu", "wgsl"] }
 glam = { version = "0.33", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
 hound = "3"
 cpal = "0.15"
+
+# The patch VALUE uses the `//`-spelled URL: cargo refuses a patch that points
+# at the exact source the manifest pins (same URL, even at a different rev).
+[patch."https://github.com/Far-Beyond-Pulsar/SceneDB"]
+pulsar_scenedb = { git = "https://github.com//Far-Beyond-Pulsar/SceneDB", rev = "7b0414b2975e8e1eb2d6ea489b710a2c411630b3" }
+pulsar_scenedb_derive = { git = "https://github.com//Far-Beyond-Pulsar/SceneDB", rev = "7b0414b2975e8e1eb2d6ea489b710a2c411630b3" }

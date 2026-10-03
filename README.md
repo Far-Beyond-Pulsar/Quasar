@@ -366,6 +366,13 @@ cargo test -p quasar-backends --no-default-features --features cpu-simd
 cargo check --workspace
 ```
 
+### Validation
+
+- [docs/validation.md](docs/validation.md): the offline, deterministic acoustic validation harness (panning law and localisation, ITD / ILD, impulse latency, RT60 / EDT / C50 / D50, image sources, BS.1770 loudness, peak ceiling, allocation-free render path, direct / early / reverb balance): what each metric means, tolerances, how to run it (`cargo test -p quasar-audio --release --test acoustic_validation -- --nocapture`).
+- [docs/listening-checklist.md](docs/listening-checklist.md): the listening-validation process (localisation, distance, occlusion, reverb balance) with reference scenes and expected outcomes.
+
+CI (`.github/workflows/rust.yml`) builds and tests the workspace and runs the harness on every push and pull request; the example crate check and clippy are non-blocking jobs.
+
 ### Crate Dependencies
 
 ```

@@ -1,61 +1,45 @@
-//! Indoor cathedral example – high complexity
+//! Indoor cathedral example with HLFS ScreenSpace visibility
 //!
-//! A large Gothic cathedral interior: a 60 m nave flanked by two side aisles,
-//! 12 stone columns, a raised altar platform with a cross, carved stone pews
-//! in 6 rows on each side, three ornate chandeliers, stained-glass window
-//! shafts casting coloured light at intervals along both walls, and candle
-//! clusters near the altar.
+//! A Gothic interior with ribbed vaults, clustered limestone piers, marble
+//! paving, carved oak pews, bronze chandeliers and leaded stained glass.
+//! Panes use alpha blending and cast coloured shadows: the raster path through
+//! the shadow transmittance layer, RT through thin-sheet RGB transmission.
+//! Refraction and caustics are not simulated.
+//! Both sizes default to one shadowed daylight sun plus interior lights, with an
+//! incense medium filling the nave so the sun forms coloured shafts through the
+//! windows (`HLFS_NO_FOG`, `HLFS_FOG_DENSITY`, `HLFS_FOG_MODE`, `HLFS_SUN` adjust it). Set
+//! `HLFS_LEGACY_CATHEDRAL_LIGHTS=1` for the multi-window transmission stress setup.
 //!
-//! No sky atmosphere — the scene relies entirely on the interplay of the
-//! chandelier warm-white lights, the cool-coloured stained-glass fills, and
-//! a very dim stone-cold ambient to create a moody sacred atmosphere. The
-//! radiance cascades GI system bounces chandelier light deep into the side
-//! aisles and onto the vaulted ceiling.
+//! HLFS uses hierarchical light culling, visibility-guided sampling and
+//! temporal/spatial filtering with a bounded shadow budget per shading pixel.
+//! `--capture <directory>` renders a deterministic offscreen camera path.
 //!
 //! Controls:
 //!   WASD        — move forward/left/back/right
 //!   Space/Shift — move up/down
-//!   V (or R)    — toggle live acoustic rays and reflection paths
-//!   T           — toggle Quasar probe grid overlay
-//!   Y           — toggle Quasar material zone colors
-//!   G           — swap Aux Left/Right channels (live patch-bay remap)
-//!   [ / ]       — master volume down / up (3 dB steps; default +18 dB)
-//!   F2          — toggle performance overlay modes (GPU heatmaps)
-//!   F3          — toggle debug overlay (FPS, timings, texture stats)
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
+mod architectural_materials;
+mod hlfs_capture;
+mod architectural_mesh;
+mod cathedral_large;
 mod v3_demo_common;
 
 use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig,
-    Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer,
-    RendererConfig, Scene,
+    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
+    HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig,
 };
-// (BillboardInstance referenced inline as helio::BillboardInstance)
-use helio_default_graphs::build_default_graph;
+use helio_default_graphs::build_hlfs_graph_with_context;
 use helio_pass_perf_overlay::PerfOverlayMode;
-use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light};
-
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use quasar_audio::SpatialAudioEngine;
-use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
-use quasar_backends::debug_capture::{AcousticDebugFrame, CaptureDetail, DebugRayKind, RejectReason};
-use quasar_core::bands::Band8;
-use quasar_core::hybrid::HybridSamplingStrategy;
-use quasar_core::probe_grid::{AcousticProbe, AcousticProbeGrid};
-use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
-use quasar_core::scene_output::{
-    ChannelPull, ListenerConfig, ListenerId, PhysicalOutputLayout, SceneOutputConfig,
-    SceneOutputId, SourceConfig, SourceId,
+use pulsar_scenedb::{Entity, SceneDb, World};
+use v3_demo_common::{
+    new_scene_db_with_gpu_mirror, point_light,
+    scene_db_handle, spawn_indoor_cathedral_sky, spawn_light,
+    update_light,
 };
-use quasar_core::streaming_source::StreamingSource;
-use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
-use quasar_materials::instance::AcousticMaterialInstance;
-use quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
 
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -72,22 +56,20 @@ use std::collections::HashSet;
 // ── Scene data ────────────────────────────────────────────────────────────────
 
 // Column positions along the nave (Z axis), symmetric at x = ±5.5
-/// Minimum seconds between `update_scene_spatial()` calls (~30 Hz).
-const SPATIAL_UPDATE_INTERVAL: f32 = 1.0 / 30.0;
-const COLUMN_Z: &[f32] = &[-22.0, 18.0];
+const COLUMN_Z: &[f32] = &[-22.0, -14.0, -6.0, 2.0, 10.0, 18.0];
 
 // Stained glass window lights: (x_wall_side, y, z, r, g, b)
 // Positive x = right-side windows, negative = left-side; placed just inside the wall
 const GLASS_LIGHTS: &[(f32, f32, f32, f32, f32, f32)] = &[
     // Left wall (x ≈ -10.5), windows between columns
-    (-10.3, 9.0, -18.0, 0.8, 0.2, 1.0), // violet
+    (-10.3, 9.0, -22.0, 0.8, 0.2, 1.0), // violet
     (-10.3, 9.0, -6.0, 0.2, 0.7, 1.0),  // sky blue
-    (-10.3, 9.0, 6.0, 0.2, 1.0, 0.4),   // emerald
+    (-10.3, 9.0, 10.0, 0.2, 1.0, 0.4),   // emerald
     (-10.3, 9.0, 18.0, 1.0, 0.7, 0.1),  // gold
     // Right wall (x ≈ +10.5)
-    (10.3, 9.0, -18.0, 1.0, 0.2, 0.3), // ruby
+    (10.3, 9.0, -22.0, 1.0, 0.2, 0.3), // ruby
     (10.3, 9.0, -6.0, 1.0, 0.5, 0.1),  // amber
-    (10.3, 9.0, 6.0, 0.1, 0.8, 0.9),   // teal
+    (10.3, 9.0, 10.0, 0.1, 0.8, 0.9),   // teal
     (10.3, 9.0, 18.0, 0.9, 0.1, 0.7),  // magenta
     // Rose window above entrance (back wall, z ≈ +28)
     (0.0, 13.0, 27.0, 1.0, 0.75, 0.3), // warm gold
@@ -95,6 +77,7 @@ const GLASS_LIGHTS: &[(f32, f32, f32, f32, f32, f32)] = &[
 
 // Chandelier positions (x=0, hanging from y≈19.5, at z intervals)
 const CHANDELIER_Z: &[f32] = &[-16.0, 0.0, 16.0];
+const LARGE_CHANDELIER_Z: &[f32] = &[-54.0, -36.0, -18.0, 0.0, 18.0, 36.0, 54.0];
 
 // Candle cluster positions near the altar (z ≈ -24)
 const CANDLES: &[(f32, f32, f32)] = &[
@@ -104,666 +87,10 @@ const CANDLES: &[(f32, f32, f32)] = &[
     (1.5, 1.6, -23.0),
     (3.0, 1.6, -23.5),
 ];
-
-// Pew rows: 6 per side, spaced 2.4 m apart starting at z = -20
-const PEW_Z_START: f32 = -20.0;
-const PEW_Z_STEP: f32 = 3.2;
-const PEW_COUNT: usize = 6;
-
-// ── Quasar spatial audio engine (playback + spatial) ──────────────────────
-
-/// Number of scene outputs / speakers in the cathedral stage.
-const NUM_SPEAKERS: usize = 8;
-/// 8 cathedral speaker positions in STANDARD DEVICE CHANNEL ORDER.
-///
-/// Standard 8-channel audio devices route (FL, FR, C, Sub/LFE, BL, BR, SL, SR).
-/// The old order put the speakers in WAV-channel order (FL, FR, C, BL, BR, Sub,
-/// AuxL, AuxR), which caused a 3-way rotation: BL went to the Sub output, BR
-/// to BL, and Sub to BR.
-///
-/// WAV channels: 0=FL, 1=FR, 2=C, 3=BL, 4=BR, 5=Sub, 6=SL, 7=SR.
-/// CHANNEL_MAP below reconnects each output to the correct WAV channel.
-const SPEAKER_POSITIONS: [glam::Vec3; 8] = [
-    glam::Vec3::new(-7.0, 5.5, -12.0), // device 0 — Front Left    ← WAV ch 0
-    glam::Vec3::new(7.0, 5.5, -12.0),  // device 1 — Front Right   ← WAV ch 1
-    glam::Vec3::new(0.0, 3.0, -12.0),  // device 2 — Center        ← WAV ch 2
-    glam::Vec3::new(0.0, 0.3, -7.0),   // device 3 — Sub/LFE       ← WAV ch 5
-    glam::Vec3::new(-7.0, 2.0, 12.0),  // device 4 — Back Left     ← WAV ch 3
-    glam::Vec3::new(7.0, 2.0, 12.0),   // device 5 — Back Right    ← WAV ch 4
-    glam::Vec3::new(-7.0, 0.5, -12.0), // device 6 — Side Left     ← WAV ch 6
-    glam::Vec3::new(7.0, 0.5, -12.0),  // device 7 — Side Right    ← WAV ch 7
+const LARGE_CANDLES: &[(f32, f32, f32)] = &[
+    (-4.0, 1.6, -64.0), (-2.0, 1.6, -63.5), (0.0, 1.6, -64.0),
+    (2.0, 1.6, -63.5), (4.0, 1.6, -64.0),
 ];
-/// Maps device-channel index → WAV-channel index so each physical speaker
-/// plays the correct sweep tone.  Replaces the old 1:1 identity mapping
-/// that assumed the demo's position order matched the device's.
-const CHANNEL_MAP: [u32; 8] = [0, 1, 2, 5, 3, 4, 6, 7];
-
-// ── Demo mix (ARTISTIC defaults; the engine's own defaults stay physical) ───
-//
-// Physically a speaker radiating omnidirectionally into a 4-7 s cathedral produces a diffuse
-// field as loud as the direct sound at about 2-4 m, so from the audience the stage is mostly
-// reverb ("only echoes"). Real PA speakers are directional, and a listener usually wants more
-// direct sound than a hall gives, so the demo (a) aims every speaker at the audience and (b) pulls
-// the reverb bus down a little. Measured with `cargo test -p quasar-audio --release --test
-// direct_vs_room_levels -- --nocapture` (all 8 speakers playing uncorrelated noise, dB re one
-// input channel, total power over the output channels):
-//   2 m from the centre speaker: direct -5.9, early -11.0, reverb -10.2  (direct +4.3 dB over
-//                                reverb; omni and untrimmed it was -4.4 / -7.8 / -1.9 = reverb +2.5)
-//   at the start position (12 m): direct -14.1, early -12.4, reverb -10.4  (reverb +3.7 dB over
-//                                direct, was +11.9: still a big hall, no longer only echoes)
-// Keep these numbers in sync with `DEMO_*` in crates/quasar/tests/direct_vs_room_levels.rs
-// (that test asserts the balance). `-` / `=` and `;` / `'` change the trims live.
-/// Where the stage speakers point (the listener start position, ear height).
-const DEMO_AUDIENCE: [f32; 3] = [0.0, 1.6, 0.0];
-/// Speaker directivity (0 = omni, 1 = cardioid; 0.7 is a typical PA horn: rear about -10 dB at 1 kHz).
-const DEMO_DIRECTIVITY: f32 = 0.7;
-/// Initial reverb-bus trim in dB (0 = physical level).
-const DEMO_REVERB_DB: f32 = -5.0;
-/// Initial early-reflection trim in dB (0 = physical level).
-const DEMO_EARLY_DB: f32 = 0.0;
-
-/// Thin wrapper around `BufferedStream` for the audio callback.
-///
-/// All disk I/O happens on a background thread.  The callback never blocks.
-struct StreamingPlayback {
-    stream: quasar_audio::streaming_source::BufferedStream,
-    channels: usize,
-    read_pos: f64,
-    rate_ratio: f64,
-}
-
-impl StreamingPlayback {
-    fn open(path: &str, output_sample_rate: f32) -> Self {
-        // Scan the first chunk for peak normalisation (blocking, setup only).
-        let mut wave = quasar_audio::streaming_source::WaveFileStream::open(path)
-            .expect("open WAV for streaming");
-        let sample_rate = wave.sample_rate();
-        let channels = wave.channels();
-        let total_frames = wave.total_frames().unwrap_or(0);
-
-        let mut scan_buf = vec![0.0_f32; 4096 * channels];
-        let n = wave.read_frames(&mut scan_buf);
-        let peak = scan_buf[..n * channels]
-            .iter()
-            .fold(0.0f32, |m, &s| m.max(s.abs()));
-        wave.seek_frames(0);
-
-        // This demo's ambient cathedral bed is meant to loop forever —
-        // declare that explicitly rather than waiting on the Auto heuristic.
-        let policy_source = quasar_audio::streaming_source::PolicyOverride::new(
-            wave,
-            quasar_core::streaming_source::StreamingPolicy::Common,
-        );
-        let stream = quasar_audio::streaming_source::BufferedStream::new(Box::new(policy_source));
-
-        eprintln!(
-            "[quasar-stream] opened {} ({} ch, {} Hz, {} frames, peak={:.3})",
-            path, channels, sample_rate, total_frames, peak,
-        );
-
-        Self {
-            stream,
-            channels,
-            read_pos: 0.0,
-            rate_ratio: sample_rate as f64 / output_sample_rate as f64,
-        }
-    }
-
-    /// Read one resampled sample from the ring buffer (non-blocking).
-    /// `norm_gain` is baked into the peak-normalisation multiplier.
-    fn source_sample(&self, frame: u64, ch: usize) -> f32 {
-        self.stream.sample_at(frame, ch)
-    }
-}
-
-/// Handles the UI / compute thread keeps. The audio callback owns the [`quasar_audio::AudioRenderer`]
-/// and the [`StreamingPlayback`] outright and shares only atomics with this side, so it never
-/// takes a lock the compute pass (which holds `engine`) could be holding.
-struct AudioEngine {
-    debug_capture: Arc<quasar_backends::debug_capture::AcousticDebugCapture>,
-    /// Compute / configuration side (registries, ray tracing, command queue to the renderer).
-    engine: Arc<Mutex<SpatialAudioEngine>>,
-    _stream: cpal::Stream,
-    /// Master gain in dB (f32 bits): UI state; applied as the output stage's pre-limiter gain, so the
-    /// limiter ceiling holds whatever the master volume.
-    master_gain_db: Arc<AtomicU32>,
-    /// Per-speaker RMS (f32 bits), written by the callback, read by the UI.
-    levels: Arc<[AtomicU32; NUM_SPEAKERS]>,
-    source_id: SourceId,
-    outputs: [SceneOutputId; NUM_SPEAKERS],
-    listener_id: ListenerId,
-}
-
-impl AudioEngine {
-    /// Nudge the listener's reverb (`early == false`) or early-reflection trim by `delta_db`
-    /// (clamped to -30 ..= +12 dB); returns the new value.
-    fn adjust_mix_trim_db(&self, early: bool, delta_db: f32) -> Option<f32> {
-        let mut e = self.engine.lock().ok()?;
-        let cur = if early {
-            e.early_reflection_gain_db(self.listener_id)
-        } else {
-            e.reverb_gain_db(self.listener_id)
-        };
-        let db = (cur + delta_db).clamp(-30.0, 12.0);
-        if early {
-            e.set_early_reflection_gain_db(self.listener_id, db);
-        } else {
-            e.set_reverb_gain_db(self.listener_id, db);
-        }
-        Some(db)
-    }
-
-    /// Master volume: the output stage's pre-limiter gain (set through the engine's lock-free
-    /// command queue), so the limiter ceiling (-1 dBFS) holds at any master volume.
-    fn set_master_gain_db(&self, db: f32) {
-        self.master_gain_db
-            .store(db.to_bits(), AtomicOrdering::Relaxed);
-        if let Ok(mut e) = self.engine.lock() {
-            e.set_output_safety(
-                self.listener_id,
-                quasar_dsp::limiter::OutputSafetyConfig {
-                    headroom_db: db,
-                    ..Default::default()
-                },
-            );
-        }
-    }
-}
-
-fn setup_audio_engine() -> AudioEngine {
-    // Set up cpal
-    let host = cpal::default_host();
-    let device = host.default_output_device().expect("audio output device");
-    let out_config = device.default_output_config().expect("output config");
-    let out_sr = out_config.sample_rate().0;
-    let out_ch = out_config.channels() as usize;
-    let sr = out_sr as f32;
-
-    // Open the WAV as a streaming source (no full-file load).
-    let mut playback = StreamingPlayback::open("assets/8_Channel_ID.wav", sr);
-    let nch_wav = playback.channels;
-
-    // Scene-pipeline engine: the demo no longer uses the legacy per-WAV-channel
-    // graph (occ → rev → dec). One multi-channel Source is loaded, positioned
-    // SceneOutputs pull their content via ChannelPulls, and the engine renders
-    // onto one Listener whose physical layout matches the real output device.
-    let mut engine = SpatialAudioEngine::new(0, sr, 15.0);
-
-    // Acoustic materials drive occlusion filtering, early reflections and the
-    // statistical late field. Per-band absorption (62.5 Hz .. 8 kHz), chosen so the
-    // closed shell's mean absorption (~0.1) gives the 4-7 s reverberation time the
-    // probe grid below describes:
-    //   floor   - stone with pews and rugs, absorbs more in the mids/highs;
-    //   walls   - rough stone, slightly more absorbent toward HF;
-    //   ceiling - vaulted stone/plaster, a little LF panel absorption.
-    // Registered BEFORE the backend is created so mesh handles are valid.
-    engine
-        .materials()
-        .register_evaluator(Box::new(Tabular8BandEvaluator::new()));
-    let material = |absorption: [f32; 8]| {
-        engine
-            .materials()
-            .add_instance(AcousticMaterialInstance::new(
-                TABULAR_MODEL_ID,
-                Tabular8BandEvaluator::create_params(
-                    Band8::new(absorption),
-                    Band8::zeros(),
-                    Band8::zeros(),
-                ),
-            ))
-    };
-    let floor_mat = material([0.08, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22]);
-    let wall_mat = material([0.06, 0.05, 0.05, 0.06, 0.07, 0.09, 0.12, 0.15]);
-    let ceiling_mat = material([0.10, 0.08, 0.06, 0.05, 0.05, 0.05, 0.06, 0.07]);
-
-    // Acoustic proxy scene: a CLOSED shell (floor, two side walls, ceiling, altar
-    // wall at z = -28 and entrance wall at z = +28; 22 x 21 x 56 m) so the early
-    // reflections and the late-reverb estimate describe a real room, plus the 4 nave
-    // columns so occluding a speaker behind a column is demonstrable (columns are
-    // 0.65 x 20 x 0.65 acoustic boxes at x = +-5.5, z = -22 / +18).
-    let mut qs = QScene::new();
-    qs.add_mesh(QMesh::new(
-        1,
-        vec![
-            [-11., 0., -28.],
-            [11., 0., -28.],
-            [11., 0., 28.],
-            [-11., 0., 28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        floor_mat,
-    ));
-    qs.add_mesh(QMesh::new(
-        2,
-        vec![
-            [-11., 0., -28.],
-            [-11., 0., 28.],
-            [-11., 21., 28.],
-            [-11., 21., -28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        wall_mat,
-    ));
-    qs.add_mesh(QMesh::new(
-        3,
-        vec![
-            [11., 0., -28.],
-            [11., 0., 28.],
-            [11., 21., 28.],
-            [11., 21., -28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        wall_mat,
-    ));
-    qs.add_mesh(QMesh::new(
-        8,
-        vec![
-            [-11., 21., -28.],
-            [11., 21., -28.],
-            [11., 21., 28.],
-            [-11., 21., 28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        ceiling_mat,
-    ));
-    qs.add_mesh(QMesh::new(
-        9,
-        vec![
-            [-11., 0., -28.],
-            [11., 0., -28.],
-            [11., 21., -28.],
-            [-11., 21., -28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        wall_mat,
-    ));
-    qs.add_mesh(QMesh::new(
-        10,
-        vec![
-            [-11., 0., 28.],
-            [11., 0., 28.],
-            [11., 21., 28.],
-            [-11., 21., 28.],
-        ],
-        vec![0, 1, 2, 0, 2, 3],
-        wall_mat,
-    ));
-    for (i, &cz) in COLUMN_Z.iter().enumerate() {
-        for (j, &cx) in [-5.5_f32, 5.5].iter().enumerate() {
-            qs.add_mesh(QMesh::new(
-                4 + (i * 2 + j) as u64,
-                vec![
-                    [cx - 0.325, 0.0, cz - 0.325],
-                    [cx + 0.325, 0.0, cz - 0.325],
-                    [cx + 0.325, 0.0, cz + 0.325],
-                    [cx - 0.325, 0.0, cz + 0.325],
-                    [cx - 0.325, 20.0, cz - 0.325],
-                    [cx + 0.325, 20.0, cz - 0.325],
-                    [cx + 0.325, 20.0, cz + 0.325],
-                    [cx - 0.325, 20.0, cz + 0.325],
-                ],
-                vec![
-                    0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 2, 6, 7, 2, 7, 3, 0, 3,
-                    7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
-                ],
-                wall_mat,
-            ));
-        }
-    }
-    let cfg = CpuSimdConfig {
-        max_reflection_order: 3,
-        diffuse_rays_per_query: 128,
-        max_reflection_distance: 60.,
-        speed_of_sound: 343.,
-        temperature_celsius: 20.,
-        humidity_percent: 50.,
-        sample_rate: 48_000.,
-        ..CpuSimdConfig::default()
-    };
-    let backend = CpuSimdComputeBackend::new(qs, cfg);
-    let debug_capture = backend.debug_capture();
-    engine.set_backend(Box::new(backend));
-
-    // Baked probe grid covering the whole navigable cathedral so HybridBlend
-    // late reverb is probe-driven everywhere the camera goes. T60 ramps from
-    // ~7 s near the altar (z = -28) to ~4.2 s at the entrance (z = +28).
-    // Probe order must match grid cell indexing (z*sy*sx + y*sx + x): z outer,
-    // y middle, x inner. Any other order scrambles which t60 is sampled where.
-    let mut probes = Vec::with_capacity(5 * 5 * 9);
-    for z in 0..9 {
-        for y in 0..5 {
-            for x in 0..5 {
-                let position = [
-                    -12.0 + x as f32 * 6.0,
-                    0.0 + y as f32 * 4.0,
-                    -28.0 + z as f32 * 7.0,
-                ];
-                let f = ((-position[2] + 28.0) / 56.0).clamp(0.0, 1.0);
-                let t60 = 4.2 + 2.8 * f;
-                probes.push(AcousticProbe {
-                    position,
-                    rir_samples: Vec::new(),
-                    sample_rate: 48000,
-                    t60: Band8::splat(t60),
-                    broadband_t60: t60,
-                    early_late_split_secs: 0.05,
-                });
-            }
-        }
-    }
-    engine.set_probe_grid(
-        AcousticProbeGrid::new(probes, [-12.0, 0.0, -28.0], [6.0, 4.0, 7.0], [5, 5, 9])
-            .expect("probe grid"),
-    );
-    engine.set_strategy(HybridSamplingStrategy::HybridBlend);
-
-    // Load the 8-channel WAV as ONE source; the patch bay taps individual channels.
-    let source_id = engine
-        .load_source(SourceConfig {
-            path: "assets/8_Channel_ID.wav".to_string(),
-            channels: nch_wav,
-        })
-        .expect("load source");
-
-    // One scene output per cathedral speaker, in device-channel order.
-    // Use CHANNEL_MAP so the correct WAV channel reaches each physical speaker.
-    let mut outputs = [SceneOutputId(0); NUM_SPEAKERS];
-    for (dev_ch, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
-        let out_id = engine.add_scene_output(SceneOutputConfig::new(
-            pos.to_array(),
-            quasar_core::scene::Movability::Static,
-        ));
-        let wav_ch = *CHANNEL_MAP.get(dev_ch).unwrap_or(&(dev_ch as u32));
-        engine.connect_pull(out_id, ChannelPull::new(source_id, wav_ch, 0.0));
-        let to_audience = (glam::Vec3::from_array(DEMO_AUDIENCE) - pos).normalize();
-        engine.set_scene_output_directivity(out_id, Some(to_audience.to_array()), DEMO_DIRECTIVITY);
-        outputs[dev_ch] = out_id;
-    }
-
-    // The Sub/LFE output (device slot 3) is never panned *to* a speaker slot by the
-    // engine; instead its rendered signal is sent to the listener's LFE channel
-    // through the engine's 120 Hz LFE low-pass bus (a no-op on layouts without an
-    // LFE slot). The Sub emitter is still also panned like any other emitter.
-    engine.set_scene_output_lfe_send(outputs[3], 1.0);
-
-    // Physical device layout derived from the real output channel count. These are
-    // the REAL device layouts (standard channel orders), not the stage speaker
-    // positions: 7.1 is FL FR C LFE BL BR SL SR with LFE excluded from panning.
-    let physical_layout = match out_ch {
-        2 => PhysicalOutputLayout::Stereo,
-        4 => PhysicalOutputLayout::Quad,
-        6 => PhysicalOutputLayout::Surround51,
-        8 => PhysicalOutputLayout::Surround714,
-        n => PhysicalOutputLayout::Custom {
-            positions: (0..n)
-                .map(|i| {
-                    let a = i as f32 * std::f32::consts::TAU / n as f32;
-                    [a.sin(), 0.0, -a.cos()]
-                })
-                .collect(),
-        },
-    };
-    let listener_id = engine.add_listener(ListenerConfig {
-        position: [0.0, 1.6, 0.0],
-        heading: [0.0, 0.0, -1.0],
-        physical_layout,
-    });
-    engine.set_reverb_gain_db(listener_id, DEMO_REVERB_DB);
-    engine.set_early_reflection_gain_db(listener_id, DEMO_EARLY_DB);
-
-    // Split the engine (#75): the audio callback takes the `AudioRenderer` (render state, triple
-    // buffer readers, command-queue consumer) and the streaming playback state BY VALUE. Nothing
-    // the callback touches is behind a mutex that the UI / compute thread also takes: the compute
-    // pass (`update_scene_spatial`, ray tracing) holds only the `engine` mutex, and configuration
-    // reaches the renderer through the engine's lock-free command queue.
-    let mut renderer = engine.audio_handle();
-    let engine = Arc::new(Mutex::new(engine));
-
-    let master_gain_db = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-    let levels: Arc<[AtomicU32; NUM_SPEAKERS]> =
-        Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
-    let levels_cb = levels.clone();
-    let out_ch_cb = out_ch;
-    let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
-
-    let stream = device
-        .build_output_stream(
-            &out_config.config(),
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let total_frames = data.len() / out_ch_cb;
-                data.fill(0.0);
-                if total_frames == 0 {
-                    return;
-                }
-
-                let nch = playback.channels;
-                let ratio = playback.rate_ratio;
-                let mut remain = total_frames;
-                let mut offset = 0;
-
-                while remain > 0 {
-                    let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
-
-                    let mut src = AudioBuffer::new(nch as u16, block as u16);
-                    for k in 0..nch.min(NUM_SPEAKERS) {
-                        let ch = src.channel_mut(k as u16);
-                        for i in 0..block {
-                            let pos = playback.read_pos + i as f64 * ratio;
-                            let fa = pos.floor() as u64;
-                            let fb = fa + 1;
-                            let frac = (pos - fa as f64) as f32;
-                            ch[i] = playback.source_sample(fa, k)
-                                + (playback.source_sample(fb, k) - playback.source_sample(fa, k))
-                                    * frac;
-                        }
-                    }
-                    for k in 0..nch.min(NUM_SPEAKERS) {
-                        let ch = src.channel(k as u16);
-                        let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
-                        levels_cb[k].store(
-                            (sum_sq / block as f32).sqrt().to_bits(),
-                            AtomicOrdering::Relaxed,
-                        );
-                    }
-                    let source_frames = (block as f64 * ratio).ceil() as u64;
-                    playback.stream.advance_read(source_frames);
-                    playback.read_pos += block as f64 * ratio;
-
-                    let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
-                    renderer.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
-
-                    for i in 0..block {
-                        let dst = offset + i;
-                        for c in 0..out_ch_cb.min(out.channels() as usize) {
-                            data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
-                        }
-                    }
-
-                    remain -= block;
-                    offset += block;
-                }
-            },
-            err_fn,
-            None,
-        )
-        .expect("build output stream");
-    stream.play().expect("play stream");
-
-    AudioEngine {
-        debug_capture,
-        engine,
-        _stream: stream,
-        master_gain_db,
-        levels,
-        source_id,
-        outputs,
-        listener_id,
-    }
-}
-
-// ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
-
-/// Replace the default billboard sprite (spotlight.png) with the procedural
-/// speaker icon in the render graph.
-///
-/// Must be called whenever the graph may have been rebuilt (see Helio #192:
-/// `rebuild_graph_if_sky_changed()` and `apply_resize_now()` both invoke the
-/// `GraphRebuilder`, which destroys custom pass replacements).  We re-apply
-/// the replacement on every frame after acquiring the render lock so that
-/// any graph rebuild is always caught.
-///
-/// Uses the *scene* camera buffer (`array<Camera,2>`, 736 bytes) — NOT the
-/// `debug_camera_buf` (`DebugCameraUniform`, 64 bytes) — because the billboard
-/// shader reads `cameras[0].view_proj` at offset 128 and
-/// `cameras[0].position_near` at offset 256, both past a 64-byte buffer.
-fn apply_billboard_replacement(
-    renderer: &mut Renderer,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) {
-    let camera_buf = renderer.scene().gpu_scene().camera.buffer();
-    let fmt = renderer.renderer_config().surface_format;
-    let (rgba, w, h) = generate_speaker_icon();
-    if let Some(idx) = renderer.graph_pass_index::<helio_pass_billboard::BillboardPass>() {
-        let custom_pass = helio_pass_billboard::BillboardPass::new_with_sprite_rgba(
-            device, queue, camera_buf, fmt, &rgba, w, h,
-        );
-        renderer.replace_graph_pass(idx, Box::new(custom_pass));
-    }
-}
-
-/// Generate a simple 16x16 white speaker icon as RGBA pixel data.
-fn generate_speaker_icon() -> (Vec<u8>, u32, u32) {
-    let w = 32u32;
-    let h = 32u32;
-    let mut pixels = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let cx = x as i32 - 16;
-            let cy = y as i32 - 16;
-            let in_cabinet = cx >= -8 && cx <= -3 && cy >= -8 && cy <= 8;
-            let in_cone = cx >= -2 && cx <= 8 && cy.abs() <= (10 - cx);
-            let in_grill = cx == -3 && cy >= -6 && cy <= 6 && cy % 3 == 0;
-            let lit = in_cabinet || in_cone || in_grill;
-            if lit {
-                let idx = ((y * w + x) * 4) as usize;
-                pixels[idx] = 255;
-                pixels[idx + 1] = 255;
-                pixels[idx + 2] = 255;
-                pixels[idx + 3] = 255;
-            }
-        }
-    }
-    (pixels, w, h)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn speaker_icon_has_correct_dimensions() {
-        let (pixels, w, h) = generate_speaker_icon();
-        assert_eq!(w, 32);
-        assert_eq!(h, 32);
-        assert_eq!(pixels.len(), 32 * 32 * 4);
-    }
-
-    #[test]
-    fn speaker_icon_has_non_transparent_pixels() {
-        let (pixels, _w, _h) = generate_speaker_icon();
-        let opaque = pixels.chunks_exact(4).filter(|c| c[3] == 255).count();
-        // Should have many white pixels (the speaker shape), not all transparent
-        assert!(
-            opaque > 0,
-            "speaker icon must contain non-transparent pixels"
-        );
-        assert!(
-            opaque < pixels.len() / 4,
-            "speaker icon should have transparent background"
-        );
-    }
-
-    #[test]
-    fn speaker_icon_white_pixels() {
-        let (pixels, _w, _h) = generate_speaker_icon();
-        for chunk in pixels.chunks_exact(4) {
-            if chunk[3] == 255 {
-                // Opaque pixels must be fully white (the shader tints them)
-                assert_eq!(chunk[0], 255);
-                assert_eq!(chunk[1], 255);
-                assert_eq!(chunk[2], 255);
-            }
-        }
-    }
-
-    fn direct(id: u32, source: [f32; 3]) -> quasar_backends::debug_capture::DebugDirect {
-        quasar_backends::debug_capture::DebugDirect {
-            source,
-            listener: [0.0; 3],
-            source_id: id,
-            query_index: id,
-            occluded: false,
-            occlusion_factor: 1.0,
-            source_outside: false,
-            listener_outside: false,
-            reflections_skipped: false,
-            rays_traced: 0,
-        }
-    }
-
-    #[test]
-    fn acoustic_view_picks_nearest_cycles_and_requests_detail() {
-        let frame = AcousticDebugFrame {
-            directs: vec![direct(4, [10.0, 0.0, 0.0]), direct(2, [3.0, 0.0, 0.0]), direct(9, [5.0, 0.0, 0.0])],
-            ..Default::default()
-        };
-        let mut view = AcousticView::default();
-        assert_eq!(view.active_emitters(&frame), vec![2], "default = nearest to the listener");
-        view.cycle_emitter(Some(&frame));
-        assert_eq!(view.active_emitters(&frame), vec![2]);
-        view.cycle_emitter(Some(&frame));
-        assert_eq!(view.active_emitters(&frame), vec![4]);
-        view.cycle_emitter(Some(&frame));
-        assert_eq!(view.active_emitters(&frame), vec![9]);
-        view.cycle_emitter(Some(&frame));
-        assert!(view.emitter.is_none(), "wraps back to nearest");
-        view.all_emitters = true;
-        assert_eq!(view.active_emitters(&frame), vec![2, 4, 9]);
-        assert_eq!(view.detail(), CaptureDetail::NONE, "probes and rejected paths are off by default");
-        view.show_probes = true;
-        view.show_rejected = true;
-        assert_eq!(view.detail(), CaptureDetail::ALL);
-        assert!(acoustic_title(&frame, &view, "capturing").contains("all emitters"));
-    }
-
-    #[test]
-    fn acoustic_title_reports_outside_listener() {
-        let mut d = direct(1, [1.0, 0.0, 0.0]);
-        d.listener_outside = true;
-        d.reflections_skipped = true;
-        let frame = AcousticDebugFrame { directs: vec![d], ray_count: 123, ..Default::default() };
-        let title = acoustic_title(&frame, &AcousticView::default(), "capturing");
-        assert!(title.contains("123 rays traced") && title.contains("outside: reflections skipped"), "{title}");
-    }
-}
-
-fn hsl_to_rgba(h: f32, s: f32, l: f32, a: f32) -> [f32; 4] {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-    let m = l - c * 0.5;
-    let (r, g, b) = match (h * 6.0).floor() as i32 {
-        0 => (c, x, 0.),
-        1 => (x, c, 0.),
-        2 => (0., c, x),
-        3 => (0., x, c),
-        4 => (x, 0., c),
-        _ => (c, 0., x),
-    };
-    [r + m, g + m, b + m, a]
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
     env_logger::init();
@@ -785,36 +112,12 @@ struct AppState {
     renderer: Arc<Mutex<Renderer>>,
     action_rx: Receiver<HelioAction>,
     last_frame: std::time::Instant,
-    /// Seconds accumulated since the last `update_scene_spatial()` call.
-    spatial_accum: f32,
-
-    // Major structural surfaces
-    _floor: MeshId,
-    _nave_ceiling: MeshId,
-    _aisle_ceil_l: MeshId,
-    _aisle_ceil_r: MeshId,
-    _wall_left_outer: MeshId,
-    _wall_right_outer: MeshId,
-    _wall_front: MeshId,
-    _wall_back: MeshId,
-    // Columns
-    _columns: Vec<MeshId>,
-    // Altar
-    _altar_plinth: MeshId,
-    _altar_step: MeshId,
-    _cross_vert: MeshId,
-    _cross_horiz: MeshId,
-    // Pews
-    _pews_left: Vec<MeshId>,
-    _pews_right: Vec<MeshId>,
-    // Chandelier bodies (chain + ring)
-    _chandelier_chains: Vec<MeshId>,
-    _chandelier_rings: Vec<MeshId>,
 
     cam_pos: glam::Vec3,
     cam_yaw: f32,
     cam_pitch: f32,
     keys: HashSet<KeyCode>,
+    alt_pressed: bool,
     cursor_grabbed: bool,
     mouse_delta: (f32, f32),
 
@@ -823,211 +126,15 @@ struct AppState {
     perf_overlay_mode: PerfOverlayMode,
     debug_overlay_enabled: bool,
 
+    scene_db: SceneDb,
+    acceleration: Option<helio_pass_hlfs::SceneDbRayTracing>,
+
     // Scene state
-    chandelier_light_ids: Vec<LightId>,
-    candle_light_ids: Vec<LightId>,
+    chandelier_light_ids: Vec<Entity>,
+    candle_light_ids: Vec<Entity>,
+    large: bool,
     start_time: std::time::Instant,
-
-    // Quasar spatial audio
-    _audio_engine: AudioEngine,
-    /// V toggles trace capture; the last nonempty snapshot stays on screen when paused.
-    show_rays: bool,
-    acoustic_snapshot: Option<AcousticDebugFrame>,
-    /// C cycles the emitter, B shows all, N rejected candidates, M probe rays.
-    acoustic_view: AcousticView,
-    show_probes: bool,
-    show_material_zones: bool,
-    // Aux Left/Right pulls swapped live via the G key (patch-bay remap).
-    aux_swapped: bool,
-}
-
-/// What the acoustic overlay shows. Keys: C cycles the emitter (auto = nearest to the
-/// listener -> each emitter -> auto), B shows all emitters, N rejected reflection
-/// candidates, M the solver's probe rays (occlusion, diffraction, path validation).
-#[derive(Default)]
-struct AcousticView {
-    /// `None` follows the emitter nearest to the listener.
-    emitter: Option<u32>,
-    all_emitters: bool,
-    show_rejected: bool,
-    show_probes: bool,
-}
-
-/// Valid reflection paths drawn emphasised (brightest, with bounce markers) per emitter.
-const OVERLAY_STRONGEST_PATHS: usize = 16;
-
-impl AcousticView {
-    /// The capture detail the solver must store for what is currently drawn.
-    fn detail(&self) -> CaptureDetail {
-        CaptureDetail {
-            occlusion_probes: self.show_probes,
-            diffraction_probes: self.show_probes,
-            reflection_validation: self.show_probes,
-            rejected_paths: self.show_rejected,
-        }
-    }
-
-    fn emitter_ids(frame: &AcousticDebugFrame) -> Vec<u32> {
-        let mut ids: Vec<u32> = frame.directs.iter().map(|d| d.source_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    }
-
-    /// auto -> first emitter -> ... -> last emitter -> auto.
-    fn cycle_emitter(&mut self, frame: Option<&AcousticDebugFrame>) {
-        let ids = frame.map(Self::emitter_ids).unwrap_or_default();
-        self.all_emitters = false;
-        self.emitter = match self.emitter {
-            None => ids.first().copied(),
-            Some(cur) => ids.iter().copied().find(|&id| id > cur),
-        };
-    }
-
-    /// Emitters drawn: all, the chosen one, or the one nearest to the listener.
-    fn active_emitters(&self, frame: &AcousticDebugFrame) -> Vec<u32> {
-        if self.all_emitters {
-            return Self::emitter_ids(frame);
-        }
-        if let Some(id) = self.emitter {
-            return vec![id];
-        }
-        let dist = |d: &quasar_backends::debug_capture::DebugDirect| {
-            (glam::Vec3::from_array(d.source) - glam::Vec3::from_array(d.listener)).length()
-        };
-        frame
-            .directs
-            .iter()
-            .min_by(|a, b| dist(a).total_cmp(&dist(b)))
-            .map(|d| vec![d.source_id])
-            .unwrap_or_default()
-    }
-
-    fn label(&self) -> &'static str {
-        if self.all_emitters {
-            "all emitters"
-        } else if self.emitter.is_some() {
-            "chosen emitter"
-        } else {
-            "nearest emitter"
-        }
-    }
-}
-
-/// Window-title statistics of the retained acoustic frame.
-fn acoustic_title(frame: &AcousticDebugFrame, view: &AcousticView, status: &str) -> String {
-    let active = view.active_emitters(frame);
-    let selected = frame.paths.iter().filter(|p| p.selected).count();
-    let stored = frame.rays.len();
-    let side = match frame.directs.iter().find(|d| active.contains(&d.source_id)) {
-        Some(d) if d.reflections_skipped => "outside: reflections skipped",
-        Some(d) if d.listener_outside => "listener outside",
-        Some(_) => "listener inside",
-        None => "no query",
-    };
-    format!(
-        "Quasar | {status} | {} rays traced | {stored} stored / {} dropped | {} valid paths, {selected} selected | {} {active:?} | {side} | C emitter, B all, N rejected {}, M probes {} | V pauses with last trace visible",
-        frame.ray_count,
-        frame.rays_dropped,
-        frame.paths.len(),
-        view.label(),
-        if view.show_rejected { "on" } else { "off" },
-        if view.show_probes { "on" } else { "off" },
-    )
-}
-
-/// Replay the retained acoustic trace through Helio's world-space debug API.
-/// The renderer clears debug geometry every frame, so paused captures are redrawn here.
-///
-/// Per active emitter: the direct segment (green clear, yellow partial, red blocked) and
-/// its valid reflection paths coloured by order and faded by gain (the strongest
-/// [`OVERLAY_STRONGEST_PATHS`] emphasised, with bounce markers and surface normals).
-/// Rejected candidates and probe rays appear only when their keys are on.
-fn draw_acoustic_snapshot(renderer: &mut Renderer, frame: &AcousticDebugFrame, view: &AcousticView) {
-    let active = view.active_emitters(frame);
-
-    if view.show_probes {
-        for sample in frame.rays.iter().filter(|s| active.contains(&s.source_id)) {
-            let ray = &sample.ray;
-            let end = sample.hit.as_ref().map(|hit| hit.point).unwrap_or_else(|| {
-                ray.point_at(if ray.max_distance < 1.0e6 { ray.max_distance } else { 60.0 })
-            });
-            let color = match (sample.kind, sample.hit.is_some()) {
-                (DebugRayKind::DiffractionProbe, _) => [1.0, 0.6, 0.1, 0.22],
-                (DebugRayKind::ReflectionValidation, _) => [0.6, 0.6, 0.95, 0.2],
-                (_, true) => [1.0, 0.18, 0.12, 0.28],
-                (_, false) => [0.1, 0.65, 1.0, 0.22],
-            };
-            renderer.debug_line(ray.point_at(ray.min_distance), end, color);
-        }
-    }
-
-    if view.show_rejected {
-        for r in frame.rejected.iter().filter(|r| active.contains(&r.source_id)) {
-            let color = match r.reason {
-                RejectReason::Blocked => [1.0, 0.45, 0.1, 0.35],
-                RejectReason::OutsideSurface => [0.55, 0.55, 0.6, 0.25],
-                RejectReason::EdgeFade => [0.95, 0.9, 0.2, 0.3],
-                RejectReason::BelowEnergy => [0.3, 0.35, 0.9, 0.3],
-            };
-            // OutsideSurface candidates are partial (listener side bounces only).
-            let mut from = r.listener;
-            for &bounce in r.bounces.iter().rev() {
-                renderer.debug_line(from, bounce, color);
-                from = bounce;
-            }
-            if r.reason != RejectReason::OutsideSurface {
-                renderer.debug_line(from, r.source, color);
-            }
-        }
-    }
-
-    for &id in &active {
-        let energy = |p: &quasar_backends::debug_capture::DebugReflectionPath| p.reflection.gain.0.iter().map(|g| g * g).sum::<f32>();
-        let mut paths: Vec<_> = frame.paths.iter().filter(|p| p.source_id == id).collect();
-        paths.sort_by(|a, b| energy(b).total_cmp(&energy(a)));
-        let strongest = paths.first().map(|p| energy(p)).unwrap_or(0.0).max(1.0e-20);
-        // Weakest first so the strongest paths are drawn on top.
-        for (rank, path) in paths.iter().enumerate().rev() {
-            let emphasised = rank < OVERLAY_STRONGEST_PATHS;
-            let t = (1.0 + 10.0 * (energy(path) / strongest).max(1.0e-20).log10() / 40.0).clamp(0.2, 1.0);
-            let base = match path.reflection.order {
-                1 => [0.2, 1.0, 0.4],
-                2 => [0.2, 0.8, 1.0],
-                _ => [0.85, 0.45, 1.0],
-            };
-            let color = [base[0] * t, base[1] * t, base[2] * t, if emphasised { 0.5 + 0.5 * t } else { 0.12 + 0.18 * t }];
-            let mut from = path.source;
-            for &bounce in &path.bounces {
-                renderer.debug_line(from, bounce, color);
-                from = bounce;
-            }
-            renderer.debug_line(from, path.listener, color);
-            if !emphasised {
-                continue;
-            }
-            for (&point, &normal) in path.bounces.iter().zip(&path.normals) {
-                let p = glam::Vec3::from_array(point);
-                let mark = [1.0, 0.85, 0.05, 0.4 + 0.6 * t];
-                for axis in [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z] {
-                    renderer.debug_line((p - axis * 0.07).to_array(), (p + axis * 0.07).to_array(), mark);
-                }
-                renderer.debug_line(point, (p + glam::Vec3::from_array(normal) * 0.35).to_array(), mark);
-            }
-        }
-    }
-
-    // Direct segments last: green clear, yellow partially occluded, red blocked.
-    for d in frame.directs.iter().filter(|d| active.contains(&d.source_id)) {
-        let color = if !d.occluded {
-            [0.2, 1.0, 0.3, 1.0]
-        } else if d.occlusion_factor > 0.3 {
-            [1.0, 0.85, 0.1, 1.0]
-        } else {
-            [1.0, 0.15, 0.1, 1.0]
-        };
-        renderer.debug_line(d.source, d.listener, color);
-    }
+    motion_frame: u32,
 }
 
 impl App {
@@ -1046,7 +153,7 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Helio & Quasar; Indoor Cathedral w/ Spatial Audio")
+                        .with_title("Helio – Indoor Cathedral (HLFS)")
                         .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32)),
                 )
                 .expect("window"),
@@ -1065,6 +172,7 @@ impl ApplicationHandler for App {
             apply_limit_buckets: false,
         }))
         .expect("adapter");
+        eprintln!("Interactive cathedral adapter: {:?}", adapter.get_info());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("Device"),
             required_features: required_wgpu_features(adapter.features()),
@@ -1103,482 +211,73 @@ impl ApplicationHandler for App {
         );
 
         let config = RendererConfig::new(size.width, size.height, format)
-            .with_shadow_quality(helio::ShadowQuality::Ultra);
-        let mut scene = Scene::new(device.clone(), queue.clone());
-
-        // Sky MUST be added to scene BEFORE build_default_graph / Renderer::new,
-        // otherwise the first render() call triggers rebuild_graph_if_sky_changed()
-        // which calls the GraphRebuilder and destroys any pass replacements made
-        // after construction (see Helio issue #192).
-        scene.insert_actor(helio::SceneActor::Sky(
-            helio::SkyActor::indoor([0.05, 0.05, 0.1]).with_clouds(helio::VolumetricClouds {
-                coverage: 0.7,
-                density: 0.8,
-                base: 1200.0,
-                top: 1800.0,
-                wind_x: 0.8,
-                wind_z: 0.2,
-                speed: 1.3,
-                skylight_intensity: 0.25,
-            }),
-        ));
-        let debug_camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Debug Camera Buffer"),
-            size: std::mem::size_of::<helio::DebugCameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let cull_stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cull Stats Buffer"),
-            size: 32,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let debug_state = Arc::new(std::sync::Mutex::new(DebugDrawState::default()));
-        let graph = build_default_graph(
-            &device,
-            &queue,
-            &scene,
-            config,
-            debug_state.clone(),
-            &debug_camera_buf,
-            &cull_stats_buf,
-            None,
-        );
-        let mut renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
-            config.surface_format,
-            config.width,
-            config.height,
-            config.render_scale,
-            config,
-            scene,
-            graph,
-            debug_state,
-            debug_camera_buf.clone(),
-            cull_stats_buf,
-        );
-        renderer.set_editor_mode(true);
-
-        let mat = renderer.scene_mut().insert_material(make_material(
-            [0.75, 0.72, 0.68, 1.0],
-            0.85,
-            0.0,
-            [0.0, 0.0, 0.0],
-            0.0,
-        ));
-
-        // Sky was added to the Scene directly before Renderer creation above.
-        // This avoids Helio issue #192: graph rebuild on sky-change that would
-        // destroy any custom pass replacements made after construction.
-
-        // Nave + aisles: total width = 22m (x: -11..+11), length = 60m (z: -28..+28), height = 21m
-        // Expand floor to cover full cathedral footprint. 32m radius = 64m square.
-        let _floor = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(plane_mesh([0.0, 0.0, 0.0], 32.0)))
-            .as_mesh()
-            .unwrap();
-        let _wall_back = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [11.0, 10.5, 0.25],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _wall_front = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [11.0, 10.5, 0.25],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _aisle_ceil_l = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [2.5, 0.15, 28.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _nave_ceiling = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [6.0, 0.18, 28.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _aisle_ceil_r = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [2.5, 0.15, 28.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _wall_left_outer = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [0.25, 7.0, 28.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _wall_right_outer = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [0.25, 7.0, 28.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _ =
-            v3_demo_common::insert_object(&mut renderer, _floor, mat, glam::Mat4::IDENTITY, 11.0);
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _nave_ceiling,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 21.0, 0.0)),
-            28.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _aisle_ceil_l,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(-8.5, 11.0, 0.0)),
-            28.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _aisle_ceil_r,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(8.5, 11.0, 0.0)),
-            28.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _wall_left_outer,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(-11.0, 7.0, 0.0)),
-            28.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _wall_right_outer,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(11.0, 7.0, 0.0)),
-            28.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _wall_front,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 10.5, 28.0)),
-            11.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _wall_back,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 10.5, -28.0)),
-            11.0,
-        );
-
-        // Columns: 0.65 m square, 20 m tall, at x = ±5.5
-        let _columns: Vec<MeshId> = COLUMN_Z
-            .iter()
-            .flat_map(|&z| {
-                let l = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [0.65, 10.0, 0.65],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    l,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(-5.5, 10.0, z)),
-                    10.0,
-                );
-                let r = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [0.65, 10.0, 0.65],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    r,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(5.5, 10.0, z)),
-                    10.0,
-                );
-                [l, r]
-            })
-            .collect();
-
-        // Altar: at far end (z = -26)
-        let _altar_step = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [5.5, 0.20, 3.0],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _altar_plinth = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [3.0, 0.45, 1.5],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _cross_vert = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [0.18, 2.2, 0.18],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _cross_horiz = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(box_mesh(
-                [0.0, 0.0, 0.0],
-                [1.0, 0.18, 0.18],
-            )))
-            .as_mesh()
-            .unwrap();
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _altar_step,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.2, -24.5)),
-            5.5,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _altar_plinth,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.65, -25.5)),
-            3.0,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _cross_vert,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 3.2, -25.8)),
-            2.2,
-        );
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            _cross_horiz,
-            mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 4.5, -25.8)),
-            1.0,
-        );
-
-        // Pews: long narrow rect3d per row, 6 rows each side
-        let _pews_left: Vec<MeshId> = (0..PEW_COUNT)
-            .map(|i| {
-                let z = PEW_Z_START + i as f32 * PEW_Z_STEP;
-                let id = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [1.5, 0.45, 0.5],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(-3.2, 0.45, z)),
-                    1.5,
-                );
-                id
-            })
-            .collect();
-        let _pews_right: Vec<MeshId> = (0..PEW_COUNT)
-            .map(|i| {
-                let z = PEW_Z_START + i as f32 * PEW_Z_STEP;
-                let id = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [1.5, 0.45, 0.5],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(3.2, 0.45, z)),
-                    1.5,
-                );
-                id
-            })
-            .collect();
-
-        // Chandeliers: vertical chain + horizontal ring at each Z
-        let chandelier_mat = renderer.scene_mut().insert_material(make_material(
-            [0.3, 0.28, 0.25, 1.0],
-            0.5,
-            0.8,
-            [0.0, 0.0, 0.0],
-            0.0,
-        ));
-        let _chandelier_chains: Vec<MeshId> = CHANDELIER_Z
-            .iter()
-            .map(|&z| {
-                let id = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [0.06, 2.0, 0.06],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    chandelier_mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(0.0, 17.5, z)),
-                    2.0,
-                );
-                id
-            })
-            .collect();
-        let _chandelier_rings: Vec<MeshId> = CHANDELIER_Z
-            .iter()
-            .map(|&z| {
-                let id = renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::mesh(box_mesh(
-                        [0.0, 0.0, 0.0],
-                        [1.2, 0.12, 1.2],
-                    )))
-                    .as_mesh()
-                    .unwrap();
-                let _ = v3_demo_common::insert_object(
-                    &mut renderer,
-                    id,
-                    chandelier_mat,
-                    glam::Mat4::from_translation(glam::Vec3::new(0.0, 15.2, z)),
-                    1.2,
-                );
-                id
-            })
-            .collect();
-
-        // Listener position marker — a Helio cube mesh that all speakers point toward
-        let listener_mat = renderer.scene_mut().insert_material(make_material(
-            [0.0, 1.0, 0.3, 1.0],
-            0.2,
-            0.0,
-            [0.0, 1.0, 0.3],
-            1.5,
-        ));
-        let listener_mesh = renderer
-            .scene_mut()
-            .insert_actor(helio::SceneActor::mesh(cube_mesh([0.0, 0.0, 0.0], 0.4)))
-            .as_mesh()
-            .unwrap();
-        let _ = v3_demo_common::insert_object(
-            &mut renderer,
-            listener_mesh,
-            listener_mat,
-            glam::Mat4::from_translation(glam::Vec3::new(0.0, 1.6, 0.0)),
-            0.4,
-        );
-
-        // Register lights (chandelier & candle light_ids stored for per-frame flicker updates)
-        let mut chandelier_light_ids = Vec::new();
-        for &z in CHANDELIER_Z {
-            chandelier_light_ids.push(
-                renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::light(point_light(
-                        [0.0_f32, 15.0, z],
-                        [1.0, 0.92, 0.78],
-                        8.0,
-                        22.0,
-                    )))
-                    .as_light()
-                    .unwrap(),
-            );
+            .with_tsr_quality(helio_pass_tsr::TsrQuality::Native)
+            .with_shadow_quality(helio::ShadowQuality::High)
+            .with_ssr(true)
+            .with_environment_reflections(true);
+        let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
+        let large = true;
+        let (chandelier_light_ids, candle_light_ids) = populate_large_cathedral(&mut scene_db.world);
+        let ray_traced = std::env::var_os("HLFS_RT").is_some();
+        eprintln!("Interactive cathedral: large={large} ray_traced={ray_traced} presampled={}",
+            std::env::var_os("HLFS_PRESAMPLED").is_some());
+        if ray_traced {
+            // The renderer captures SceneDB's initial light flags at build.
+            // Match the offscreen path by setting RT flags before building it.
+            hlfs_capture::enable_ray_shadows(&mut scene_db.world);
         }
-        // Stained glass shafts — Stationary: they never animate, so they're excluded
-        // from the real-time deferred-light loop once baked lighting is loaded.
-        // Without this they were running full tiled PCF every frame despite being "baked".
-        for &(x, y, z, r, g, b) in GLASS_LIGHTS {
-            let _ = renderer
-                .scene_mut()
-                .insert_actor(helio::SceneActor::light_with_movability(
-                    point_light([x, y, z], [r, g, b], 1.8, 8.0),
-                    Some(Movability::Stationary),
-                ));
-        }
-        let mut candle_light_ids = Vec::new();
-        for &(x, y, z) in CANDLES {
-            candle_light_ids.push(
-                renderer
-                    .scene_mut()
-                    .insert_actor(helio::SceneActor::light(point_light(
-                        [x, y, z],
-                        [1.0, 0.6, 0.15],
-                        1.2,
-                        4.0,
-                    )))
-                    .as_light()
-                    .unwrap(),
-            );
-        }
-        renderer.set_ambient([0.65, 0.7, 0.85], 0.015);
+
+        let mut scene_handle = scene_db_handle(&scene_db);
+        let stone_store = architectural_materials::load(&device, &queue, &mut scene_db.world);
+        let has_stone = stone_store.is_some();
+        if let Some(store) = stone_store { scene_handle = scene_handle.with_texture_store(store).unwrap(); }
+        let mut renderer = RendererBuilder::new(config, scene_handle)
+            .with_external_device()
+            .with_editor_mode(false)
+            .with_pass_build_context(Box::new(build_hlfs_graph_with_context))
+            .build(device.clone(), queue.clone(), size.width, size.height, format);
+        if has_stone { architectural_materials::configure_sampler(&mut renderer); }
+        let mut acceleration = if ray_traced {
+            let config = if std::env::var_os("HLFS_PRESAMPLED").is_some() {
+                helio_pass_hlfs::HlfsConfig::ray_traced_presampled()
+            } else {
+                helio_pass_hlfs::HlfsConfig { mode: helio_pass_hlfs::HlfsMode::RayTraced, ..Default::default() }
+            };
+            renderer.set_graph_rebuild_hook(move |graph, device| {
+                graph.find_pass_mut::<helio_pass_hlfs::HlfsPass>().expect("HLFS pass")
+                    .set_config(device, config);
+            });
+            eprintln!("Interactive HLFS configuration: {:?}",
+                renderer.find_pass_mut::<helio_pass_hlfs::HlfsPass>().unwrap().config());
+            Some(helio_pass_hlfs::SceneDbRayTracing::new(device.clone(), queue.clone()))
+        } else { None };
+        renderer.set_ambient([0.10, 0.09, 0.085], 1.0);
         renderer.set_clear_color([0.0, 0.0, 0.0, 1.0]);
 
-        // Bake static/stationary lights so they're excluded from the real-time
-        // deferred-light loop. Without this, all 9 glass window lights + environment
-        // run full tiled PCF every frame even though they're fixed.
-        renderer.auto_bake(BakeConfig::fast("indoor_cathedral"));
-
-        // Replace default billboard sprite (spotlight.png) with speaker icon.
-        // Also re-applied every frame (see render()) to survive graph rebuilds
-        // triggered by resize or sky-change (Helio issue #192).
-        apply_billboard_replacement(&mut renderer, &device, &queue);
-
-        let audio_engine = setup_audio_engine();
-
-        // Draw initial probe grid
-        {
-            for x in -2..=2 {
-                for z in -2..=2 {
-                    let hue = (((x + 2) * 5 + (z + 2)) as f32 / 25.0) * 0.7;
-                    renderer.debug_sphere(
-                        [x as f32 * 2.0, 0.3, z as f32 * 2.0],
-                        0.08,
-                        hsl_to_rgba(hue, 0.8, 0.6, 1.0),
-                        8,
-                    );
-                }
-            }
+        let warmup_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Cathedral startup warmup"),
+            size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let warmup_view = warmup_texture.create_view(&Default::default());
+        let aspect = size.width as f32 / size.height.max(1) as f32;
+        let warmup_camera = if large { large_cathedral_camera(0.0, aspect) } else {
+            let pos = glam::Vec3::new(0.0, 2.0, 24.0);
+            Camera::perspective_look_at(pos,
+                pos + glam::Vec3::new(0.0, 0.065_f32.sin(), -0.065_f32.cos()),
+                glam::Vec3::Y, std::f32::consts::FRAC_PI_4, aspect, 0.1, 200.0)
+        };
+        if let Some(acceleration) = acceleration.as_mut() {
+            v3_demo_common::flush_scene_db(&scene_db, &queue);
+            acceleration.prepare(&scene_db.world).expect("cathedral RT geometry");
         }
+        hlfs_capture::warm_up_cathedral(&scene_db, &mut renderer, acceleration.as_ref(),
+            &device, &queue, &warmup_camera, &warmup_view);
 
         let renderer = Arc::new(Mutex::new(renderer));
         let (bridge, action_rx) = HelioCommandBridge::new();
@@ -1610,30 +309,15 @@ impl ApplicationHandler for App {
             renderer,
             action_rx,
             last_frame: std::time::Instant::now(),
-            // Start at the interval so the first frame computes immediately.
-            spatial_accum: SPATIAL_UPDATE_INTERVAL,
-            _floor,
-            _nave_ceiling,
-            _aisle_ceil_l,
-            _aisle_ceil_r,
-            _wall_left_outer,
-            _wall_right_outer,
-            _wall_front,
-            _wall_back,
-            _columns,
-            _altar_plinth,
-            _altar_step,
-            _cross_vert,
-            _cross_horiz,
-            _pews_left,
-            _pews_right,
-            _chandelier_chains,
-            _chandelier_rings,
+            scene_db,
+            acceleration,
             // Start at entrance, looking toward the altar
-            cam_pos: glam::Vec3::new(0.0, 2.0, 24.0),
-            cam_yaw: std::f32::consts::PI,
-            cam_pitch: -0.05,
+            cam_pos: if large { glam::Vec3::new(0.0, 2.3, 67.0) }
+                else { glam::Vec3::new(0.0, 2.0, 24.0) },
+            cam_yaw: 0.0,
+            cam_pitch: 0.065,
             keys: HashSet::new(),
+            alt_pressed: false,
             cursor_grabbed: false,
             mouse_delta: (0.0, 0.0),
             debug_mode: 0,
@@ -1641,14 +325,9 @@ impl ApplicationHandler for App {
             debug_overlay_enabled: false,
             chandelier_light_ids,
             candle_light_ids,
+            large,
             start_time: std::time::Instant::now(),
-            _audio_engine: audio_engine,
-            show_rays: false,
-            acoustic_snapshot: None,
-            acoustic_view: AcousticView::default(),
-            show_probes: true,
-            show_material_zones: true,
-            aux_swapped: false,
+            motion_frame: 0,
         });
     }
 
@@ -1656,6 +335,19 @@ impl ApplicationHandler for App {
         let Some(state) = &mut self.state else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                // Some platforms swallow key-up while a system menu or another
+                // window owns focus. Never keep flying on a stale movement key.
+                state.keys.clear();
+                state.alt_pressed = false;
+                state.mouse_delta = (0.0, 0.0);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.alt_pressed = modifiers.state().alt_key();
+                if state.alt_pressed {
+                    state.keys.clear();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1671,152 +363,6 @@ impl ApplicationHandler for App {
                     state.window.set_cursor_visible(true);
                 } else {
                     event_loop.exit();
-                }
-            }
-
-            // V pauses/resumes trace capture. Keep the last captured drawing visible.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        physical_key: PhysicalKey::Code(KeyCode::KeyV | KeyCode::KeyR),
-                        ..
-                    },
-                ..
-            } => {
-                state.show_rays = !state.show_rays;
-                state
-                    ._audio_engine
-                    .debug_capture
-                    .set_enabled(state.show_rays);
-                state.spatial_accum = SPATIAL_UPDATE_INTERVAL;
-                let status = if state.show_rays {
-                    "capturing"
-                } else {
-                    "paused; showing last trace"
-                };
-                state.window.set_title(&format!(
-                    "Quasar acoustic rays: {status} | V to pause/resume"
-                ));
-                println!("[quasar] acoustic capture: {status}. The last nonempty trace stays visible. Direct segment: green clear, yellow partial, red blocked; reflection paths: green/cyan/violet by order, brighter = stronger. C cycles emitter, B all emitters, N rejected candidates, M probe rays.");
-            }
-            // C cycles the traced emitter (auto = nearest), B shows all emitters,
-            // N toggles rejected reflection candidates, M toggles the solver's probe rays.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        physical_key:
-                            PhysicalKey::Code(
-                                key @ (KeyCode::KeyC | KeyCode::KeyB | KeyCode::KeyN | KeyCode::KeyM),
-                            ),
-                        ..
-                    },
-                ..
-            } => {
-                let view = &mut state.acoustic_view;
-                match key {
-                    KeyCode::KeyC => view.cycle_emitter(state.acoustic_snapshot.as_ref()),
-                    KeyCode::KeyB => view.all_emitters = !view.all_emitters,
-                    KeyCode::KeyN => view.show_rejected = !view.show_rejected,
-                    _ => view.show_probes = !view.show_probes,
-                }
-                state._audio_engine.debug_capture.set_detail(view.detail());
-                // Re-capture right away so newly enabled detail has data.
-                state.spatial_accum = SPATIAL_UPDATE_INTERVAL;
-                if let Some(frame) = &state.acoustic_snapshot {
-                    let status = if state.show_rays { "capturing" } else { "paused" };
-                    state.window.set_title(&acoustic_title(frame, &state.acoustic_view, status));
-                }
-            }
-            // T: toggle Quasar probe grid
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::KeyT),
-                        ..
-                    },
-                ..
-            } => {
-                state.show_probes = !state.show_probes;
-            }
-            // Y: toggle Quasar material zones
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::KeyY),
-                        ..
-                    },
-                ..
-            } => {
-                state.show_material_zones = !state.show_material_zones;
-            }
-
-            // 1: cycle audio DSP stage (0=silence, 1=raw, 2=+occ, 3=+early, 4=full)
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::Digit1),
-                        ..
-                    },
-                ..
-            } => {
-                if let Ok(mut engine) = state._audio_engine.engine.lock() {
-                    let stage = (engine.debug_audio_stage + 1) % 5;
-                    engine.set_debug_audio_stage(stage);
-                    println!(
-                        "[audio] dsp stage {}: {}",
-                        stage,
-                        match stage {
-                            0 => "silence",
-                            1 => "raw pull only (reduce master vol with [!)",
-                            2 => "+ occlusion",
-                            3 => "+ early reflections",
-                            _ => "full pipeline",
-                        }
-                    );
-                }
-            }
-
-            // 2: print audio timing snapshot
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::Digit2),
-                        ..
-                    },
-                ..
-            } => {
-                if let Ok(engine) = state._audio_engine.engine.lock() {
-                    let t = engine.timing_snapshot();
-                    let ns_per_us = 1000.0;
-                    println!("[timing] calls={}  max={:.1}μs  avg={:.1}μs  block={:.0}μs  headroom={:.1}μs",
-                        t.call_count,
-                        t.max_ns as f64 / ns_per_us,
-                        t.avg_ns as f64 / ns_per_us,
-                        t.block_us,
-                        t.headroom_us);
-                }
-            }
-            // 3: reset audio timing counters
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::Digit3),
-                        ..
-                    },
-                ..
-            } => {
-                if let Ok(engine) = state._audio_engine.engine.lock() {
-                    engine.timing.reset();
-                    println!("[timing] counters reset");
                 }
             }
 
@@ -1841,6 +387,7 @@ impl ApplicationHandler for App {
                 println!("[debug] shadow debug mode = {}", state.debug_mode);
             }
 
+            // F2: cycle perf overlay modes
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1867,7 +414,7 @@ impl ApplicationHandler for App {
                 println!("[debug] perf overlay mode = {:?}", state.perf_overlay_mode);
             }
 
-            // F3: toggle debug overlay (FPS, timings, texture stats)
+            // F3: toggle debug overlay
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1885,106 +432,7 @@ impl ApplicationHandler for App {
                         pass.set_enabled(state.debug_overlay_enabled);
                     }
                 }
-                println!("[debug] debug overlay = {}", state.debug_overlay_enabled);
-            }
-
-            // G: live patch-bay remap — swap Aux Left/Right channel pulls.
-            // Remapping a speaker is a single runtime connect_pull call.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::KeyG),
-                        ..
-                    },
-                ..
-            } => {
-                if let Ok(mut engine) = state._audio_engine.engine.lock() {
-                    let src = state._audio_engine.source_id;
-                    engine.disconnect_pull(state._audio_engine.outputs[6], src, 6);
-                    engine.connect_pull(
-                        state._audio_engine.outputs[6],
-                        ChannelPull::new(src, 7, 0.0),
-                    );
-                    engine.disconnect_pull(state._audio_engine.outputs[7], src, 7);
-                    engine.connect_pull(
-                        state._audio_engine.outputs[7],
-                        ChannelPull::new(src, 6, 0.0),
-                    );
-                }
-                state.aux_swapped = !state.aux_swapped;
-                println!("[audio] aux channels swapped = {}", state.aux_swapped);
-            }
-
-            // [ / ]: master volume down / up (3 dB steps).
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::BracketLeft),
-                        ..
-                    },
-                ..
-            } => {
-                let g = state
-                    ._audio_engine
-                    .master_gain_db
-                    .load(AtomicOrdering::Relaxed);
-                let db = (f32::from_bits(g) - 3.0).max(-60.0);
-                state
-                    ._audio_engine
-                    .master_gain_db
-                    .store(db.to_bits(), AtomicOrdering::Relaxed);
-                state._audio_engine.set_master_gain_db(db);
-                println!("[audio] master gain = {} dB", db);
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::BracketRight),
-                        ..
-                    },
-                ..
-            } => {
-                let g = state
-                    ._audio_engine
-                    .master_gain_db
-                    .load(AtomicOrdering::Relaxed);
-                let db = (f32::from_bits(g) + 3.0).min(24.0);
-                state
-                    ._audio_engine
-                    .master_gain_db
-                    .store(db.to_bits(), AtomicOrdering::Relaxed);
-                state._audio_engine.set_master_gain_db(db);
-                println!("[audio] master gain = {} dB", db);
-            }
-
-            // - / =: reverb trim down / up, ; / ': early-reflection trim down / up (2 dB steps).
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key:
-                            PhysicalKey::Code(
-                                key @ (KeyCode::Minus
-                                | KeyCode::Equal
-                                | KeyCode::Semicolon
-                                | KeyCode::Quote),
-                            ),
-                        ..
-                    },
-                ..
-            } => {
-                let (early, delta) = match key {
-                    KeyCode::Minus => (false, -2.0),
-                    KeyCode::Equal => (false, 2.0),
-                    KeyCode::Semicolon => (true, -2.0),
-                    _ => (true, 2.0),
-                };
-                if let Some(db) = state._audio_engine.adjust_mix_trim_db(early, delta) {
-                    println!("[audio] {} trim = {db} dB", if early { "early reflection" } else { "reverb" });
-                }
+                println!("[debug] debug overlay = {:?}", state.debug_overlay_enabled);
             }
 
             WindowEvent::KeyboardInput {
@@ -1997,7 +445,9 @@ impl ApplicationHandler for App {
                 ..
             } => match ks {
                 ElementState::Pressed => {
-                    state.keys.insert(key);
+                    if !state.alt_pressed {
+                        state.keys.insert(key);
+                    }
                 }
                 ElementState::Released => {
                     state.keys.remove(&key);
@@ -2104,7 +554,7 @@ impl AppState {
         let aspect = size.width as f32 / size.height.max(1) as f32;
         let time = self.start_time.elapsed().as_secs_f32();
 
-        let camera = Camera::perspective_look_at(
+        let mut camera = Camera::perspective_look_at(
             self.cam_pos,
             self.cam_pos + forward,
             glam::Vec3::Y,
@@ -2113,6 +563,14 @@ impl AppState {
             0.1,
             200.0,
         );
+        if self.large && std::env::var_os("HLFS_LIVE_MOTION_TEST").is_some() {
+            // Travel the same path as --capture-large, then reverse smoothly.
+            // This exercises the real swapchain and resize path while moving.
+            let phase = (self.motion_frame % 600) as f32 / 300.0;
+            let t = if phase <= 1.0 { phase } else { 2.0 - phase };
+            camera = large_cathedral_camera(t, aspect);
+            self.motion_frame = self.motion_frame.wrapping_add(1);
+        }
 
         // Apply commands from REPL / quark to renderer
         let mut renderer = self.renderer.lock().unwrap();
@@ -2124,169 +582,8 @@ impl AppState {
             }
         }
 
-        // Re-apply billboard sprite replacement every frame to survive graph
-        // rebuilds triggered by resize or sky-change (Helio issue #192).
-        apply_billboard_replacement(&mut renderer, &*self.device, &*self.queue);
-
-        // Chandeliers flicker slightly
-        let flicker = 1.0 + (time * 9.1).sin() * 0.03 + (time * 5.7).cos() * 0.02;
-        // Candle flicker — more pronounced
-        let cflicker = 1.0 + (time * 14.3).sin() * 0.07 + (time * 8.9).cos() * 0.05;
-
-        // Update flickering chandelier intensities
-        for (i, &id) in self.chandelier_light_ids.iter().enumerate() {
-            let z = CHANDELIER_Z[i];
-            let _ = renderer.scene_mut().update_light(
-                id,
-                point_light([0.0_f32, 15.0, z], [1.0, 0.92, 0.78], 8.0 * flicker, 22.0),
-            );
-        }
-        // Update flickering candle intensities
-        for (i, &id) in self.candle_light_ids.iter().enumerate() {
-            let (x, y, z) = CANDLES[i];
-            let _ = renderer.scene_mut().update_light(
-                id,
-                point_light([x, y, z], [1.0, 0.6, 0.15], 1.2 * cflicker, 4.0),
-            );
-        }
-
-        // ── Quasar spatial audio debug overlay ─────────────────────────
-        let listener_pos = self.cam_pos;
-        // Stage speaker layout (all point toward the listener cube at (0, 1.6, 0)):
-        // Index = scene output = device channel (SPEAKER_POSITIONS), mapped to WAV
-        // channels through CHANNEL_MAP:
-        //  0: Front Left           — WAV ch 0 / scene output 0
-        //  1: Front Right          — WAV ch 1 / scene output 1
-        //  2: Center               — WAV ch 2 / scene output 2
-        //  3: Sub / LFE            — WAV ch 5 / scene output 3
-        //  4: Back Left            — WAV ch 3 / scene output 4
-        //  5: Back Right           — WAV ch 4 / scene output 5
-        //  6: Side Left            — WAV ch 6 / scene output 6
-        //  7: Side Right           — WAV ch 7 / scene output 7
-
-        // Update the scene pipeline: move the listener with the camera, then
-        // resolve every (scene output, listener) pair (compute thread side).
-        if let Ok(mut engine) = self._audio_engine.engine.lock() {
-            engine.update_listener(
-                self._audio_engine.listener_id,
-                self.cam_pos.to_array(),
-                forward.to_array(),
-            );
-            // Throttle the (crossfade-restarting) spatial compute to ~30 Hz;
-            // running it every render frame keeps the fade perpetually at t≈0.
-            self.spatial_accum += dt;
-            if self.spatial_accum >= SPATIAL_UPDATE_INTERVAL {
-                self.spatial_accum = 0.0;
-                if self.show_rays {
-                    self._audio_engine.debug_capture.begin_update();
-                }
-                engine.update_scene_spatial();
-                if self.show_rays {
-                    let frame = self._audio_engine.debug_capture.take_frame();
-                    // Unchanged scenes or a skipped engine query may yield an empty
-                    // batch. Keep the last useful drawing rather than erasing it.
-                    if !frame.directs.is_empty() {
-                        self.window.set_title(&acoustic_title(&frame, &self.acoustic_view, "capturing"));
-                        self.acoustic_snapshot = Some(frame);
-                    }
-                }
-            }
-        }
-        renderer.debug_clear();
-        for (i, &pos) in SPEAKER_POSITIONS.iter().enumerate() {
-            let hue = i as f32 / SPEAKER_POSITIONS.len() as f32;
-            let color = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
-            renderer.debug_sphere(pos.into(), 0.25, color, 16);
-            let dir = (glam::Vec3::new(0.0, 1.6, 0.0) - pos).normalize();
-            renderer.debug_cone(
-                (pos + dir * 0.3).into(),
-                dir.into(),
-                1.5,
-                0.8,
-                [color[0], color[1], color[2], 0.3],
-                12,
-            );
-            renderer.debug_circle(pos.into(), 2.0, [color[0], color[1], color[2], 0.12], 24);
-        }
-        renderer.debug_sphere(listener_pos.into(), 0.2, [0.0, 1.0, 0.3, 1.0], 12);
-        renderer.debug_cone(
-            (listener_pos + forward * 0.2).into(),
-            forward.into(),
-            0.4,
-            0.15,
-            [0.0, 0.8, 0.0, 0.4],
-            8,
-        );
-
-        // Billboard speaker icons at each speaker position, flash on audio activity
-        let src_levels: [f32; NUM_SPEAKERS] = std::array::from_fn(|i| {
-            f32::from_bits(self._audio_engine.levels[i].load(AtomicOrdering::Relaxed))
-        });
-        let billboards: Vec<helio::BillboardInstance> = SPEAKER_POSITIONS
-            .iter()
-            .enumerate()
-            .map(|(i, &pos)| {
-                let lvl = src_levels[i];
-                let active = lvl > 0.005;
-                let scale = if active {
-                    (0.5 + lvl * 4.0).min(1.5)
-                } else {
-                    0.5
-                };
-                let mut c = hsl_to_rgba(i as f32 / SPEAKER_POSITIONS.len() as f32, 0.9, 0.6, 1.0);
-                if active {
-                    let boost = (lvl * 6.0).min(1.0);
-                    c[0] = c[0] * (1.0 - boost) + boost;
-                    c[1] = c[1] * (1.0 - boost) + boost;
-                    c[2] = c[2] * (1.0 - boost) + boost;
-                }
-                helio::BillboardInstance {
-                    world_pos: [pos.x, pos.y + 1.2, pos.z, 1.0],
-                    scale_flags: [scale, scale, 0.0, 0.0],
-                    color: c,
-                }
-            })
-            .collect();
-        renderer.set_billboard_instances(&billboards);
-
-        if self.show_probes {
-            for x in -2..=2 {
-                for z in -2..=2 {
-                    let p = glam::Vec3::new(x as f32 * 3.0, 0.5, z as f32 * 3.0);
-                    renderer.debug_sphere(p.into(), 0.08, [0.3, 0.6, 1.0, 0.7], 6);
-                    if x < 2 {
-                        renderer.debug_line(
-                            p.into(),
-                            glam::Vec3::new((x + 1) as f32 * 3.0, 0.5, z as f32 * 3.0).into(),
-                            [0.3, 0.6, 1.0, 0.15],
-                        );
-                    }
-                    if z < 2 {
-                        renderer.debug_line(
-                            p.into(),
-                            glam::Vec3::new(x as f32 * 3.0, 0.5, (z + 1) as f32 * 3.0).into(),
-                            [0.3, 0.6, 1.0, 0.15],
-                        );
-                    }
-                }
-            }
-        }
-        if self.show_material_zones {
-            for x in -4..=4 {
-                for z in -4..=4 {
-                    let center = glam::Vec3::new(x as f32 * 2.0, 0.01, z as f32 * 2.0);
-                    let color = if (x + z) % 2 == 0 {
-                        [0.8, 0.2, 0.2, 0.3]
-                    } else {
-                        [0.3, 0.3, 0.8, 0.15]
-                    };
-                    renderer.debug_filled_box(center.into(), 0.96, color);
-                }
-            }
-        }
-        if let Some(snapshot) = &self.acoustic_snapshot {
-            draw_acoustic_snapshot(&mut renderer, snapshot, &self.acoustic_view);
-        }
+        flicker_lights(&mut self.scene_db.world, &self.chandelier_light_ids, &self.candle_light_ids,
+            self.large, time, self.acceleration.is_some());
 
         // Scene state is persistent — no per-frame setup needed.
 
@@ -2297,9 +594,171 @@ impl AppState {
         };
         let view = output.texture.create_view(&Default::default());
 
+        v3_demo_common::flush_scene_db(&self.scene_db, &self.queue);
+        if let Some(acceleration) = &self.acceleration {
+            renderer.set_ray_tracing_frame_with_transmission(acceleration.tlas(), acceleration.transmission());
+        }
         if let Err(e) = renderer.render(&camera, &view) {
             log::error!("Render: {:?}", e);
         }
+        if self.acceleration.is_some() {
+            static CONFIG_LOGGED: std::sync::Once = std::sync::Once::new();
+            CONFIG_LOGGED.call_once(|| eprintln!("HLFS after first live render: {:?}",
+                renderer.find_pass_mut::<helio_pass_hlfs::HlfsPass>().unwrap().config()));
+        }
         self.queue.present(output);
+    }
+}
+
+/// entrance, so the view up the nave looks into the light where forward-
+/// scattering smoke is brightest. 46° elevation lands the lancet patterns on the nave floor in both
+/// sizes: the small nave's 5–11 m lancets and the large one's clerestory.
+const SUN_DIRECTION: [f32; 3] = [0.58, -0.72, 0.38];
+
+/// Lets an interior light glow in the incense. These lights have no shadow
+/// maps, so their scattering is unshadowed (decay 0): a soft halo, no shafts.
+fn haze_light(mut light: helio::GpuLight) -> helio::GpuLight {
+    if std::env::var_os("HLFS_NO_HAZE_LIGHTS").is_some() { return light; }
+    light.god_rays_enabled = 1;
+    light.god_rays_density = 1.0;
+    light.god_rays_weight = 1.0;
+    light.god_rays_exposure = 1.0;
+    light.god_rays_decay = 0.0;
+    light
+}
+
+/// Incense haze filling the interior: a local medium bounded by the walls,
+/// lit by the sun through the stained glass. Physical fog only scatters light
+/// that reaches it, so the shafts take the panes' colours and outlines.
+/// `HLFS_NO_FOG=1` removes it; `HLFS_FOG_DENSITY=<m⁻¹>` overrides extinction.
+fn configure_cathedral_fog(world: &mut World, large: bool) {
+    if std::env::var_os("HLFS_NO_FOG").is_some() { return; }
+    let (half_x, height, half_z, extinction, range) =
+        if large { (22.0, 46.0, 71.5, 0.018, 170.0) } else { (10.7, 21.0, 27.8, 0.03, 70.0) };
+    let extinction = std::env::var("HLFS_FOG_DENSITY").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(extinction);
+    v3_demo_common::spawn_local_fog(
+        world,
+        [-half_x, 0.0, -half_z],
+        [half_x, height, half_z],
+        v3_demo_common::GlobalFogComponent {
+            // Drifting smoke under a height envelope: incense, not a flat haze.
+            mode: std::env::var("HLFS_FOG_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+            extinction,
+            albedo: [0.92, 0.90, 0.86],
+            // Forward-peaked, as smoke is: shafts brighten looking toward the sun.
+            anisotropy: 0.6,
+            // Denser low down, thinning toward the vault.
+            height: 0.0,
+            height_falloff: if large { 0.03 } else { 0.06 },
+            ..Default::default()
+        },
+        1.0,
+    );
+    let settings = v3_demo_common::set_volumetric_quality(world, 1, range);
+    if let Some(blend) = std::env::var("HLFS_FOG_BLEND").ok().and_then(|v| v.parse().ok()) {
+        world.insert(settings, v3_demo_common::VolumetricFogSettingsComponent {
+            quality: 1, max_distance: range, light_max_distance: range, temporal_blend: blend,
+            ..Default::default()
+        });
+    }
+}
+
+fn large_cathedral_camera(t: f32, aspect: f32) -> Camera {
+    let mut camera = Camera::perspective_look_at(
+        glam::Vec3::new(4.0 * t, 2.3, 67.0 - 29.0 * t),
+        glam::Vec3::new(0.0, 10.0, -68.0), glam::Vec3::Y,
+        std::f32::consts::FRAC_PI_4, aspect, 0.1, 200.0,
+    );
+    camera
+}
+
+fn populate_large_cathedral(world: &mut World) -> (Vec<Entity>, Vec<Entity>) {
+    configure_cathedral_fog(world, true);
+    spawn_indoor_cathedral_sky(world);
+    cathedral_large::populate(world);
+    populate_cathedral_lights(world, true)
+}
+
+fn populate_cathedral_lights(world: &mut World, large: bool) -> (Vec<Entity>, Vec<Entity>) {
+    let chandelier_z = if large { LARGE_CHANDELIER_Z } else { CHANDELIER_Z };
+    let candles = if large { LARGE_CANDLES } else { CANDLES };
+
+    // Register lights (chandelier & candle light_ids stored for per-frame flicker updates)
+    let mut chandelier_light_ids = Vec::new();
+    for &z in chandelier_z {
+        chandelier_light_ids.push(spawn_light(
+            world,
+            haze_light(point_light([0.0_f32, if large { 31.0 } else { 15.0 }, z],
+                [1.0, 0.92, 0.78], 160.0, 22.0)),
+        ));
+    }
+    // A single exterior sun supplies a coherent daylight direction. It owns the
+    // first shadow slot and participates in the medium, so the glass colours
+    // both the floor pattern and the shafts (raster: the shadow transmittance
+    // layer; RT: thin-sheet transmission). Keep the older multi-window
+    // emitter setup as an explicit transmission stress case.
+    if std::env::var_os("HLFS_LEGACY_CATHEDRAL_LIGHTS").is_none() {
+        let intensity = std::env::var("HLFS_SUN").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(20.0);
+        spawn_light(world, v3_demo_common::volumetric_light(
+            v3_demo_common::directional_light(SUN_DIRECTION, [1.0, 0.94, 0.84], intensity),
+            v3_demo_common::SHADOW_BASES[0],
+        ));
+    } else {
+        // Stained glass shafts — static, no need to store ids
+        // RT uses white exterior sources: pane materials supply the transmitted tint.
+        for &(x, y, z, r, g, b) in GLASS_LIGHTS {
+            let (x, y, z) = if large { (x.signum() * 21.5, y * 1.8, z * 2.4) }
+                else { (x, y, z) };
+            let light = if std::env::var_os("HLFS_RT").is_some() {
+                let position = if x == 0.0 { [0.0, if large { 34.0 } else { 17.0 },
+                    if large { 78.0 } else { 34.0 }] }
+                    else { [x.signum() * if large { 29.0 } else { 16.0 },
+                        if large { 24.0 } else { 12.0 }, z] };
+                point_light(position, [1.0; 3], 2500.0, 65.0)
+            } else {
+                point_light([x, y, z], [r, g, b], 35.0, 10.0)
+            };
+            spawn_light(world, light);
+        }
+    }
+    let mut candle_light_ids = Vec::new();
+    for &(x, y, z) in candles {
+        candle_light_ids.push(spawn_light(
+            world,
+            haze_light(point_light([x, y, z], [1.0, 0.6, 0.15], 8.0, 4.0)),
+        ));
+    }
+
+    (chandelier_light_ids, candle_light_ids)
+}
+
+/// Chandeliers flicker slightly and candles more. Shared by the window and by
+/// `HLFS_CAPTURE_FLICKER=1` captures, so stability measurements see the same
+/// per-frame light updates the interactive demo makes.
+fn flicker_lights(
+    world: &mut World,
+    chandeliers: &[Entity],
+    candles: &[Entity],
+    large: bool,
+    time: f32,
+    ray_traced: bool,
+) {
+    let flicker = 1.0 + (time * 9.1).sin() * 0.03 + (time * 5.7).cos() * 0.02;
+    let cflicker = 1.0 + (time * 14.3).sin() * 0.07 + (time * 8.9).cos() * 0.05;
+    let with_shadows = |mut light: helio::GpuLight| {
+        light.set_ray_traced_shadows(ray_traced);
+        light
+    };
+    let chandelier_z = if large { LARGE_CHANDELIER_Z } else { CHANDELIER_Z };
+    let candle_positions = if large { LARGE_CANDLES } else { CANDLES };
+    for (&id, &z) in chandeliers.iter().zip(chandelier_z) {
+        update_light(world, id, with_shadows(haze_light(point_light(
+            [0.0_f32, if large { 31.0 } else { 15.0 }, z], [1.0, 0.92, 0.78], 160.0 * flicker, 22.0))));
+    }
+    for (&id, &(x, y, z)) in candles.iter().zip(candle_positions) {
+        update_light(world, id, with_shadows(haze_light(point_light(
+            [x, y, z], [1.0, 0.6, 0.15], 8.0 * cflicker, 4.0))));
     }
 }

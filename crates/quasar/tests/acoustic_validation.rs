@@ -411,9 +411,11 @@ fn first_order_reflection_delays_and_levels_match_the_image_sources() {
     }
     let t_direct = (d_dir * SR / C).round() as usize;
     let max_e = refl.iter().cloned().fold(0.0_f32, f32::max);
-    // Every analytic first-order arrival has energy within -3 .. +0.5 dB of (1 - alpha) / d^2 (air
-    // absorption takes HF, which carries most of a white impulse's energy: -0.4 .. -2 dB at 5..9 m;
-    // the backend's own tests pin the per-band gain to 0.2 % including air), times the
+    // Every analytic first-order arrival has energy within -3 .. +0.5 dB of (1 - alpha) / d^2. The
+    // backend's per-band gains are exact (its own tests pin them to 0.2 % including air
+    // absorption); what the engine adds is the 4-point Hermite fractional delay, which low-passes
+    // an IMPULSE by up to -1.9 dB of energy depending on the fractional part of the delay (weights
+    // -1/16, 9/16, 9/16, -1/16 at 0.5), and air absorption of the HF-heavy impulse. Times the
     // engine's handover weight: discrete taps fade out over 10 ms ending `early_late_split` after
     // the direct sound, where the diffuse field takes over (this room: split 20 ms).
     let split_end = t_direct as f32 + 0.020 * SR;
@@ -421,7 +423,7 @@ fn first_order_reflection_delays_and_levels_match_the_image_sources() {
     let mut accounted = vec![false; refl.len()];
     for &d in &images {
         let n = (d * SR / C).round() as usize;
-        let win: f32 = refl[n.saturating_sub(6)..n + 7].iter().sum(); let wide: f32 = refl[n.saturating_sub(60)..n + 60].iter().sum(); eprintln!("wide {wide:.5} narrow {win:.5}");
+        let win: f32 = refl[n.saturating_sub(6)..n + 7].iter().sum();
         let w = ((split_end - n as f32) / fade).clamp(0.0, 1.0);
         let want = 0.8 / (d * d) * w * w;
         if w < 0.01 {

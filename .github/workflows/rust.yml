@@ -8,15 +8,68 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  build:
-
+  # Blocking: the workspace must build and every test must pass, including the offline acoustic
+  # validation harness (docs/validation.md).
+  test:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Install Rust
+      run: rustup toolchain install stable --profile minimal
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Build (all targets)
+      run: cargo build --workspace --all-targets --verbose
+    - name: Test (debug: debug assertions on)
+      run: cargo test --workspace --no-fail-fast --verbose
+    # The harness measures the rendered audio (levels, RT60, localisation, loudness, allocations);
+    # run it again optimised, which is how it is meant to be read (and fast).
+    - name: Audio validation harness (release)
+      run: >
+        cargo test -p quasar-audio --release
+        --test acoustic_validation --test direct_vs_room_levels --test block_size_tests
+        --test mix_trim_tests --test no_alloc_tests --test lockfree_engine_tests
+        -- --nocapture
+    - name: Check the optional GPU backend feature
+      run: cargo check -p quasar-backends --features wgpu-compute
+
+  # The example is a separate workspace (its own Cargo.lock) with git dependencies (Helio, SceneDB)
+  # and system libraries (ALSA for cpal, X11 / Wayland for winit). It is built to catch API breaks,
+  # but it depends on third-party repositories and heavy graphics crates, so a failure here is
+  # reported without failing the run (continue-on-error). If the git dependencies cannot be
+  # resolved on a clean runner this job is simply red-but-non-blocking.
+  example:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      run: rustup toolchain install stable --profile minimal
+    - name: System libraries (cpal / winit)
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: examples/basic
+    - name: Check the example
+      working-directory: examples/basic
+      run: cargo check --verbose
+
+  # Non-blocking: lints are reported, not enforced (the tree has not been through clippy yet).
+  # `cargo fmt --check` is deliberately NOT run: the tree is not rustfmt-clean (about a thousand
+  # diffs), and reformatting the repository is a separate, deliberate change. Add the step
+  # (`cargo fmt --all -- --check`) once the tree has been formatted.
+  clippy:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      run: rustup toolchain install stable --profile minimal --component clippy
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets
