@@ -10,7 +10,8 @@ pub struct AcousticResponse8Band {
     pub absorption: Band8,
     /// Scattering coefficient [0.0 - 1.0] — 0.0 = purely specular, 1.0 = purely diffuse
     pub scattering: Band8,
-    /// Transmission gain (linear) — 0.0 = fully blocked, 1.0 = fully transmitted
+    /// Transmission gain (linear **amplitude**, not energy) — 0.0 = fully blocked, 1.0 = fully
+    /// transmitted. Applied once per surface crossed (no thickness model).
     pub transmission: Band8,
 }
 

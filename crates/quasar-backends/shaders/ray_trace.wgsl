@@ -226,7 +226,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out._pad0 = 0.0;
     out._pad1 = 0.0;
 
-    let air_atten = 1.0 / (1.0 + dist * 0.01);
+    // Same default law as quasar-core DistanceModel (inverse, 1 m reference,
+    // clamped at 1 m). The Rust side currently overrides this with its own model.
+    let air_atten = 1.0 / max(dist, 1.0);
     for (var b = 0u; b < 8u; b = b + 1u) {
         out.direct_attenuation[b] = air_atten;
     }

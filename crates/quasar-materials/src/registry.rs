@@ -141,6 +141,20 @@ impl MaterialProvider for AcousticMaterialRegistry {
             .map(|r| r.absorption)
             .unwrap_or_else(|_| Band8::splat(0.9))
     }
+
+    fn evaluate_transmission(&self, handle: u32, context: &RayInteractionContext) -> Band8 {
+        match self.evaluate(handle, context) {
+            Ok(r) => {
+                let mut t = r.transmission;
+                for v in t.0.iter_mut() {
+                    *v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+                }
+                t
+            }
+            // Unknown material: opaque.
+            Err(_) => Band8::zeros(),
+        }
+    }
 }
 
 impl Default for AcousticMaterialRegistry {

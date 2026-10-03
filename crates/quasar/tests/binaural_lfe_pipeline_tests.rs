@@ -130,6 +130,10 @@ fn hrtf_listener_follows_heading() {
     let id = quasar_audio::quasar_core::scene_output::ListenerId(0);
     engine.update_listener(id, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
     engine.update_scene_spatial();
+    // Direct path only: the late reverb is a diffuse, per-ear DECORRELATED field (shared bus,
+    // #62), so a pure tone legitimately has different levels in its tail at the two ears; this
+    // test is about the direct path following the heading.
+    engine.debug_audio_stage = 2;
     let s = render_stream(&mut engine, 2, 40, |b| sine_block(4000.0, b, 0.5));
     let tail = |x: &Vec<f32>| rms_of(&x[x.len() - 10 * BLOCK..]);
     let (l, r) = (tail(&s[0]), tail(&s[1]));

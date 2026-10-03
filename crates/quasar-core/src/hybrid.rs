@@ -2,6 +2,7 @@ use crate::backend::{
     DirectPathResult, DEFAULT_SAMPLE_RATE, SPEED_OF_SOUND, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery,
     SpatialQueryResult,
 };
+use crate::distance::DistanceModel;
 use crate::error::SpatialAudioError;
 use crate::probe_grid::AcousticProbeGrid;
 
@@ -28,6 +29,10 @@ pub struct HybridProbeSampler {
     /// Audio device sample rate; `delay_samples` the sampler itself produces
     /// (BakedOnly) is `distance * sample_rate / SPEED_OF_SOUND`.
     sample_rate: f32,
+    /// Direct-path distance law (shared with the real-time backend).
+    distance_model: DistanceModel,
+    /// Air temperature (C) / relative humidity (%) for BakedOnly air absorption.
+    atmosphere: (f32, f32),
 }
 
 impl HybridProbeSampler {
@@ -38,6 +43,8 @@ impl HybridProbeSampler {
             probe_grid: None,
             realtime_backend: None,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            distance_model: DistanceModel::default(),
+            atmosphere: (20.0, 50.0),
         }
     }
 
@@ -47,6 +54,27 @@ impl HybridProbeSampler {
         if let Some(b) = self.realtime_backend.as_mut() {
             b.set_sample_rate(sample_rate);
         }
+    }
+
+    /// Set the distance model (also forwarded to the real-time backend), so
+    /// BakedOnly, RealTimeOnly and HybridBlend give the same distance gain.
+    pub fn set_distance_model(&mut self, model: DistanceModel) {
+        self.distance_model = model;
+        if let Some(b) = self.realtime_backend.as_mut() {
+            b.set_distance_model(model);
+        }
+    }
+
+    /// Air temperature (C) and relative humidity (%) used for the air absorption
+    /// the sampler itself applies (BakedOnly; default 20 C / 50 %). Real-time
+    /// backends use their own configuration.
+    pub fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
+        self.atmosphere = (temperature_celsius, humidity_percent);
+    }
+
+    /// The active distance model.
+    pub fn distance_model(&self) -> DistanceModel {
+        self.distance_model
     }
 
     /// The sample rate delays are expressed in.
@@ -62,6 +90,7 @@ impl HybridProbeSampler {
     /// Set the real-time compute backend.
     pub fn set_realtime_backend(&mut self, mut backend: Box<dyn IAcousticComputeBackend>) {
         backend.set_sample_rate(self.sample_rate);
+        backend.set_distance_model(self.distance_model);
         self.realtime_backend = Some(backend);
     }
 
@@ -115,13 +144,10 @@ impl HybridProbeSampler {
                 let dz = query.source_position[2] - query.listener_position[2];
                 let distance = (dx * dx + dy * dy + dz * dz).sqrt();
 
-                // Simple inverse-distance attenuation (clamped to avoid divide-by-zero).
-                let atten = if distance > 1e-6 {
-                    1.0 / distance
-                } else {
-                    1.0
-                };
-                let attenuations = crate::bands::Band8::splat(atten.min(1.0));
+                // Shared distance law and ISO 9613-1 air absorption (same as the
+                // real-time backends, so the clear-path gain matches across strategies).
+                let attenuations = crate::bands::Band8::splat(self.distance_model.gain(distance))
+                    .mul(&crate::air::air_absorption_gain(distance, self.atmosphere.0, self.atmosphere.1));
 
                 Ok(SpatialQueryResult {
                     source_id: query.source_id,
@@ -131,13 +157,10 @@ impl HybridProbeSampler {
                         distance,
                         occluded: false,
                         occlusion_factor: 1.0,
+                        occlusion: crate::bands::Band8::splat(1.0),
                     },
                     early_reflections: Vec::new(),
-                    late_reverb: LateReverbEstimate {
-                        t60: sample.t60,
-                        early_late_split_secs: 0.05,
-                        late_loudness_db: -10.0,
-                    },
+                    late_reverb: baked_late_estimate(&sample, grid),
                 })
             }
             HybridSamplingStrategy::RealTimeOnly => {
@@ -174,15 +197,26 @@ impl HybridProbeSampler {
                 let sample = grid
                     .sample(&query.listener_position)
                     .ok_or_else(|| SpatialAudioError::ProbeGrid("listener position is outside the probe grid".into()))?;
+                result.late_reverb = baked_late_estimate(&sample, grid);
 
-                result.late_reverb = LateReverbEstimate {
-                    t60: sample.t60,
-                    early_late_split_secs: 0.05,
-                    late_loudness_db: -10.0,
-                };
 
                 Ok(result)
             }
         }
+    }
+}
+
+/// Late-reverb estimate from a probe-grid sample (no constants): T60 and the early /
+/// late split come from the interpolated probes; the level comes from the baked RIRs
+/// when there are any, else from the diffuse-field model
+/// ([`crate::reverb_model::late_loudness_from_t60_volume`]) with the mean T60 and the
+/// volume spanned by the grid.
+fn baked_late_estimate(sample: &crate::probe_grid::AcousticProbeSample, grid: &AcousticProbeGrid) -> LateReverbEstimate {
+    LateReverbEstimate {
+        t60: sample.t60,
+        early_late_split_secs: sample.early_late_split_secs,
+        late_loudness_db: sample.late_loudness_db.unwrap_or_else(|| {
+            crate::reverb_model::late_loudness_from_t60_volume(sample.t60.mean(), grid.volume_m3())
+        }),
     }
 }

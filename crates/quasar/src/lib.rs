@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery};
 use quasar_core::bands::Band8;
+use quasar_core::distance::DistanceModel;
 use quasar_core::error::SpatialAudioError;
 use quasar_core::hybrid::{HybridProbeSampler, HybridSamplingStrategy};
 use quasar_core::param_exchange::{
@@ -32,8 +33,9 @@ use quasar_core::scene_output::{
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNELS};
 use quasar_dsp::biquad::BiquadFilter;
 use quasar_dsp::binaural::{BinauralConfig, BinauralRenderer, ParametricBinauralRenderer};
-use quasar_dsp::crossfader::EqualPowerCrossfader;
+use quasar_dsp::crossfader::{EqualPowerCrossfader, MAX_CROSSFADE_REFLECTIONS};
 use quasar_dsp::early_reflections::EarlyReflectionDelayNode;
+use quasar_dsp::reflection_decoder::{ReflectionDecoder, TapTarget};
 use quasar_dsp::late_reverb::FdnReverbNode;
 use quasar_dsp::master_decoder::{layout_lfe, layout_panner, SpeakerLayout};
 use quasar_dsp::vbap::VbapPanner;
@@ -44,6 +46,10 @@ use quasar_materials::registry::AcousticMaterialRegistry;
 
 /// Corner frequency of the per-listener LFE low-pass (4th-order Butterworth, two biquads).
 pub const LFE_CUTOFF_HZ: f32 = 120.0;
+
+/// Capacity of each scene output's propagation-delay line, in seconds (0.5 s =
+/// 171 m at 343 m/s). Longer direct paths are clamped to this delay.
+pub const MAX_PROPAGATION_DELAY_SECS: f32 = 0.5;
 
 /// Atomic instrumentation for `process_audio_scene`.  All fields are relaxed-
 /// ordered atomics written from the audio callback and read from the demo's
@@ -121,13 +127,8 @@ struct SceneRenderState {
     /// Per scene output DSP chain (mono). Reference listener for occ/early/rev = listener 0.
     occ: Vec<AirAbsorptionOcclusionNode>,
     early: Vec<EarlyReflectionDelayNode>,
-    rev: Vec<FdnReverbNode>,
-    /// Direct-path fractional delays (samples), one per scene output.
-    /// Written by `update_scene_spatial` for listener 0, read directly by
-    /// `process_audio_scene` — NOT crossfaded (crossfading the read pointer
-    /// causes a 1700-sample jump at every block boundary during the 15 ms
-    /// transition, producing a 188 Hz click train).
-    direct_delays: Vec<f32>,
+    /// One shared reverb bus (FDN) per LISTENER.
+    rev_bus: Vec<FdnReverbNode>,
     /// Per-listener VBAP panner (from listener.physical_layout; LFE slots excluded).
     listener_panners: Vec<VbapPanner>,
     /// Speaker gains applied at the end of the previous block, one row per
@@ -153,9 +154,24 @@ struct SceneRenderState {
     /// Preallocated scratch (all mono unless noted), sized to DEFAULT_BLOCK_SIZE.
     mixed: Vec<AudioBuffer>,        // patch bay output per scene output
     filtered: Vec<AudioBuffer>,     // occ output per scene output
-    reflections: Vec<AudioBuffer>,  // early output (MONO) per scene output
-    reverb: Vec<AudioBuffer>,       // rev output per scene output
-    combined: Vec<AudioBuffer>,     // per-output final mono = filtered + reflections + reverb
+    /// Early-reflection decoder per (listener x output) (flat index listener * n_out + output):
+    /// renders every tap at its own arrival direction through the listener decoder.
+    refl_dec: Vec<ReflectionDecoder>,
+    /// Preallocated (capacity MAX_CROSSFADE_REFLECTIONS) listener-space tap list for one pair.
+    tap_targets: Vec<TapTarget>,
+    /// Shared reverb bus output per LISTENER: FDN output `k` on channel `k`.
+    rev_out: Vec<AudioBuffer>,
+    /// Mono send-sum scratch (one block) of the listener being rendered.
+    rev_in: Vec<f32>,
+    /// Send gain / propagation delay of each (listener x output) pair at the end of the
+    /// previous block (per-sample ramp starts); NaN until the pair has rendered once.
+    rev_send_prev: Vec<f32>,
+    rev_delay_prev: Vec<f32>,
+    /// Listener output channel of each FDN output, per listener.
+    rev_slots: Vec<Vec<usize>>,
+    /// Per-listener layout normalisation of the diffuse level (constant total power).
+    rev_gain: Vec<f32>,
+    combined: Vec<AudioBuffer>,     // per-output final mono = filtered (direct) + reverb; reflections are decoded per listener
     block: usize,                   // samples per block (from last process call, for crossfader advance)
     /// Sample rate captured at construction; mirrors `SpatialAudioEngine::sample_rate`.
     #[allow(dead_code)] // stored per the locked SceneRenderState layout; engine reads its own field
@@ -177,7 +193,7 @@ impl SceneRenderState {
             last_versions: Vec::new(),
             occ: Vec::new(),
             early: Vec::new(),
-            rev: Vec::new(),
+            rev_bus: Vec::new(),
             listener_panners: Vec::new(),
             prev_gains: Vec::new(),
             prev_valid: Vec::new(),
@@ -188,11 +204,16 @@ impl SceneRenderState {
             lfe_send: Vec::new(),
             lfe_send_prev: Vec::new(),
             lfe_scratch: Vec::new(),
-            direct_delays: Vec::new(),
             mixed: Vec::new(),
             filtered: Vec::new(),
-            reflections: Vec::new(),
-            reverb: Vec::new(),
+            refl_dec: Vec::new(),
+            tap_targets: Vec::new(),
+            rev_out: Vec::new(),
+            rev_in: Vec::new(),
+            rev_send_prev: Vec::new(),
+            rev_delay_prev: Vec::new(),
+            rev_slots: Vec::new(),
+            rev_gain: Vec::new(),
             combined: Vec::new(),
             block: DEFAULT_BLOCK_SIZE,
             sample_rate,
@@ -232,6 +253,10 @@ pub struct SpatialAudioEngine {
     /// LFE send (linear) per scene output, parallel to `scene_outputs`. Kept here,
     /// not in `SceneOutputConfig`, so the config struct stays source compatible.
     lfe_sends: Vec<f32>,
+    /// Optional per-output distance-model override, parallel to `scene_outputs`
+    /// (`None` = use the engine-wide model). Kept here for the same reason as
+    /// `lfe_sends`: `SceneOutputConfig` stays source compatible.
+    distance_overrides: Vec<Option<DistanceModel>>,
     /// Next ID to hand out for a freshly loaded source.
     next_source_id: u32,
     /// Next ID to hand out for a freshly added scene output.
@@ -253,6 +278,12 @@ impl SpatialAudioEngine {
     /// Snapshot the audio-thread timing counters (for display or logging).
     pub fn timing_snapshot(&self) -> AudioTimingSnapshot {
         self.timing.snapshot(DEFAULT_BLOCK_SIZE, self.sample_rate)
+    }
+
+    /// Number of late-reverb (FDN) nodes in the render state: one per LISTENER,
+    /// independent of the number of scene outputs (#62).
+    pub fn reverb_node_count(&self) -> usize {
+        self.scene.rev_bus.len()
     }
 }
 
@@ -291,6 +322,7 @@ impl SpatialAudioEngine {
             scene_outputs: Vec::new(),
             listeners: Vec::new(),
             lfe_sends: Vec::new(),
+            distance_overrides: Vec::new(),
             next_source_id: 0,
             next_scene_output_id: 0,
             next_listener_id: 0,
@@ -310,6 +342,28 @@ impl SpatialAudioEngine {
     /// Set baked probe grid data.
     pub fn set_probe_grid(&mut self, grid: AcousticProbeGrid) {
         self.hybrid_sampler.set_probe_grid(grid);
+    }
+
+    /// Set the engine-wide distance-attenuation model (default: inverse
+    /// distance, 1 m reference, 6.02 dB per doubling, clamped at 1 m).
+    ///
+    /// The same model is used by BakedOnly and the installed real-time
+    /// backend, so the strategy does not change the direct-path loudness.
+    pub fn set_distance_model(&mut self, model: DistanceModel) {
+        self.hybrid_sampler.set_distance_model(model);
+    }
+
+    /// Override the distance model of one scene output (`None` = engine-wide model).
+    ///
+    /// Applied on the compute thread as the ratio `override.gain(d) / global.gain(d)`
+    /// on the resolved direct gain, so it works with any strategy/backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn set_scene_output_distance_model(&mut self, id: SceneOutputId, model: Option<DistanceModel>) {
+        let idx = self.scene_output_index(id);
+        self.distance_overrides[idx] = model;
     }
 
     /// Set hybrid sampling strategy.
@@ -462,15 +516,13 @@ impl SpatialAudioEngine {
                     listener_position: self.listeners[l].position,
                     source_id: idx,
                 };
-                if let Ok(res) = self.hybrid_sampler.resolve(&query, &self.material_registry) {
-                    // Snapshot the raw direct-path delay for listener 0 (the
-                    // reference listener for occ/early/rev).  This is used by
-                    // the occlusion node INSTEAD of the crossfaded value,
-                    // because the crossfader interpolates from the initial
-                    // 0.0 over 15 ms, causing ~1700-sample tap-position
-                    // jumps at every block boundary (= 188 Hz click train).
-                    if l == 0 && o < self.scene.direct_delays.len() {
-                        self.scene.direct_delays[o] = res.direct_path.delay_samples;
+                if let Ok(mut res) = self.hybrid_sampler.resolve(&query, &self.material_registry) {
+                    if let Some(Some(ov)) = self.distance_overrides.get(o) {
+                        let global = self.hybrid_sampler.distance_model().gain(res.direct_path.distance);
+                        if global > 1e-9 {
+                            let ratio = ov.gain(res.direct_path.distance) / global;
+                            res.direct_path.attenuation = res.direct_path.attenuation.scale(ratio);
+                        }
                     }
                     let early_reflections: Vec<_> = res
                         .early_reflections
@@ -606,11 +658,8 @@ impl SpatialAudioEngine {
         let n_out_proc = n_out
             .min(self.scene.occ.len())
             .min(self.scene.early.len())
-            .min(self.scene.rev.len())
             .min(self.scene.mixed.len())
             .min(self.scene.filtered.len())
-            .min(self.scene.reflections.len())
-            .min(self.scene.reverb.len())
             .min(self.scene.combined.len())
             .min(self.scene.crossfaders.len());
         for o in 0..n_out_proc {
@@ -620,33 +669,26 @@ impl SpatialAudioEngine {
                 0 => self.scene.combined[o].clear(),
                 1 => self.scene.combined[o].copy_from(&self.scene.mixed[o]),
                 _ => {
-                    // (a) Occlusion / air absorption / direct-path delay.
-                    // Use the raw snapshotted delay (direct_delays[o]) rather
-                    // than the crossfaded coeff.direct_delay_samples so the
-                    // delay-line tap position doesn't jump ~1700 samples per
-                    // block during the 15 ms initial crossfade.
-                    self.scene.occ[o].update_occlusion(&coeff.direct_gain, coeff.direct_delay_samples);
-                    let raw_delay = if o < self.scene.direct_delays.len() { self.scene.direct_delays[o] } else { coeff.direct_delay_samples };
-                    self.scene.occ[o].process_raw(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff, raw_delay);
+                    // (a) Direct path: propagation delay + per-band air absorption /
+                    // occlusion filter. Both come from the crossfaded coefficients; the
+                    // node ramps gains, filter coefficients and delay per sample, so the
+                    // crossfader's block-rate steps do not click (a delay that moves
+                    // shifts pitch like a real Doppler shift, a teleport is crossfaded).
+                    self.scene.occ[o].process(&self.scene.mixed[o], &mut self.scene.filtered[o], coeff);
 
                     if stage >= 3 {
-                        // (b) Early reflections.
-                        self.scene.early[o].update_reflections(&coeff.early_reflections);
-                        self.scene.early[o].process(&self.scene.filtered[o], &mut self.scene.reflections[o], coeff);
+                        // (b) Early reflections: fed the UN-attenuated, undelayed dry signal
+                        // (post patch bay). Each tap's gain already carries the full path
+                        // attenuation and the surface reflection coefficients and its delay the
+                        // full emission -> listener path length, so the stage shares the direct
+                        // path's clock but not its distance gain or occlusion (#59, #125).
+                        self.scene.early[o].push_block(&self.scene.mixed[o]);
                     }
 
-                    if stage >= 4 {
-                        // (c) Late reverb.
-                        self.scene.rev[o].set_t60(&coeff.late_t60);
-                        let wet = db_to_linear(coeff.late_gain_db);
-                        self.scene.rev[o].set_mix(wet, 0.0);
-                        self.scene.rev[o].process(&self.scene.filtered[o], &mut self.scene.reverb[o], coeff);
-                    }
-
-                    // (d) Final mono for this output.
+                    // (c) Direct mono for this output. The late reverb is NOT per output: it is
+                    // one shared bus per listener, fed by per-output sends and decoded
+                    // diffusely (step 5; #62).
                     self.scene.combined[o].copy_from(&self.scene.filtered[o]);
-                    if stage >= 3 { self.scene.combined[o].add_from(&self.scene.reflections[o]); }
-                    if stage >= 4 { self.scene.combined[o].add_from(&self.scene.reverb[o]); }
                 }
             }
         }
@@ -691,34 +733,126 @@ impl SpatialAudioEngine {
                         &mut left[..nb],
                         &mut right[..nb],
                     );
-                    continue;
+                } else {
+                    panner.gains(az, el, &mut target[..n]);
+
+                    let prev = &mut self.scene.prev_gains[idx];
+                    if !self.scene.prev_valid[idx] {
+                        // First block after a rebuild: start at the target, don't ramp from garbage.
+                        prev[..n].copy_from_slice(&target[..n]);
+                        self.scene.prev_valid[idx] = true;
+                    }
+                    let combined_ch = self.scene.combined[o].channel(0);
+                    for sp in 0..n {
+                        let g0 = prev[sp];
+                        let g1 = target[sp];
+                        prev[sp] = g1;
+                        if sp >= n_speakers || (g0 == 0.0 && g1 == 0.0) {
+                            continue;
+                        }
+                        let ch = out.channel_mut(sp as u16);
+                        if g0 == g1 {
+                            for i in 0..block {
+                                ch[i] += combined_ch[i] * g1;
+                            }
+                        } else {
+                            let step = (g1 - g0) / block.max(1) as f32;
+                            for i in 0..block {
+                                ch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
+                            }
+                        }
+                    }
                 }
 
-                panner.gains(az, el, &mut target[..n]);
-
-                let prev = &mut self.scene.prev_gains[idx];
-                if !self.scene.prev_valid[idx] {
-                    // First block after a rebuild: start at the target, don't ramp from garbage.
-                    prev[..n].copy_from_slice(&target[..n]);
-                    self.scene.prev_valid[idx] = true;
+                // Early reflections of this (listener, output) pair: every tap is rendered
+                // at its OWN arrival direction, rotated into the listener frame exactly like
+                // the direct path, through the same decoder (VBAP / binaural), with per-tap
+                // gain / delay / pan ramps (see `ReflectionDecoder`; #58). Taps come from the
+                // pair's crossfaded coefficients and read the output's shared dry delay line.
+                if stage >= 3 {
+                    self.scene.tap_targets.clear();
+                    for er in coeff.early_reflections.iter().take(MAX_CROSSFADE_REFLECTIONS) {
+                        let (taz, tel) = basis.to_listener_angles(er.azimuth, er.elevation);
+                        let lo = er.gain.0[..4].iter().sum::<f32>() * 0.25;
+                        let hi = er.gain.0[4..].iter().sum::<f32>() * 0.25;
+                        self.scene.tap_targets.push(TapTarget {
+                            delay_samples: er.delay_samples,
+                            gain_lo: lo,
+                            gain_hi: hi,
+                            azimuth: taz,
+                            elevation: tel,
+                        });
+                    }
+                    self.scene.refl_dec[idx].render_add(
+                        &self.scene.early[o],
+                        &self.scene.tap_targets,
+                        Some(panner),
+                        out,
+                        block,
+                    );
                 }
-                let combined_ch = self.scene.combined[o].channel(0);
-                for sp in 0..n {
-                    let g0 = prev[sp];
-                    let g1 = target[sp];
-                    prev[sp] = g1;
-                    if sp >= n_speakers || (g0 == 0.0 && g1 == 0.0) {
+            }
+
+            // Late reverb: ONE shared FDN bus per listener (#62), not one per emitter.
+            //
+            // Each output contributes a SEND of its un-attenuated dry signal, read from the
+            // output's dry delay line at its propagation delay (so the tail starts when the
+            // direct sound arrives), scaled by `late_gain_db` (the room's diffuse-field level
+            // relative to the direct sound at the 1 m reference). That level does NOT include
+            // the direct path's distance attenuation or occlusion: the diffuse field is roughly
+            // constant with distance, so a distant emitter is mostly reverberant (DRR falls
+            // with distance as in a real room) and the send is independent of where the
+            // emitter stands. Sends are ramped per sample.
+            //
+            // The bus is decoded DIFFUSELY: FDN output `k` (decorrelated Hadamard tap sets, see
+            // `FdnReverbNode::process_bus`) feeds the k-th non-LFE speaker, or an ear for HRTF
+            // listeners, instead of being panned from an emitter direction. T60 is the mean
+            // over the listener's outputs. Cost: one FDN per listener, plus one Hermite read
+            // per (listener x output) per sample for the sends.
+            if stage >= 4 && !self.scene.rev_slots[l].is_empty() {
+                let inv_n = 1.0 / block.max(1) as f32;
+                let max_d = (self.scene.early[0].max_tap_delay() - block as f32).max(0.0);
+                self.scene.rev_in[..block].fill(0.0);
+                let mut t60_sum = Band8::zeros();
+                for o in 0..n_out_proc {
+                    let idx = l * n_out + o;
+                    let coeff = self.scene.crossfaders[idx].current_coefficients();
+                    t60_sum = t60_sum.add(&coeff.late_t60);
+                    let s1 = if coeff.late_gain_db.is_finite() { db_to_linear(coeff.late_gain_db.min(40.0)) } else { 0.0 };
+                    let d1 = if coeff.direct_delay_samples.is_finite() {
+                        coeff.direct_delay_samples.clamp(0.0, max_d)
+                    } else {
+                        0.0
+                    };
+                    let (mut s0, mut d0) = (self.scene.rev_send_prev[idx], self.scene.rev_delay_prev[idx]);
+                    if !s0.is_finite() || !d0.is_finite() {
+                        s0 = s1; // first block of this pair: start at the target
+                        d0 = d1;
+                    }
+                    self.scene.rev_send_prev[idx] = s1;
+                    self.scene.rev_delay_prev[idx] = d1;
+                    if s0 <= 0.0 && s1 <= 0.0 {
                         continue;
                     }
-                    let ch = out.channel_mut(sp as u16);
-                    if g0 == g1 {
+                    let line = &self.scene.early[o];
+                    let acc = &mut self.scene.rev_in[..block];
+                    for j in 0..block {
+                        let t = (j + 1) as f32 * inv_n;
+                        let d = d0 + (d1 - d0) * t + (block - 1 - j) as f32;
+                        acc[j] += line.tap_at(d) * (s0 + (s1 - s0) * t);
+                    }
+                }
+                let bus = &mut self.scene.rev_bus[l];
+                bus.set_t60(&t60_sum.scale(1.0 / n_out_proc.max(1) as f32));
+                bus.set_wet(self.scene.rev_gain[l]);
+                let n_fdn = self.scene.rev_slots[l].len();
+                bus.process_bus(&self.scene.rev_in[..block], &mut self.scene.rev_out[l], n_fdn);
+                for (k, &slot) in self.scene.rev_slots[l].iter().enumerate() {
+                    if slot < n_speakers {
+                        let src = self.scene.rev_out[l].channel(k as u16);
+                        let dst = out.channel_mut(slot as u16);
                         for i in 0..block {
-                            ch[i] += combined_ch[i] * g1;
-                        }
-                    } else {
-                        let step = (g1 - g0) / block.max(1) as f32;
-                        for i in 0..block {
-                            ch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
+                            dst[i] += src[i];
                         }
                     }
                 }
@@ -829,13 +963,11 @@ impl SpatialAudioEngine {
 
         // Per-output mono DSP chain. Reference listener for occ/early/rev = 0.
         let occ = (0..n_out)
-            // Cathedral diagonal ≈ 84 m → 84/343 ≈ 245 ms. Use 0.3 s margin.
-            .map(|_| AirAbsorptionOcclusionNode::new(1, sr, 0.3))
+            .map(|_| AirAbsorptionOcclusionNode::new(1, sr, MAX_PROPAGATION_DELAY_SECS))
             .collect();
         let early = (0..n_out)
             .map(|_| EarlyReflectionDelayNode::new(1, sr, 0.2, 16))
             .collect();
-        let rev = (0..n_out).map(|_| FdnReverbNode::new(1, sr)).collect();
 
         let listener_panners: Vec<VbapPanner> = self
             .listeners
@@ -851,6 +983,13 @@ impl SpatialAudioEngine {
                 } else {
                     None
                 }
+            })
+            .collect();
+        // Early-reflection decoders, per (listener x output).
+        let refl_dec: Vec<ReflectionDecoder> = (0..n_lis * n_out)
+            .map(|idx| {
+                let l = idx / n_out.max(1);
+                ReflectionDecoder::new(sr, self.listeners[l].physical_layout == PhysicalOutputLayout::Hrtf)
             })
             .collect();
         // LFE: per-listener slots, low-pass (4th-order Butterworth @ LFE_CUTOFF_HZ) and per-output sends.
@@ -869,9 +1008,6 @@ impl SpatialAudioEngine {
             .collect();
         let mut lfe_send = self.lfe_sends.clone();
         lfe_send.resize(n_out, 0.0);
-        // Direct-path delays: pre-allocated, written by update_scene_spatial.
-        let direct_delays = vec![0.0_f32; n_out];
-
         let mono = |count: usize| -> Vec<AudioBuffer> {
             (0..count)
                 .map(|_| AudioBuffer::new(1, DEFAULT_BLOCK_SIZE as u16))
@@ -879,8 +1015,29 @@ impl SpatialAudioEngine {
         };
         let mixed = mono(n_out);
         let filtered = mono(n_out);
-        let reflections = mono(n_out);
-        let reverb = mono(n_out);
+        // Shared reverb bus, one per LISTENER (cost independent of the emitter count).
+        let rev_bus: Vec<FdnReverbNode> = (0..n_lis).map(|_| FdnReverbNode::new(1, sr)).collect();
+        // FDN output k -> listener output channel: every non-LFE slot of a speaker layout
+        // (LFE never gets reverb), the two ears for an HRTF listener.
+        let rev_slots: Vec<Vec<usize>> = (0..n_lis)
+            .map(|l| {
+                if self.listeners[l].physical_layout == PhysicalOutputLayout::Hrtf {
+                    vec![0, 1]
+                } else {
+                    let lfe = layout_lfe(&physical_to_speaker_layout(&self.listeners[l].physical_layout));
+                    (0..listener_panners[l].num_outputs())
+                        .filter(|s| !lfe.contains(s))
+                        .take(quasar_dsp::late_reverb::FDN_MAX_BUS_OUTPUTS)
+                        .collect()
+                }
+            })
+            .collect();
+        // Constant TOTAL diffuse power across layouts, referenced to a stereo pair.
+        let rev_gain: Vec<f32> = rev_slots.iter().map(|s| (2.0 / s.len().max(2) as f32).sqrt()).collect();
+        let rev_out: Vec<AudioBuffer> = rev_slots
+            .iter()
+            .map(|s| AudioBuffer::new(s.len().max(1) as u16, DEFAULT_BLOCK_SIZE as u16))
+            .collect();
         let combined = mono(n_out);
 
         self.scene = SceneRenderState {
@@ -890,7 +1047,7 @@ impl SpatialAudioEngine {
             last_versions: vec![0; n_out * n_lis],
             occ,
             early,
-            rev,
+            rev_bus,
             listener_panners,
             prev_gains: vec![[0.0; MAX_AUDIO_CHANNELS]; n_out * n_lis],
             prev_valid: vec![false; n_out * n_lis],
@@ -901,11 +1058,16 @@ impl SpatialAudioEngine {
             lfe_send_prev: lfe_send.iter().cycle().take(n_out * n_lis).copied().collect(),
             lfe_send,
             lfe_scratch: vec![0.0; DEFAULT_BLOCK_SIZE],
-            direct_delays,
             mixed,
             filtered,
-            reflections,
-            reverb,
+            refl_dec,
+            tap_targets: Vec::with_capacity(MAX_CROSSFADE_REFLECTIONS),
+            rev_out,
+            rev_in: vec![0.0; DEFAULT_BLOCK_SIZE],
+            rev_send_prev: vec![f32::NAN; n_out * n_lis],
+            rev_delay_prev: vec![f32::NAN; n_out * n_lis],
+            rev_slots,
+            rev_gain,
             combined,
             block: self.scene.block,
             sample_rate: sr,
@@ -979,6 +1141,7 @@ impl SpatialAudioEngine {
         self.next_scene_output_id += 1;
         self.scene_outputs.push(cfg);
         self.lfe_sends.push(0.0);
+        self.distance_overrides.push(None);
         self.rebuild_scene_render();
         id
     }
@@ -998,6 +1161,7 @@ impl SpatialAudioEngine {
         let idx = self.scene_output_index(id);
         self.scene_outputs.remove(idx);
         self.lfe_sends.remove(idx);
+        self.distance_overrides.remove(idx);
         self.next_scene_output_id = self.scene_outputs.len() as u32;
         self.rebuild_scene_render();
     }

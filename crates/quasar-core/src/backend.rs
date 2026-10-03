@@ -1,4 +1,5 @@
 use crate::bands::Band8;
+use crate::distance::DistanceModel;
 use crate::error::SpatialAudioError;
 use crate::rays::{Ray, RayHit, RayInteractionContext};
 use crate::scene::AcousticScene;
@@ -45,20 +46,34 @@ pub struct DirectPathResult {
     pub distance: f32,
     /// Whether the direct path is occluded.
     pub occluded: bool,
-    /// Occlusion factor [0, 1] — 0 = fully occluded, 1 = clear line of sight.
+    /// Broadband occlusion factor [0, 1] — 0 = fully occluded, 1 = clear line of sight
+    /// (the mean of [`Self::occlusion`]).
     pub occlusion_factor: f32,
+    /// Per-band linear amplitude occlusion [0, 1] (1 = clear, 0 = blocked). Already
+    /// multiplied into [`Self::attenuation`]; kept separately so callers can inspect
+    /// how much of the direct-path loss is due to geometry.
+    pub occlusion: Band8,
 }
 
 /// A single early reflection path.
 #[derive(Clone, Debug)]
 pub struct EarlyReflection {
-    /// Direction from listener toward the reflection point.
+    /// Arrival direction: the unit vector, in WORLD space, from the listener
+    /// toward the **last** reflection point of the path (the bounce nearest the
+    /// listener; for a first-order path, the single bounce point). It is the
+    /// direction the sound seems to come from, so it is already listener-relative
+    /// in origin; rotating it by the listener's heading gives the panning angle.
     pub direction: [f32; 3],
-    /// Delay in samples at the audio thread's sample rate.
+    /// Delay in samples at the audio thread's sample rate: the TOTAL emission ->
+    /// listener path length `* fs / c` (same clock as the direct path's
+    /// `distance * fs / c`).
     pub delay_samples: f32,
-    /// Gain per band (linear).
+    /// Gain per band (linear amplitude), relative to the un-attenuated dry
+    /// signal: the product of the surface reflection coefficients along the path
+    /// times the distance law and air absorption of the TOTAL path length. It does
+    /// NOT include (or depend on) the direct path's attenuation or occlusion.
     pub gain: Band8,
-    /// Specular reflection order (0 = direct, 1 = first-order, etc.).
+    /// Specular reflection order (number of bounces; 1 = first-order, etc.).
     pub order: u32,
 }
 
@@ -81,6 +96,17 @@ pub trait MaterialProvider: Send + Sync {
     ///
     /// Returns the per-band absorption coefficient(s) or similar acoustic parameter.
     fn evaluate_material(&self, handle: u32, context: &RayInteractionContext) -> Band8;
+
+    /// Per-band linear **amplitude** transmission gain of the surface (what is left
+    /// of a wave after passing *through* it): 0 = opaque, 1 = transparent.
+    ///
+    /// Distinct from absorption (energy lost at a reflection). The backend
+    /// multiplies it over every surface a direct-path ray crosses. The default is
+    /// opaque, so a provider that only knows absorption blocks sound rather than
+    /// leaking it; `AcousticMaterialRegistry` returns the material model's own value.
+    fn evaluate_transmission(&self, _handle: u32, _context: &RayInteractionContext) -> Band8 {
+        Band8::zeros()
+    }
 }
 
 /// Hardware-agnostic spatial compute backend.
@@ -103,6 +129,11 @@ pub trait IAcousticComputeBackend: Send + Sync {
     /// engine rate changes), never from the audio thread. Backends that do not
     /// produce delays may ignore it.
     fn set_sample_rate(&mut self, _sample_rate: f32) {}
+
+    /// Install the shared distance-attenuation model used for the direct path
+    /// (default: [`DistanceModel::default`], inverse distance with a 1 m
+    /// reference). Backends that do not model distance may ignore it.
+    fn set_distance_model(&mut self, _model: DistanceModel) {}
 
     /// Whether this backend supports dynamic scene updates.
     fn supports_dynamic_geometry(&self) -> bool {

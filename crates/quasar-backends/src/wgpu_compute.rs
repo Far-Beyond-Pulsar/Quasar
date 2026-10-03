@@ -6,6 +6,7 @@ use quasar_core::backend::{
     MaterialProvider, SpatialQuery, SpatialQueryResult,
 };
 use quasar_core::bands::Band8;
+use quasar_core::distance::DistanceModel;
 use quasar_core::error::SpatialAudioError;
 use quasar_core::rays::{Ray, RayHit};
 use quasar_core::scene::AcousticScene;
@@ -36,6 +37,7 @@ pub struct WgpuComputeBackend {
     staging_buffers: [wgpu::Buffer; 2],
     readback_index: AtomicU32,
     sample_rate: f32,
+    distance_model: DistanceModel,
     config: WgpuComputeConfig,
 }
 
@@ -238,6 +240,7 @@ impl WgpuComputeBackend {
             ],
             readback_index: AtomicU32::new(0),
             sample_rate: 48_000.0,
+            distance_model: DistanceModel::default(),
             config,
         };
 
@@ -449,6 +452,7 @@ impl WgpuComputeBackend {
         }
 
         let sample_rate = self.sample_rate;
+        let distance_model = self.distance_model;
         let config = &self.config;
 
         let params = ShaderParams {
@@ -525,11 +529,12 @@ impl WgpuComputeBackend {
                 SpatialQueryResult {
                     source_id: q.source_id,
                     direct_path: DirectPathResult {
-                        attenuation: Band8::splat(1.0 / (1.0 + dist)),
+                        attenuation: Band8::splat(distance_model.gain(dist)),
                         delay_samples: dist * sample_rate / config.speed_of_sound,
                         distance: dist,
                         occluded: false,
                         occlusion_factor: 1.0,
+                        occlusion: Band8::splat(1.0),
                     },
                     early_reflections: Vec::new(),
                     late_reverb: LateReverbEstimate {
@@ -550,6 +555,10 @@ impl IAcousticComputeBackend for WgpuComputeBackend {
         materials: &dyn MaterialProvider,
     ) -> Vec<SpatialQueryResult> {
         self.dispatch_and_readback(queries, materials)
+    }
+
+    fn set_distance_model(&mut self, model: DistanceModel) {
+        self.distance_model = model;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {

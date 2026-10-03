@@ -7,6 +7,9 @@ pub mod scene_output;
 pub mod param_exchange;
 pub mod probe_grid;
 pub mod hybrid;
+pub mod distance;
+pub mod air;
+pub mod reverb_model;
 pub mod streaming_source;
 
 /// Nebula audio import bridge (optional, behind `nebula-import` feature).
@@ -22,4 +25,5 @@ pub use scene_output::*;
 pub use param_exchange::*;
 pub use probe_grid::*;
 pub use hybrid::*;
+pub use distance::*;
 pub use streaming_source::*;

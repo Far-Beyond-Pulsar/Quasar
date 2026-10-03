@@ -18,6 +18,32 @@ pub struct AcousticProbe {
     pub early_late_split_secs: f32,
 }
 
+impl AcousticProbe {
+    /// Late-field level (dB) derived from the baked RIR, if there is one: the energy after
+    /// `early_late_split_secs` over the energy of the direct arrival (the first 2.5 ms),
+    /// both averaged over the bands. `rir_samples` are per-band ENERGIES at `sample_rate`,
+    /// and the reference is the direct sound at the bake's own source distance, so this is
+    /// a level relative to the baked direct sound. `None` without an RIR or without a
+    /// direct / late part.
+    pub fn late_loudness_db(&self) -> Option<f32> {
+        if self.rir_samples.is_empty() || self.sample_rate == 0 {
+            return None;
+        }
+        let sr = self.sample_rate as f32;
+        let direct_end = ((0.0025 * sr).ceil() as usize).clamp(1, self.rir_samples.len());
+        let split = ((self.early_late_split_secs.max(0.0) * sr) as usize).max(direct_end);
+        if split >= self.rir_samples.len() {
+            return None;
+        }
+        let sum = |s: &[Band8]| s.iter().map(|b| b.mean().max(0.0)).sum::<f32>();
+        let (direct, late) = (sum(&self.rir_samples[..direct_end]), sum(&self.rir_samples[split..]));
+        if !(direct > 0.0 && late > 0.0 && direct.is_finite() && late.is_finite()) {
+            return None;
+        }
+        Some((10.0 * (late / direct).log10()).clamp(crate::reverb_model::LATE_DB_MIN, crate::reverb_model::LATE_DB_MAX))
+    }
+}
+
 /// An interpolated sample from an `AcousticProbeGrid`.
 #[derive(Clone, Debug)]
 pub struct AcousticProbeSample {
@@ -25,6 +51,12 @@ pub struct AcousticProbeSample {
     pub t60: Band8,
     /// Interpolation quality: 1.0 = fully inside the grid, 0.0 = at boundary or outside.
     pub interpolation_quality: f32,
+    /// Early / late split time (s), trilinearly interpolated from the probes.
+    pub early_late_split_secs: f32,
+    /// Late-field level (dB re the baked direct sound, see [`AcousticProbe::late_loudness_db`])
+    /// interpolated over the corner probes that have an RIR (weights renormalised);
+    /// `None` when none of the 8 corners has one.
+    pub late_loudness_db: Option<f32>,
     /// Index of the nearest probe in the probe list.
     pub nearest_probe_index: usize,
 }
@@ -84,6 +116,7 @@ impl AcousticProbeGrid {
         let weights = [wx, wy, wz];
         let corner_indices = self.cell_probe_indices(cell);
         let t60 = self.trilinear_interpolate(weights, corner_indices);
+        let (split, late_db) = self.interpolate_scalars(weights, corner_indices);
 
         // Interpolation quality: 1.0 at cell centre, 0.0 at cell boundary.
         let quality = (1.0 - (wx - 0.5).abs() * 2.0)
@@ -101,6 +134,8 @@ impl AcousticProbeGrid {
         Some(AcousticProbeSample {
             t60,
             interpolation_quality: quality,
+            early_late_split_secs: split,
+            late_loudness_db: late_db,
             nearest_probe_index: nearest,
         })
     }
@@ -163,6 +198,27 @@ impl AcousticProbeGrid {
         ]
     }
 
+    /// Trilinear interpolation of the early/late split and (over the corners that have
+    /// an RIR) the late level.
+    fn interpolate_scalars(&self, weights: [f32; 3], corner_indices: [usize; 8]) -> (f32, Option<f32>) {
+        let [wx, wy, wz] = weights;
+        let (ix, iy, iz) = (1.0 - wx, 1.0 - wy, 1.0 - wz);
+        let w = [
+            ix * iy * iz, wx * iy * iz, ix * wy * iz, wx * wy * iz,
+            ix * iy * wz, wx * iy * wz, ix * wy * wz, wx * wy * wz,
+        ];
+        let (mut split, mut late, mut late_w) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for k in 0..8 {
+            let p = &self.probes[corner_indices[k]];
+            split += w[k] * p.early_late_split_secs;
+            if let Some(l) = p.late_loudness_db() {
+                late += w[k] * l;
+                late_w += w[k];
+            }
+        }
+        (split, if late_w > 1e-6 { Some(late / late_w) } else { None })
+    }
+
     /// Trilinear interpolation of `t60` values from 8 corner probes.
     fn trilinear_interpolate(&self, weights: [f32; 3], corner_indices: [usize; 8]) -> Band8 {
         let [wx, wy, wz] = weights;
@@ -212,5 +268,14 @@ impl Default for AcousticProbeGrid {
             grid_spacing: [1.0; 3],
             grid_dims: [0; 3],
         }
+    }
+}
+
+impl AcousticProbeGrid {
+    /// Volume (m^3) of the box the probes span: a coarse proxy for the room volume when
+    /// nothing better is known (a grid is normally laid over the navigable room).
+    pub fn volume_m3(&self) -> f32 {
+        let d = |a: usize| ((self.grid_dims[a].saturating_sub(1)) as f32 * self.grid_spacing[a]).max(0.0);
+        d(0) * d(1) * d(2)
     }
 }

@@ -217,26 +217,37 @@ fn setup_audio_engine() -> AudioEngine {
     // onto one Listener whose physical layout matches the real output device.
     let mut engine = SpatialAudioEngine::new(0, sr, 15.0);
 
-    // Acoustic materials drive occlusion filtering and reflections. Polished
-    // stone floor (low absorption 0.15), rough stone walls + columns (0.35).
+    // Acoustic materials drive occlusion filtering, early reflections and the
+    // statistical late field. Per-band absorption (62.5 Hz .. 8 kHz), chosen so the
+    // closed shell's mean absorption (~0.1) gives the 4-7 s reverberation time the
+    // probe grid below describes:
+    //   floor   - stone with pews and rugs, absorbs more in the mids/highs;
+    //   walls   - rough stone, slightly more absorbent toward HF;
+    //   ceiling - vaulted stone/plaster, a little LF panel absorption.
     // Registered BEFORE the backend is created so mesh handles are valid.
     engine.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
-    let floor_mat = engine.materials().add_instance(AcousticMaterialInstance::new(
-        TABULAR_MODEL_ID,
-        Tabular8BandEvaluator::create_params(Band8::splat(0.15), Band8::zeros(), Band8::zeros()),
-    ));
-    let wall_mat = engine.materials().add_instance(AcousticMaterialInstance::new(
-        TABULAR_MODEL_ID,
-        Tabular8BandEvaluator::create_params(Band8::splat(0.35), Band8::zeros(), Band8::zeros()),
-    ));
+    let material = |absorption: [f32; 8]| {
+        engine.materials().add_instance(AcousticMaterialInstance::new(
+            TABULAR_MODEL_ID,
+            Tabular8BandEvaluator::create_params(Band8::new(absorption), Band8::zeros(), Band8::zeros()),
+        ))
+    };
+    let floor_mat = material([0.08, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22]);
+    let wall_mat = material([0.06, 0.05, 0.05, 0.06, 0.07, 0.09, 0.12, 0.15]);
+    let ceiling_mat = material([0.10, 0.08, 0.06, 0.05, 0.05, 0.05, 0.06, 0.07]);
 
-    // Acoustic proxy scene: floor, two side walls, plus the 4 nave columns so
-    // occluding a speaker behind a column is demonstrable (columns are 0.65 × 20
-    // × 0.65 acoustic boxes at x = ±5.5, z = -22 / +18).
+    // Acoustic proxy scene: a CLOSED shell (floor, two side walls, ceiling, altar
+    // wall at z = -28 and entrance wall at z = +28; 22 x 21 x 56 m) so the early
+    // reflections and the late-reverb estimate describe a real room, plus the 4 nave
+    // columns so occluding a speaker behind a column is demonstrable (columns are
+    // 0.65 x 20 x 0.65 acoustic boxes at x = +-5.5, z = -22 / +18).
     let mut qs = QScene::new();
     qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], floor_mat));
     qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
     qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
+    qs.add_mesh(QMesh::new(8, vec![[-11.,21.,-28.],[11.,21.,-28.],[11.,21.,28.],[-11.,21.,28.]], vec![0,1,2,0,2,3], ceiling_mat));
+    qs.add_mesh(QMesh::new(9, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,21.,-28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
+    qs.add_mesh(QMesh::new(10, vec![[-11.,0.,28.],[11.,0.,28.],[11.,21.,28.],[-11.,21.,28.]], vec![0,1,2,0,2,3], wall_mat));
     for (i, &cz) in COLUMN_Z.iter().enumerate() {
         for (j, &cx) in [-5.5_f32, 5.5].iter().enumerate() {
             qs.add_mesh(QMesh::new(
@@ -263,6 +274,7 @@ fn setup_audio_engine() -> AudioEngine {
         max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
         speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
         sample_rate: 48_000.,
+        ..CpuSimdConfig::default()
     };
     engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
 

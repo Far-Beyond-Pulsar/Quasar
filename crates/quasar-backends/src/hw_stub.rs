@@ -3,6 +3,7 @@ use quasar_core::backend::{
     SpatialQueryResult,
 };
 use quasar_core::bands::Band8;
+use quasar_core::distance::DistanceModel;
 use quasar_core::error::SpatialAudioError;
 use quasar_core::rays::{Ray, RayHit};
 use quasar_core::scene::AcousticScene;
@@ -17,12 +18,13 @@ use quasar_core::scene::AcousticScene;
 pub struct HardwareAcceleratorStub {
     has_scene: bool,
     sample_rate: f32,
+    distance_model: DistanceModel,
 }
 
 impl HardwareAcceleratorStub {
     /// Create a new `HardwareAcceleratorStub` with no scene loaded.
     pub fn new() -> Self {
-        Self { has_scene: false, sample_rate: DEFAULT_SAMPLE_RATE }
+        Self { has_scene: false, sample_rate: DEFAULT_SAMPLE_RATE, distance_model: DistanceModel::default() }
     }
 }
 
@@ -43,11 +45,12 @@ impl IAcousticComputeBackend for HardwareAcceleratorStub {
                 SpatialQueryResult {
                     source_id: q.source_id,
                     direct_path: DirectPathResult {
-                        attenuation: Band8::splat(1.0 / (1.0 + dist)),
+                        attenuation: Band8::splat(self.distance_model.gain(dist)),
                         delay_samples: dist * self.sample_rate / SPEED_OF_SOUND,
                         distance: dist,
                         occluded: false,
                         occlusion_factor: 1.0,
+                        occlusion: Band8::splat(1.0),
                     },
                     early_reflections: Vec::new(),
                     late_reverb: LateReverbEstimate {
@@ -58,6 +61,10 @@ impl IAcousticComputeBackend for HardwareAcceleratorStub {
                 }
             })
             .collect()
+    }
+
+    fn set_distance_model(&mut self, model: DistanceModel) {
+        self.distance_model = model;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {

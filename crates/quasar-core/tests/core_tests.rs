@@ -341,6 +341,7 @@ fn spatial_query_result_construction() {
             distance: 5.0,
             occluded: false,
             occlusion_factor: 1.0,
+            occlusion: Band8::splat(1.0),
         },
         early_reflections: vec![EarlyReflection {
             direction: [1.0, 0.0, 0.0],
