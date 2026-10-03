@@ -225,8 +225,9 @@ impl AirAbsorptionOcclusionNode {
             let mut l = 0;
             while l < n_live {
                 let left = n_live - l;
-                let take = if left >= 4 { 4 } else if left >= 2 { 2 } else { 1 };
+                let take = if left >= 8 { 8 } else if left >= 4 { 4 } else if left >= 2 { 2 } else { 1 };
                 match take {
+                    8 => run_group::<8>(&mut y[..nn], &live[l..l + 8], &self.cur_coefs, &step, st, ramping),
                     4 => run_group::<4>(&mut y[..nn], &live[l..l + 4], &self.cur_coefs, &step, st, ramping),
                     2 => run_group::<2>(&mut y[..nn], &live[l..l + 2], &self.cur_coefs, &step, st, ramping),
                     _ => run_group::<1>(&mut y[..nn], &live[l..l + 1], &self.cur_coefs, &step, st, ramping),
