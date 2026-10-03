@@ -40,7 +40,7 @@ fn quad(id: u64, p: [[f32; 3]; 4], mat: u32) -> AcousticMesh {
 
 /// The demo's closed cathedral shell + probe grid + HybridBlend, one emitter per entry of
 /// `emitters` (emitter `i` pulls channel `i` of a `emitters.len()`-channel source).
-fn cathedral(layout: PhysicalOutputLayout, listener: [f32; 3], emitters: &[[f32; 3]]) -> SpatialAudioEngine {
+fn cathedral(layout: PhysicalOutputLayout, listener: [f32; 3], emitters: &[[f32; 3]], aim: Option<([f32; 3], f32)>) -> SpatialAudioEngine {
     let mut e = SpatialAudioEngine::new(0, SR, 15.0);
     e.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
     let mat = |e: &SpatialAudioEngine, a: [f32; 8]| {
@@ -97,6 +97,11 @@ fn cathedral(layout: PhysicalOutputLayout, listener: [f32; 3], emitters: &[[f32;
     for (i, &pos) in emitters.iter().enumerate() {
         let out = e.add_scene_output(SceneOutputConfig::new(pos, Movability::Static));
         e.connect_pull(out, ChannelPull::new(src, i as u32, 0.0));
+        if let Some((target, directivity)) = aim {
+            let d = [target[0] - pos[0], target[1] - pos[1], target[2] - pos[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            e.set_scene_output_directivity(out, Some([d[0] / l, d[1] / l, d[2] / l]), directivity);
+        }
     }
     e.add_listener(ListenerConfig { position: listener, heading: [0.0, 0.0, -1.0], physical_layout: layout });
     e.update_scene_spatial();
@@ -144,11 +149,11 @@ fn db(x: f32) -> f32 {
 }
 
 /// Returns (direct, early, reverb) levels in dB re ONE input channel's RMS, total power over channels.
-fn report(label: &str, layout: PhysicalOutputLayout, ch: u16, listener: [f32; 3], emitters: &[[f32; 3]]) -> (f32, f32, f32) {
+fn report(label: &str, layout: PhysicalOutputLayout, ch: u16, listener: [f32; 3], emitters: &[[f32; 3]], aim: Option<([f32; 3], f32)>) -> (f32, f32, f32) {
     let mut lv = [0.0_f32; 3];
     let mut input = 1.0;
     for (i, stage) in [2u8, 3, 4].iter().enumerate() {
-        let mut e = cathedral(layout.clone(), listener, emitters);
+        let mut e = cathedral(layout.clone(), listener, emitters, aim);
         let (o, inp) = render_rms(&mut e, *stage, ch, emitters.len());
         lv[i] = o;
         input = inp;
@@ -167,12 +172,23 @@ fn report(label: &str, layout: PhysicalOutputLayout, ch: u16, listener: [f32; 3]
 fn close_emitter_is_dominated_by_direct_sound() {
     // One emitter at increasing distance straight ahead of the listener.
     for d in [1.0_f32, 2.0, 4.0, 12.0] {
-        report(&format!("1 emitter @ {d:>4} m  (stereo)"), PhysicalOutputLayout::Stereo, 2, [0.0, 1.6, 0.0], &[[0.0, 1.6, -d]]);
+        report(&format!("1 emitter @ {d:>4} m  (stereo)"), PhysicalOutputLayout::Stereo, 2, [0.0, 1.6, 0.0], &[[0.0, 1.6, -d]], None);
     }
     // The demo: all 8 speakers play uncorrelated signals.  Listener 1.5 m in front of the
     // centre speaker (speaker C is at (0, 3, -12)) and at the origin (12 m from the front stage).
     for (label, listener) in [("DEMO 8 spk, 2 m from centre spk", [0.0, 1.6, -10.5]), ("DEMO 8 spk, at origin (12 m)", [0.0, 1.6, 0.0])] {
-        report(&format!("{label} (stereo)"), PhysicalOutputLayout::Stereo, 2, listener, &SPEAKERS);
-        report(&format!("{label} (7.1)"), PhysicalOutputLayout::Surround714, 8, listener, &SPEAKERS);
+        report(&format!("{label} (stereo)"), PhysicalOutputLayout::Stereo, 2, listener, &SPEAKERS, None);
+        report(&format!("{label} (7.1)"), PhysicalOutputLayout::Surround714, 8, listener, &SPEAKERS, None);
+    }
+}
+
+#[test]
+fn aimed_speakers_improve_the_direct_to_reverb_balance() {
+    // Same demo scenario with every stage speaker aimed at the audience (the origin).
+    let target = [0.0_f32, 1.6, 0.0];
+    for (label, listener) in [("2 m from centre spk", [0.0, 1.6, -10.5]), ("at origin (12 m)", [0.0, 1.6, 0.0])] {
+        for d in [0.0_f32, 0.5, 1.0] {
+            report(&format!("DEMO {label} directivity {d:.1}"), PhysicalOutputLayout::Stereo, 2, listener, &SPEAKERS, Some((target, d)));
+        }
     }
 }
