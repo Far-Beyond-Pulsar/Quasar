@@ -253,8 +253,8 @@ pub fn run() -> Result<(), String> {
         s.aabb_min, s.aabb_max, s.aabb_size(), s.degenerate_triangles
     );
     println!(
-        "[check] backend: BVH + planes built in {:.1} ms, extraction {:.1} ms, {} mirror planes, room_is_closed = {}",
-        built.backend_build_ms, built.extract_ms, built.reflection_planes, built.room_closed
+        "[check] backend: BVH + planes built in {:.1} ms, extraction {:.1} ms, {} mirror planes, room_is_closed = {}, watertight = {}",
+        built.backend_build_ms, built.extract_ms, built.reflection_planes, built.room_closed, built.watertight
     );
     println!(
         "[check] statistical late-field T60 per band (62.5 Hz..8 kHz) {:?} s; probe grid {:?} probes @ {:?} m",
@@ -324,9 +324,11 @@ pub fn run() -> Result<(), String> {
     for (label, pos) in positions {
         engine.update_listener(lid, pos, [0.0, 0.0, -1.0]);
         engine.update_scene_spatial(); // warm (first update after a jump)
+        // The engine skips unchanged poses: move the listener 0.3 m each iteration so every update computes.
         let t = Instant::now();
-        for _ in 0..5 {
-            engine.update_listener(lid, pos, [0.0, 0.0, -1.0]);
+        for k in 0..5 {
+            let moved = [pos[0] + 0.3 * (k as f32 + 1.0), pos[1], pos[2]];
+            engine.update_listener(lid, moved, [0.0, 0.0, -1.0]);
             engine.update_scene_spatial();
         }
         let ms = t.elapsed().as_secs_f64() * 1e3 / 5.0;
@@ -368,5 +370,167 @@ pub fn run() -> Result<(), String> {
             println!("[check] FAIL: {f}");
         }
         Err(failures.join("; "))
+    }
+}
+
+/// `QUASAR_SWEEP=1`: cost of the tracer settings on the real scene (query time and rays for the 8
+/// stage emitters at three listener positions). Diagnostic only.
+pub fn sweep() {
+    let scene_db = build_world();
+    let world = &scene_db.world;
+    let built = audio_demo::build_engine(
+        world, SR, "assets/8_Channel_ID.wav", 8, PhysicalOutputLayout::Surround714, AUDIENCE, audio_demo::tracer_config(SR),
+    );
+    let handles = built.class_handles.clone();
+    let materials = built.engine.materials();
+    let speakers = audio_demo::speaker_positions(AUDIENCE);
+    let listeners = [AUDIENCE, [0.0, 2.3, 0.0], [0.0, 2.3, -60.0]];
+    println!("[sweep] order planes | build ms | per listener: ms / rays / early paths / outside-skipped");
+    for order in [1u32, 2, 3] {
+        for planes in [8usize, 16, 32] {
+            let ex = acoustic_geometry::extract_acoustic_scene(world, |c| handles[&c]);
+            let mut cfg = audio_demo::tracer_config(SR);
+            cfg.max_reflection_order = order;
+            cfg.max_reflection_planes = planes;
+            let t = Instant::now();
+            let backend = CpuSimdComputeBackend::new(ex.scene, cfg);
+            let build = t.elapsed().as_secs_f64() * 1e3;
+            let mut line = format!("[sweep] {order} {planes:>3} | {build:7.0} |");
+            for l in listeners {
+                let q: Vec<SpatialQuery> = speakers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| SpatialQuery { source_position: p.to_array(), listener_position: l, source_id: i as u32 })
+                    .collect();
+                backend.query_spatial(&q, materials); // warm
+                backend.reset_ray_counter();
+                let t = Instant::now();
+                let r = backend.query_spatial(&q, materials);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let paths: usize = r.iter().map(|x| x.early_reflections.len()).sum();
+                line += &format!(" {ms:6.1} ms {:6} r {paths:3} p |", backend.rays_traced());
+            }
+            println!("{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These need a GPU adapter (the SceneDB mirror allocates GPU buffers); run with
+    //! `cargo test --release -- --ignored`.
+    use super::*;
+
+    fn built() -> (pulsar_scenedb::SceneDb, audio_demo::BuiltEngine) {
+        let scene_db = build_world();
+        let built = audio_demo::build_engine(
+            &scene_db.world,
+            SR,
+            "assets/8_Channel_ID.wav",
+            8,
+            PhysicalOutputLayout::Surround714,
+            AUDIENCE,
+            audio_demo::tracer_config(SR),
+        );
+        (scene_db, built)
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn geometry_completeness_counts() {
+        let (db, built) = built();
+        let counts = render_counts(&db.world);
+        let s = &built.scene_stats;
+        assert_eq!(s.instances, counts.objects, "every SceneDB object row is an acoustic mesh");
+        assert_eq!(counts.objects, 15, "9 opaque material meshes + 6 glass pane meshes");
+        assert_eq!(s.triangles, counts.draw_triangles, "audio triangles == SceneDB draw ranges");
+        assert_eq!(s.triangles, counts.authored_triangles, "audio triangles == authored triangles");
+        assert!(s.triangles > 400_000, "{}", s.triangles);
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        assert_eq!((s.invalid_triangles, s.degenerate_triangles), (0, 0));
+        assert_eq!(built.engine.materials().instance_count(), AcousticClass::ALL.len());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn material_mapping_has_no_silent_fallbacks() {
+        let (_db, built) = built();
+        let s = &built.scene_stats;
+        assert_eq!(s.materials_used, 15);
+        assert_eq!(s.tagged_materials, 15, "every material row carries an AcousticSurface tag");
+        assert_eq!(s.fallback_materials, 0);
+        // The class split of the cathedral: glass panes are 6 instances, everything else 1 each.
+        assert_eq!(s.by_class[&AcousticClass::StainedGlass].instances, 6);
+        for class in [AcousticClass::Stone, AcousticClass::CarvedStone, AcousticClass::Paving, AcousticClass::Oak, AcousticClass::Bronze] {
+            assert!(s.by_class[&class].triangles > 0, "{class:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn extracted_scene_is_finite_valid_and_matches_the_expected_bounds() {
+        let (db, _built) = built();
+        let handles: HashMap<AcousticClass, u32> = AcousticClass::ALL.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+        let ex = acoustic_geometry::extract_acoustic_scene(&db.world, |c| handles[&c]);
+        for mesh in &ex.scene.meshes {
+            assert!(mesh.positions.iter().flatten().all(|v| v.is_finite()));
+            assert!(mesh.transform.iter().all(|v| v.is_finite()));
+            assert!(mesh.indices.len() % 3 == 0);
+            assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.positions.len()));
+            assert!(handles.values().any(|&h| h == mesh.material_handle));
+        }
+        // 145 x 45 x 43 m shell (outer walls +-22.95, end walls +-72.45, the oculus ring and
+        // rose-window tracery reach z = +-75.9 outside the end walls, vault top y = 43,
+        // paving slab underside y = -0.34).
+        let s = &ex.stats;
+        let size = s.aabb_size();
+        assert!((size[0] - 45.9).abs() < 0.1, "{size:?}");
+        assert!((size[1] - 43.34).abs() < 0.1, "{size:?}");
+        assert!(size[2] > 144.0 && size[2] < 160.0, "{size:?}");
+        // The camera start and every speaker are inside the AABB.
+        for p in std::iter::once(glam::Vec3::from_array(AUDIENCE)).chain(audio_demo::speaker_positions(AUDIENCE)) {
+            assert!((0..3).all(|i| p[i] > s.aabb_min[i] && p[i] < s.aabb_max[i]), "{p:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn cathedral_is_not_watertight_and_reports_it() {
+        let (_db, built) = built();
+        // Overlapping blocks, rods and single-sided panes: not a closed, consistently wound
+        // surface. The backend then uses the bounding-box volume for the late-reverb estimate and
+        // the closed-room (outside the building) shortcuts never apply.
+        assert!(!built.room_closed);
+        assert!(!built.watertight);
+        assert_eq!(built.reflection_planes, 32);
+        println!("room_is_closed = {}, planes = {}", built.room_closed, built.reflection_planes);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn dominant_surfaces_are_the_selected_reflection_planes_and_speakers_are_clear() {
+        let (db, built) = built();
+        let handles = built.class_handles.clone();
+        let ex = acoustic_geometry::extract_acoustic_scene(&db.world, |c| handles[&c]);
+        let tris = world_triangles(&ex);
+        let (planes, _) = dominant_planes(&tris, 32);
+        let has = |n: [f32; 3], d: f32, min_area: f32| {
+            planes.iter().any(|p| {
+                (0..3).all(|i| (p.normal[i] - n[i]).abs() < 1e-3) && (p.offset - d).abs() < 0.05 && p.area >= min_area
+            })
+        };
+        assert!(has([0.0, 1.0, 0.0], 0.0, 5000.0), "marble floor");
+        assert!(has([1.0, 0.0, 0.0], -22.05, 1000.0) && has([1.0, 0.0, 0.0], 22.05, 1000.0), "side walls");
+        assert!(has([0.0, 0.0, 1.0], -71.55, 1000.0) && has([0.0, 0.0, 1.0], 71.55, 1000.0), "end walls");
+        assert!(has([1.0, 0.0, 0.0], -9.15, 1000.0) && has([1.0, 0.0, 0.0], 9.15, 1000.0), "nave arcade walls");
+        assert!(has([0.0, 1.0, 0.0], 22.0, 1000.0), "aisle vault");
+        let backend = CpuSimdComputeBackend::new(ex.scene.clone(), audio_demo::tracer_config(SR));
+        for (i, sp) in audio_demo::speaker_positions(AUDIENCE).into_iter().enumerate() {
+            let clearance = tris.iter().map(|(t, _)| point_triangle_distance(sp, t[0], t[1], t[2])).fold(f32::MAX, f32::min);
+            assert!(clearance >= 0.3, "speaker {i} only {clearance} m from geometry");
+            let up = backend
+                .trace_ray(&Ray { origin: sp.to_array(), direction: [0.0, 1.0, 0.0], min_distance: 0.0, max_distance: f32::MAX });
+            assert!(up.first().map_or(false, |h| h.point[1] > 20.0), "speaker {i} is not under a vault");
+        }
     }
 }

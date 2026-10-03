@@ -41,9 +41,9 @@ pub const NUM_SPEAKERS: usize = 8;
 /// Where the stage speakers point and where the listener starts: the audience point, at ear (camera)
 /// height. The old demo's audience point was the origin of its 22 x 56 m hall; this is the same
 /// stage translated into the nave of the large cathedral, near the entrance end, looking down the
-/// nave toward the altar (-z). It is 14 m from the entrance wall (z = +72): with the old
+/// nave toward the altar (-z). It is 16 m from the entrance wall (z = +72): with the old
 /// +12 m rear speakers (BL / BR) a point nearer the wall would put them outside the building.
-pub const AUDIENCE: [f32; 3] = [0.0, 2.3, 58.0];
+pub const AUDIENCE: [f32; 3] = [0.0, 2.3, 56.0];
 
 /// Old stage speaker offsets from the old audience point, `[dx, dz]` (metres; -z is toward the
 /// altar). Device-channel order FL FR C Sub BL BR SL SR (see [`CHANNEL_MAP`]).
@@ -91,7 +91,10 @@ pub const DEMO_EARLY_DB: f32 = 0.0;
 /// Acoustic-proxy / tracer settings of this demo (see the README, "Geometry and materials").
 pub fn tracer_config(sample_rate: f32) -> CpuSimdConfig {
     CpuSimdConfig {
-        max_reflection_order: 3,
+        // Order 2: measured on the 415 k-triangle cathedral, order 3 with 32 mirror planes costs
+        // ~100 ms and ~300 k rays per update (8 emitters), order 2 about 10-14 ms and ~50-65 k rays.
+        // Third-order paths are far below the late field in a hall this size.
+        max_reflection_order: 2,
         diffuse_rays_per_query: 128,
         // The hall is 144 m long: a reflected path from a stage speaker to the far end is well over
         // the old demo's 60 m limit.
@@ -169,6 +172,8 @@ pub struct BuiltEngine {
     pub backend_build_ms: f64,
     pub reflection_planes: usize,
     pub room_closed: bool,
+    /// Every edge is shared by two triangles: inside / outside queries (and the closed-room shortcuts) work.
+    pub watertight: bool,
     /// Statistical late-field T60 per band of the backend at the audience point (source at the centre speaker).
     pub statistical_t60: Band8,
     /// Engine material handle of each acoustic class.
@@ -193,7 +198,12 @@ pub fn build_engine(
     // One acoustic material instance per class, registered BEFORE the backend so handles are valid.
     let mut handles: HashMap<AcousticClass, u32> = HashMap::new();
     for class in AcousticClass::ALL {
-        let (absorption, scattering, transmission) = class.bands();
+        let (absorption, scattering, mut transmission) = class.bands();
+        if std::env::var_os("QUASAR_OPAQUE").is_some() {
+            // Diagnostic: every surface fully opaque (the old demo shell's setting), to compare the
+            // inside level balance with and without the mapped transmission.
+            transmission = Band8::zeros();
+        }
         let handle = engine.materials().add_instance(AcousticMaterialInstance::new(
             TABULAR_MODEL_ID,
             Tabular8BandEvaluator::create_params(absorption, scattering, transmission),
@@ -211,6 +221,9 @@ pub fn build_engine(
     let backend_build_ms = t.elapsed().as_secs_f64() * 1e3;
     let reflection_planes = backend.reflection_plane_count();
     let room_closed = backend.room_is_closed();
+    // `room_side` answers `Outside` for a point far outside the bounding box only when the soup is
+    // watertight (every edge shared by two triangles); otherwise it is always `Unknown`.
+    let watertight = backend.room_side([1.0e6; 3]) == quasar_backends::cpu_simd::RoomSide::Outside;
     let debug_capture = backend.debug_capture();
 
     // The backend's own statistical late-field estimate for this geometry and these materials.
@@ -271,6 +284,7 @@ pub fn build_engine(
         backend_build_ms,
         reflection_planes,
         room_closed,
+        watertight,
         statistical_t60,
         class_handles: handles,
     }
@@ -342,6 +356,8 @@ impl StreamingPlayback {
 /// and the [`StreamingPlayback`] outright and shares only atomics with this side, so it never takes
 /// a lock the compute pass (which holds `engine`) could be holding.
 pub struct AudioEngine {
+    /// See `BuiltEngine::watertight`.
+    pub watertight: bool,
     pub debug_capture: Arc<AcousticDebugCapture>,
     /// Compute / configuration side (registries, ray tracing, command queue to the renderer).
     pub engine: Arc<Mutex<SpatialAudioEngine>>,
@@ -420,16 +436,18 @@ pub fn setup_audio_engine(world: &pulsar_scenedb::World) -> AudioEngine {
         tracer_config(sr),
     );
     eprintln!(
-        "[quasar] acoustic scene from SceneDB: {} | planes {} | closed {} | extract {:.1} ms, backend build {:.1} ms | probe grid {:?} @ {:?} m, T60 {:?}",
+        "[quasar] acoustic scene from SceneDB: {} | planes {} | closed {} | watertight {} | extract {:.1} ms, backend build {:.1} ms | probe grid {:?} @ {:?} m, T60 {:?}",
         built.scene_stats.summary(),
         built.reflection_planes,
         built.room_closed,
+        built.watertight,
         built.extract_ms,
         built.backend_build_ms,
         built.probe_grid.dims,
         built.probe_grid.spacing,
         built.probe_grid.t60.0,
     );
+    let built_watertight = built.watertight;
     let BuiltEngine { mut engine, debug_capture, source_id, outputs, listener_id, scene_stats, probe_grid, .. } = built;
 
     // Split the engine (#75): the audio callback takes the `AudioRenderer` (render state, triple
@@ -506,6 +524,7 @@ pub fn setup_audio_engine(world: &pulsar_scenedb::World) -> AudioEngine {
     stream.play().expect("play stream");
 
     AudioEngine {
+        watertight: built_watertight,
         debug_capture,
         engine,
         _stream: stream,

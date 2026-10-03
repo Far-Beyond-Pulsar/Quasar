@@ -27,8 +27,6 @@ use quasar_core::bands::Band8;
 use quasar_core::scene::{AcousticMesh, AcousticScene};
 use std::collections::HashMap;
 
-/// Octave-band centres of [`Band8`], Hz.
-pub const BAND_CENTRES_HZ: [f32; 8] = [62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0];
 
 /// Acoustic surface class of a material row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

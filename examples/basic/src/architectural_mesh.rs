@@ -1,4 +1,5 @@
 //! Shared procedural architecture primitives, batched by material.
+#![allow(dead_code)] // `ring` / `arch` are used by the other Helio cathedral examples
 use crate::v3_demo_common::box_mesh;
 use glam::Vec3;
 use helio::PackedVertex;

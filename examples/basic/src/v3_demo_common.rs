@@ -1,3 +1,4 @@
+#![allow(dead_code)] // copied helper set: only part of it is used by this example
 use glam::{Mat4, Vec3};
 use helio::{GpuLight, LightType, MeshUpload, PackedVertex, Renderer, RendererBuilder, RendererConfig, SceneDbHandle};
 use pulsar_scenedb::{Entity, World};
@@ -79,6 +80,8 @@ pub fn new_scene_db_with_gpu_mirror_and(
     helio_pass_volumetric_fog::GlobalFogComponent::register_gpu_columns_growable(&mut gpu_store, 4096, device);
     helio_pass_volumetric_fog::LocalFogVolumeComponent::register_gpu_columns_growable(&mut gpu_store, 4096, device);
     helio_pass_volumetric_fog::VolumetricFogSettingsComponent::register_gpu_columns_growable(&mut gpu_store, 4096, device);
+    // Billboards (speaker markers): registered up front like every other `#[gpu]` row type here.
+    helio_pass_billboard::BillboardComponent::register_gpu_columns_growable(&mut gpu_store, 256, device);
     register_extra(&mut gpu_store);
     let gpu_store = Arc::new(gpu_store);
     let mirror = pulsar_scenedb::gpu::GpuMirrorHandle::new(gpu_store, queue.clone());
