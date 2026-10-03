@@ -1,258 +1,552 @@
-// Real-time spatial audio ray tracing shader.
-// Each workgroup evaluates one source-listener pair.
-// Workgroup threads trace stochastic rays for acoustic parameter estimation.
+// Quasar WGPU compute shader: direct-path occlusion probes and image-source
+// early-reflection validation. One workgroup (64 threads) per source/listener
+// query, one dispatch for the whole batch.
+//
+// What runs where (see wgpu_compute.rs): this shader does the GEOMETRY (ray /
+// triangle work). It records raw geometric facts (which materials a probe ray
+// crosses and at what incidence cosine, the shortest detour length, validated
+// reflection paths with their bounce points). The MATERIAL-dependent arithmetic
+// (per-band transmission / absorption through the `MaterialProvider` trait object),
+// distance law, air absorption, diffraction blend, ranking and the statistical late
+// reverb are evaluated on the host with the same code the CPU backend uses.
+//
+// Geometry is a flat triangle list tested brute force: O(triangles) per ray (no BVH
+// on the GPU), fine for the small scenes a room model has, see the scaling note in
+// wgpu_compute.rs.
+//
+// ----------------------------------------------------------------------------
+// MEMORY LAYOUT. Every struct below is built only from 16-byte `vec4` fields and
+// scalar arrays in the `storage` address space, so there is NO implicit padding;
+// the Rust mirrors in wgpu_compute.rs are `repr(C)` and their sizes are asserted in
+// a unit test against the byte sizes written here:
+//   Params   416   Query 32   Tri 80   Plane 64   Edge 32
+//   Crossing 32    RayOut 288 (16 + 16 + 8*32 -> 16 header + 16 first + 256)
+//   Head 3776 (16 + 16 + 13*288)   Cand 224 (16 + 16 + 32 + 32 + 128)
+// ----------------------------------------------------------------------------
+
+const N_RAYS: u32 = 13u;        // = OCCLUSION_RAYS in cpu_simd.rs
+const MAX_CROSSINGS: u32 = 8u;  // = OCCLUSION_MAX_CROSSINGS
+const N_DETOUR: u32 = 8u;       // = OCCLUSION_DETOUR_DIRS
+const MAX_ORDER: u32 = 8u;      // = MAX_IMAGE_ORDER
+const NONE: u32 = 0xffffffffu;
 
 struct Params {
-    listener_pos: vec3<f32>,
-    source_pos: vec3<f32>,
-    _pad0: f32,
-    n_rays: u32,
-    max_bounces: u32,
-    num_meshes: u32,
-    num_indices: u32,
-    speed_of_sound: f32,
-    max_duration: f32,
-    _pad1: f32,
-    air_abs: array<f32, 8>,
-    sample_rate: f32,
-    _pad2: vec3<f32>,
-    seed: u32,
+    // x: queries in this dispatch, y: triangles, z: mirror planes, w: max reflection order
+    counts0: vec4<u32>,
+    // x: max candidate paths per query, y: bisection steps, z: max image nodes per thread
+    counts1: vec4<u32>,
+    // x: occlusion eps, y: detour min offset, z: detour max offset, w: detour margin
+    limits0: vec4<f32>,
+    // x: max reflection distance, y: edge fade width, z: plane side eps, w: plane box pad
+    limits1: vec4<f32>,
+    // x: barycentric slack of the triangle test
+    limits2: vec4<f32>,
+    // (r cos t, r sin t) offsets of the 13 occlusion targets in the (u, w) plane
+    disc: array<vec4<f32>, 13>,
+    // (cos phi, sin phi) of the 8 detour directions
+    detour: array<vec4<f32>, 8>,
 }
 
-struct Vertex {
-    pos: vec3<f32>,
-    _p: f32,
-    normal: vec3<f32>,
-    _p2: f32,
+struct Query {
+    source: vec4<f32>,   // w = 1 valid, 0 = non-finite input (skipped)
+    listener: vec4<f32>,
 }
 
-struct Mesh {
-    idx_off: u32,
-    idx_cnt: u32,
-    vert_off: u32,
-    mat_idx: u32,
-    xform: mat4x4<f32>,
+struct Tri {
+    a: vec4<f32>,
+    b: vec4<f32>,
+    c: vec4<f32>,
+    n: vec4<f32>,        // unit normal
+    mat: vec4<u32>,      // x = material handle
 }
 
-struct Material {
-    absorption: array<f32, 8>,
-    scattering: array<f32, 8>,
-    transmission: array<f32, 8>,
+struct Plane {
+    no: vec4<f32>,       // xyz = canonical unit normal, w = offset (n . p)
+    bmin: vec4<f32>,
+    bmax: vec4<f32>,
+    ranges: vec4<u32>,   // x: first plane_tris entry, y: count, z: first edge, w: count
 }
 
-struct RayHitResult {
-    distance: f32,
-    hit: u32,
-    _pad0: f32,
-    _pad1: f32,
-    material_idx: u32,
-    hit_point: vec3<f32>,
-    hit_normal: vec3<f32>,
+struct Edge {
+    a: vec4<f32>,
+    b: vec4<f32>,
 }
 
-struct SpatialOutput {
-    direct_distance: f32,
-    direct_occluded: u32,
-    _pad0: f32,
-    _pad1: f32,
-    direct_attenuation: array<f32, 8>,
-    late_t60: array<f32, 8>,
-    late_energy: f32,
-    _pad2: vec3<f32>,
+struct Crossing {
+    n_cos: vec4<f32>,    // xyz = triangle normal, w = dot(-dir, normal)
+    mat: vec4<u32>,      // x = material handle
+}
+
+struct RayOut {
+    count: vec4<u32>,    // x = surfaces crossed (MAX_CROSSINGS + 1 = more than that: opaque)
+    first: vec4<f32>,    // first hit point
+    cr: array<Crossing, 8>,
+}
+
+struct Head {
+    info: vec4<u32>,     // x = candidate paths found (may exceed the capacity)
+    delta: vec4<f32>,    // x = shortest detour extra path, < 0 = no detour / none needed
+    rays: array<RayOut, 13>,
+}
+
+struct Cand {
+    head: vec4<f32>,     // x = edge window, y = total path length
+    info: vec4<u32>,     // x = order (bounces)
+    seq: array<u32, 8>,  // plane of each bounce, source side first
+    tri: array<u32, 8>,  // triangle of each bounce
+    pts: array<vec4<f32>, 8>, // bounce points
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> verts: array<Vertex>;
-@group(0) @binding(2) var<storage, read> indices: array<u32>;
-@group(0) @binding(3) var<storage, read> meshes: array<Mesh>;
-@group(0) @binding(4) var<storage, read> mats: array<Material>;
-@group(0) @binding(5) var<storage, read_write> output: array<SpatialOutput>;
-@group(0) @binding(6) var<storage, read> ray_hits: array<RayHitResult>;
+@group(0) @binding(1) var<storage, read> queries: array<Query>;
+@group(0) @binding(2) var<storage, read> tris: array<Tri>;
+@group(0) @binding(3) var<storage, read> planes: array<Plane>;
+@group(0) @binding(4) var<storage, read> plane_tris: array<u32>;
+@group(0) @binding(5) var<storage, read> edges: array<Edge>;
+@group(0) @binding(6) var<storage, read_write> heads: array<Head>;
+@group(0) @binding(7) var<storage, read_write> cands: array<Cand>;
 
-var<private> rng_state: u32;
+var<workgroup> n_cand: atomic<u32>;
+var<workgroup> g_ref_valid: u32;
+var<workgroup> g_ref_tgt: vec3<f32>;
+var<workgroup> g_ref_hit: vec3<f32>;
+var<workgroup> g_det: array<f32, 8>;
 
-fn pcg() -> u32 {
-    rng_state = rng_state * 747796405u + 2891336453u;
-    let word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;
-    return (word >> 22u) ^ word;
+// Per-thread scratch of the image-source search.
+var<private> p_seq: array<u32, 8>;
+var<private> p_img: array<vec3<f32>, 9>;
+var<private> p_pts: array<vec3<f32>, 8>;
+var<private> p_tri: array<u32, 8>;
+var<private> p_next: array<u32, 8>;
+
+// ---------------------------------------------------------------- ray / triangle
+
+// Moller-Trumbore over [tmin, tmax], edge tolerant; mirrors Triangle::intersect_max.
+// Returns the hit distance or -1.
+fn tri_hit(i: u32, o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> f32 {
+    let t = tris[i];
+    let a = t.a.xyz;
+    let e1 = t.b.xyz - a;
+    let e2 = t.c.xyz - a;
+    let h = cross(d, e2);
+    let det = dot(e1, h);
+    let scale = sqrt(dot(e1, e1) * dot(e2, e2));
+    if !(abs(det) > 1e-9 * scale) {
+        return -1.0;
+    }
+    let inv_det = 1.0 / det;
+    let s = o - a;
+    let u = dot(s, h) * inv_det;
+    let eps = params.limits2.x;
+    if u < -eps || u > 1.0 + eps {
+        return -1.0;
+    }
+    let q = cross(s, e1);
+    let v = dot(d, q) * inv_det;
+    if v < -eps || u + v > 1.0 + eps {
+        return -1.0;
+    }
+    let hit_t = dot(e2, q) * inv_det;
+    if !(hit_t >= tmin && hit_t <= tmax) {
+        return -1.0;
+    }
+    return hit_t;
 }
 
-fn rf() -> f32 {
-    return f32(pcg()) / 4294967296.0;
-}
-
-fn uniform_sphere() -> vec3<f32> {
-    let theta = 6.2831853 * rf();
-    let phi = acos(2.0 * rf() - 1.0);
-    return vec3<f32>(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
-}
-
+// Closest hit: x = distance, y = bitcast triangle index (NONE = miss).
 struct Hit {
     t: f32,
-    normal: vec3<f32>,
-    mat_idx: u32,
-    hit: bool,
+    idx: u32,
 }
 
-fn scene_intersect(ro: vec3<f32>, rd: vec3<f32>) -> Hit {
-    var best_t: f32 = 1e10;
-    var best_normal: vec3<f32> = vec3<f32>(0.0);
-    var best_mat: u32 = 0u;
-    var did_hit: bool = false;
-
-    for (var mi: u32 = 0u; mi < params.num_meshes; mi = mi + 1u) {
-        let mesh = meshes[mi];
-        let idx_end = mesh.idx_off + mesh.idx_cnt;
-        var vi: u32 = mesh.idx_off;
-        while (vi + 2u < idx_end) {
-            let i0 = indices[vi];
-            let i1 = indices[vi + 1u];
-            let i2 = indices[vi + 2u];
-            let v0 = verts[mesh.vert_off + i0];
-            let v1 = verts[mesh.vert_off + i1];
-            let v2 = verts[mesh.vert_off + i2];
-
-            // Transform to world space via mesh.xform
-            let a = (mesh.xform * vec4<f32>(v0.pos, 1.0)).xyz;
-            let b = (mesh.xform * vec4<f32>(v1.pos, 1.0)).xyz;
-            let c = (mesh.xform * vec4<f32>(v2.pos, 1.0)).xyz;
-
-            // Möller-Trumbore
-            let e1 = b - a;
-            let e2 = c - a;
-            let h = cross(rd, e2);
-            let det = dot(e1, h);
-            if (abs(det) < 1e-12) {
-                vi = vi + 3u;
-                continue;
-            }
-            let inv_det = 1.0 / det;
-            let s = ro - a;
-            let u = dot(s, h) * inv_det;
-            if (u < 0.0 || u > 1.0) {
-                vi = vi + 3u;
-                continue;
-            }
-            let q = cross(s, e1);
-            let v = dot(rd, q) * inv_det;
-            if (v < 0.0 || u + v > 1.0) {
-                vi = vi + 3u;
-                continue;
-            }
-            let t = dot(e2, q) * inv_det;
-            if (t > 0.001 && t < best_t) {
-                best_t = t;
-                best_normal = normalize(cross(e1, e2));
-                best_mat = mesh.mat_idx;
-                did_hit = true;
-            }
-            vi = vi + 3u;
+fn closest_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Hit {
+    var best = tmax;
+    var idx = NONE;
+    for (var i = 0u; i < params.counts0.y; i++) {
+        let t = tri_hit(i, o, d, tmin, best);
+        if t >= 0.0 && (idx == NONE || t < best) {
+            best = t;
+            idx = i;
         }
     }
-
-    return Hit(best_t, best_normal, best_mat, did_hit);
+    return Hit(best, idx);
 }
 
-fn hemispherical_diffuse(n: vec3<f32>) -> vec3<f32> {
-    let u = rf();
-    let v = rf();
-    let theta = 2.0 * 3.14159265 * u;
-    let phi = acos(sqrt(v));
-    let local_dir = vec3<f32>(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
-
-    // Build tangent frame
-    let up = vec3<f32>(0.0, 1.0, 0.0);
-    let tangent = normalize(cross(up, n));
-    if (length(tangent) < 0.001) {
-        let right = vec3<f32>(1.0, 0.0, 0.0);
-        let tangent2 = normalize(cross(right, n));
-        let bitangent2 = cross(n, tangent2);
-        return local_dir.x * tangent2 + local_dir.y * n + local_dir.z * bitangent2;
+fn any_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> bool {
+    for (var i = 0u; i < params.counts0.y; i++) {
+        if tri_hit(i, o, d, tmin, tmax) >= 0.0 {
+            return true;
+        }
     }
-    let bitangent = cross(n, tangent);
-    return local_dir.x * tangent + local_dir.y * n + local_dir.z * bitangent;
+    return false;
 }
 
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let thread_idx = gid.x;
-    let num_workgroups = gid.y + 1u;
+// True if nothing lies between a and b; the ray starts `before` m before a and ends
+// `after` m past b. Mirrors CpuSimdComputeBackend::segment_clear_overshoot.
+fn segment_clear_overshoot(a: vec3<f32>, b: vec3<f32>, after: f32, before: f32) -> bool {
+    let eps = params.limits0.x;
+    let len = distance(a, b);
+    if len < 2.0 * eps {
+        return true;
+    }
+    let dir = normalize(b - a);
+    let origin = a - dir * before;
+    return !any_hit(origin, dir, eps, before + len + after - eps);
+}
 
-    // Seed RNG per thread
-    rng_state = params.seed + thread_idx * 6364136223846793005u;
+fn basis_u(axis: vec3<f32>) -> vec3<f32> {
+    var helper = vec3<f32>(0.0, 1.0, 0.0);
+    if abs(axis.y) >= 0.9 {
+        helper = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    return normalize(cross(axis, helper));
+}
 
-    let listener = params.listener_pos;
-    let source = params.source_pos;
+// ------------------------------------------------------------ direct-path probes
 
-    // Direct path check
-    let to_source = source - listener;
-    let dist = length(to_source);
-    let dir = normalize(to_source);
+fn occlusion_target(k: u32, src: vec3<f32>, u: vec3<f32>, w: vec3<f32>) -> vec3<f32> {
+    let off = params.disc[k];
+    return src + u * off.x + w * off.y;
+}
 
-    var direct_occluded: u32 = 0u;
-    let hit = scene_intersect(listener + dir * 0.01, dir);
+// Walk the segment from -> to and record every surface it crosses
+// (CpuSimdComputeBackend::segment_transmission).
+fn trace_probe(ray_index: u32, org: vec3<f32>, dst: vec3<f32>) {
+    let eps = params.limits0.x;
+    let total = distance(org, dst);
+    var count = 0u;
+    var first = vec3<f32>(0.0);
+    if total >= 2.0 * eps {
+        let dir = normalize(dst - org);
+        var origin = org;
+        var remaining = total;
+        loop {
+            if !(remaining > 2.0 * eps) {
+                break;
+            }
+            let h = closest_hit(origin, dir, eps, remaining - eps);
+            if h.idx == NONE {
+                break;
+            }
+            let point = origin + dir * h.t;
+            if count == 0u {
+                first = point;
+            }
+            count += 1u;
+            if count > MAX_CROSSINGS {
+                break;
+            }
+            let tri = tris[h.idx];
+            let c = clamp(dot(-dir, tri.n.xyz), -1.0, 1.0);
+            heads[ray_index / N_RAYS].rays[ray_index % N_RAYS].cr[count - 1u] =
+                Crossing(vec4<f32>(tri.n.xyz, c), vec4<u32>(tri.mat.x, 0u, 0u, 0u));
+            origin = point;
+            remaining -= h.t;
+        }
+    }
+    heads[ray_index / N_RAYS].rays[ray_index % N_RAYS].count = vec4<u32>(count, 0u, 0u, 0u);
+    heads[ray_index / N_RAYS].rays[ray_index % N_RAYS].first = vec4<f32>(first, 0.0);
+}
 
-    var direct_dist = dist;
-    if (hit.hit && hit.t < dist) {
-        direct_occluded = 1u;
+// Extra path |L-P| + |P-S| - |L-S| of the shortest one-point detour around the first
+// hit `h` in lateral direction `j` (exponential search then bisection), or -1.
+// Mirrors CpuSimdComputeBackend::detour_extra_path for one direction.
+fn detour_dir(j: u32, lis: vec3<f32>, tgt: vec3<f32>, h: vec3<f32>, u: vec3<f32>, w: vec3<f32>) -> f32 {
+    let margin = params.limits0.w;
+    let dcs = params.detour[j];
+    let dir = u * dcs.x + w * dcs.y;
+    let direct = distance(lis, tgt);
+    var lo = 0.0;
+    var hi = params.limits0.y;
+    var found = false;
+    loop {
+        if !(hi <= params.limits0.z) {
+            break;
+        }
+        let p = h + dir * hi;
+        if segment_clear_overshoot(lis, p, margin, 0.0) && segment_clear_overshoot(p, tgt, 0.0, margin) {
+            found = true;
+            break;
+        }
+        lo = hi;
+        hi = hi * 2.0;
+    }
+    if !found {
+        return -1.0;
+    }
+    for (var i = 0u; i < params.counts1.y; i++) {
+        let mid = 0.5 * (lo + hi);
+        let p = h + dir * mid;
+        if segment_clear_overshoot(lis, p, margin, 0.0) && segment_clear_overshoot(p, tgt, 0.0, margin) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let p = h + dir * hi;
+    return max(distance(lis, p) + distance(p, tgt) - direct, 0.0);
+}
+
+// ----------------------------------------------------- image-source reflections
+
+fn plane_sd(pi: u32, p: vec3<f32>) -> f32 {
+    let no = planes[pi].no;
+    return dot(no.xyz, p) - no.w;
+}
+
+fn plane_mirror(pi: u32, p: vec3<f32>) -> vec3<f32> {
+    let d = 2.0 * plane_sd(pi, p);
+    return p - d * planes[pi].no.xyz;
+}
+
+fn tri_contains(ti: u32, p: vec3<f32>) -> bool {
+    let t = tris[ti];
+    let v0 = t.c.xyz - t.a.xyz;
+    let v1 = t.b.xyz - t.a.xyz;
+    let v2 = p - t.a.xyz;
+    let d00 = dot(v0, v0);
+    let d01 = dot(v0, v1);
+    let d11 = dot(v1, v1);
+    let d20 = dot(v2, v0);
+    let d21 = dot(v2, v1);
+    let denom = d00 * d11 - d01 * d01;
+    if !(abs(denom) > 1e-20) {
+        return false;
+    }
+    let u = (d11 * d20 - d01 * d21) / denom;
+    let v = (d00 * d21 - d01 * d20) / denom;
+    let eps = params.limits2.x;
+    return u >= -eps && v >= -eps && u + v <= 1.0 + eps;
+}
+
+fn point_segment_distance(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    var t = 0.0;
+    if len2 > 1e-20 {
+        t = clamp(dot(p - a, ab) / len2, 0.0, 1.0);
+    }
+    return distance(p, a + ab * t);
+}
+
+// Triangle of plane `pi` containing the in-plane point p and the edge window; the
+// triangle is NONE when p is outside the surface. Mirrors locate_on_plane.
+struct Located {
+    tri: u32,
+    w: f32,
+}
+
+fn locate_on_plane(pi: u32, p: vec3<f32>) -> Located {
+    let pl = planes[pi];
+    let pad = params.limits1.w;
+    if any(p < pl.bmin.xyz - vec3<f32>(pad)) || any(p > pl.bmax.xyz + vec3<f32>(pad)) {
+        return Located(NONE, 0.0);
+    }
+    var found = NONE;
+    for (var i = 0u; i < pl.ranges.y; i++) {
+        let ti = plane_tris[pl.ranges.x + i];
+        if tri_contains(ti, p) {
+            found = ti;
+            break;
+        }
+    }
+    if found == NONE {
+        return Located(NONE, 0.0);
+    }
+    let fade = params.limits1.y;
+    if !(fade > 0.0) {
+        return Located(found, 1.0);
+    }
+    var dist = 3.0e38;
+    for (var e = 0u; e < pl.ranges.w; e++) {
+        let ed = edges[pl.ranges.z + e];
+        dist = min(dist, point_segment_distance(p, ed.a.xyz, ed.b.xyz));
+    }
+    let s = clamp(dist / fade, 0.0, 1.0);
+    return Located(found, s * s * (3.0 - 2.0 * s));
+}
+
+// Validate the plane sequence p_seq[0..n] (images p_img[0..=n]); append the path to
+// the candidate list when it is real. Mirrors validate_image_path up to the gain.
+fn validate_path(q: u32, n: u32, src: vec3<f32>, lis: vec3<f32>) {
+    let side_eps = params.limits1.z;
+    var prev = lis;
+    var edge_w = 1.0;
+    var k = n;
+    loop {
+        if k == 0u {
+            break;
+        }
+        let pi = p_seq[k - 1u];
+        let tgt = p_img[k];
+        let da = plane_sd(pi, prev);
+        let db = plane_sd(pi, tgt);
+        if !(da * db < 0.0) || abs(da) < side_eps || abs(db) < side_eps {
+            return;
+        }
+        let t = da / (da - db);
+        let b = prev + (tgt - prev) * t;
+        let loc = locate_on_plane(pi, b);
+        if loc.tri == NONE {
+            return;
+        }
+        p_pts[k - 1u] = b;
+        p_tri[k - 1u] = loc.tri;
+        edge_w *= loc.w;
+        prev = b;
+        k -= 1u;
     }
 
-    // Accumulate late reverb energy via stochastic rays
-    var total_energy: f32 = 0.0;
-    var hit_count: u32 = 0u;
-    var total_absorption: array<f32, 8>;
-    for (var b = 0u; b < 8u; b = b + 1u) {
-        total_absorption[b] = 0.0;
+    // Visibility of every segment L -> B_n -> .. -> B_1 -> S.
+    var total = 0.0;
+    var seg_a = lis;
+    k = n;
+    loop {
+        if k == 0u {
+            break;
+        }
+        let seg_b = p_pts[k - 1u];
+        if !segment_clear_overshoot(seg_a, seg_b, 0.0, 0.0) {
+            return;
+        }
+        total += distance(seg_a, seg_b);
+        seg_a = seg_b;
+        k -= 1u;
+    }
+    if !segment_clear_overshoot(seg_a, src, 0.0, 0.0) {
+        return;
+    }
+    total += distance(seg_a, src);
+    if !(total > 0.0 && total <= params.limits1.x) {
+        return;
     }
 
-    for (var i: u32 = 0u; i < params.n_rays; i = i + 1u) {
-        let rdir = uniform_sphere();
-        let hit2 = scene_intersect(listener + rdir * 0.01, rdir);
-        if (hit2.hit) {
-            hit_count = hit_count + 1u;
-            let refl_coeff = 1.0 - mats[hit2.mat_idx].absorption[0];
-            total_energy = total_energy + refl_coeff / (1.0 + hit2.t);
+    let slot = atomicAdd(&n_cand, 1u);
+    if slot < params.counts1.x {
+        let ci = q * params.counts1.x + slot;
+        cands[ci].head = vec4<f32>(edge_w, total, 0.0, 0.0);
+        cands[ci].info = vec4<u32>(n, 0u, 0u, 0u);
+        for (var j = 0u; j < n; j++) {
+            cands[ci].seq[j] = p_seq[j];
+            cands[ci].tri[j] = p_tri[j];
+            cands[ci].pts[j] = vec4<f32>(p_pts[j], 0.0);
+        }
+    }
+}
 
-            for (var b = 0u; b < 8u; b = b + 1u) {
-                total_absorption[b] = total_absorption[b] + mats[hit2.mat_idx].absorption[b];
+// Depth-first image-tree search of the subtree whose first bounce is `first_plane`
+// (iterative; same node order and pruning as expand_images).
+fn search_subtree(q: u32, first_plane: u32, src: vec3<f32>, lis: vec3<f32>) {
+    let n_planes = params.counts0.z;
+    let max_order = min(params.counts0.w, MAX_ORDER);
+    let node_cap = params.counts1.z;
+    p_img[0] = src;
+    var depth = 0u;
+    p_next[0] = first_plane;
+    var nodes = 0u;
+    loop {
+        var end = n_planes;
+        if depth == 0u {
+            end = first_plane + 1u;
+        }
+        let pi = p_next[depth];
+        if pi >= end {
+            if depth == 0u {
+                break;
+            }
+            depth -= 1u;
+            continue;
+        }
+        p_next[depth] = pi + 1u;
+        if nodes >= node_cap {
+            break;
+        }
+        if depth > 0u && p_seq[depth - 1u] == pi {
+            continue; // a plane cannot reflect twice in a row
+        }
+        if depth == 0u && abs(plane_sd(pi, src)) < params.limits1.z {
+            continue; // source lies on the surface
+        }
+        nodes += 1u;
+        p_seq[depth] = pi;
+        let img = plane_mirror(pi, p_img[depth]);
+        p_img[depth + 1u] = img;
+        let n = depth + 1u;
+        if distance(lis, img) <= params.limits1.x {
+            validate_path(q, n, src, lis);
+        }
+        if n < max_order {
+            depth = n;
+            p_next[depth] = 0u;
+        }
+    }
+}
+
+// ------------------------------------------------------------------------ main
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
+) {
+    let q = wg.x;
+    let query = queries[q];
+    let src = query.source.xyz;
+    let lis = query.listener.xyz;
+    let valid = query.source.w > 0.5;
+
+    let axis = normalize(src - lis);
+    let u = basis_u(axis);
+    let w = cross(axis, u);
+
+    // Phase 1: one occlusion probe per thread.
+    if valid && li < N_RAYS {
+        trace_probe(q * N_RAYS + li, lis, occlusion_target(li, src, u, w));
+    }
+    storageBarrier();
+    workgroupBarrier();
+
+    // Phase 2: the reference ray (first blocked probe in pattern order).
+    if li == 0u {
+        g_ref_valid = 0u;
+        if valid {
+            for (var k = 0u; k < N_RAYS; k++) {
+                if heads[q].rays[k].count.x > 0u {
+                    g_ref_valid = 1u;
+                    g_ref_tgt = occlusion_target(k, src, u, w);
+                    g_ref_hit = heads[q].rays[k].first.xyz;
+                    break;
+                }
             }
         }
     }
+    workgroupBarrier();
 
-    // Write result for this thread
-    var out: SpatialOutput;
-    out.direct_distance = direct_dist;
-    out.direct_occluded = direct_occluded;
-    out._pad0 = 0.0;
-    out._pad1 = 0.0;
-
-    // Same default law as quasar-core DistanceModel (inverse, 1 m reference,
-    // clamped at 1 m). The Rust side currently overrides this with its own model.
-    let air_atten = 1.0 / max(dist, 1.0);
-    for (var b = 0u; b < 8u; b = b + 1u) {
-        out.direct_attenuation[b] = air_atten;
-    }
-
-    var avg_abs: f32 = 0.0;
-    if (hit_count > 0u) {
-        for (var b = 0u; b < 8u; b = b + 1u) {
-            let avg = total_absorption[b] / f32(hit_count);
-            avg_abs = avg_abs + avg;
-            // STUB (#78): hard-coded room (V = 1000 m^3, S = 100 m^2), not the scene. The GPU path
-            // does not implement the statistical estimate of `CpuSimdComputeBackend` (mesh volume,
-            // random-incidence absorption, Eyring); it is a placeholder until it does.
-            let t60 = 0.161 * 1000.0 / (100.0 * max(avg, 0.01));
-            out.late_t60[b] = clamp(t60, 0.1, 10.0);
-        }
-        avg_abs = avg_abs / 8.0;
-    } else {
-        for (var b = 0u; b < 8u; b = b + 1u) {
-            out.late_t60[b] = 0.5;
+    // Phase 3: detour search, one lateral direction per thread.
+    if li < N_DETOUR {
+        g_det[li] = -1.0;
+        if g_ref_valid == 1u {
+            g_det[li] = detour_dir(li, lis, g_ref_tgt, g_ref_hit, u, w);
         }
     }
+    workgroupBarrier();
+    if li == 0u {
+        var best = -1.0;
+        for (var j = 0u; j < N_DETOUR; j++) {
+            let d = g_det[j];
+            if d >= 0.0 && (best < 0.0 || d < best) {
+                best = d;
+            }
+        }
+        heads[q].delta = vec4<f32>(best, 0.0, 0.0, 0.0);
+    }
 
-    out.late_energy = total_energy / (f32(params.n_rays) + 1.0);
-    out._pad2 = vec3<f32>(0.0);
-
-    output[thread_idx] = out;
+    // Phase 4: early reflections, one first-bounce plane per thread.
+    if valid && li < params.counts0.z {
+        search_subtree(q, li, src, lis);
+    }
+    workgroupBarrier();
+    if li == 0u {
+        heads[q].info = vec4<u32>(atomicLoad(&n_cand), 0u, 0u, 0u);
+    }
 }

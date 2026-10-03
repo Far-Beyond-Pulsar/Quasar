@@ -16,6 +16,8 @@ wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12", "
 [features]
 default = ["cpu-simd"]
 cpu-simd = ["rayon"]
-wgpu-compute = ["bytemuck", "wgpu"]
+# wgpu-compute reuses the CPU backend's scene preprocessing (mirror planes, room statistics) and
+# its shared occlusion / reflection / late-reverb code, hence the cpu-simd dependency.
+wgpu-compute = ["bytemuck", "wgpu", "cpu-simd"]
 
 [lib]

@@ -53,6 +53,7 @@ use quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
 
 use std::io::{self, BufRead};
 use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use winit::{
@@ -142,7 +143,6 @@ struct StreamingPlayback {
     channels: usize,
     read_pos: f64,
     rate_ratio: f64,
-    master_gain_db: f32,
 }
 
 impl StreamingPlayback {
@@ -177,7 +177,6 @@ impl StreamingPlayback {
             channels,
             read_pos: 0.0,
             rate_ratio: sample_rate as f64 / output_sample_rate as f64,
-            master_gain_db: 0.0,
         }
     }
 
@@ -188,11 +187,17 @@ impl StreamingPlayback {
     }
 }
 
+/// Handles the UI / compute thread keeps. The audio callback owns the [`quasar_audio::AudioRenderer`]
+/// and the [`StreamingPlayback`] outright and shares only atomics with this side, so it never
+/// takes a lock the compute pass (which holds `engine`) could be holding.
 struct AudioEngine {
+    /// Compute / configuration side (registries, ray tracing, command queue to the renderer).
     engine: Arc<Mutex<SpatialAudioEngine>>,
-    _state: Arc<Mutex<StreamingPlayback>>,
     _stream: cpal::Stream,
-    levels: Arc<Mutex<[f32; NUM_SPEAKERS]>>,
+    /// Master gain in dB (f32 bits), read by the callback each buffer.
+    master_gain_db: Arc<AtomicU32>,
+    /// Per-speaker RMS (f32 bits), written by the callback, read by the UI.
+    levels: Arc<[AtomicU32; NUM_SPEAKERS]>,
     source_id: SourceId,
     outputs: [SceneOutputId; NUM_SPEAKERS],
     listener_id: ListenerId,
@@ -361,14 +366,17 @@ fn setup_audio_engine() -> AudioEngine {
         physical_layout,
     });
 
+    // Split the engine (#75): the audio callback takes the `AudioRenderer` (render state, triple
+    // buffer readers, command-queue consumer) and the streaming playback state BY VALUE. Nothing
+    // the callback touches is behind a mutex that the UI / compute thread also takes: the compute
+    // pass (`update_scene_spatial`, ray tracing) holds only the `engine` mutex, and configuration
+    // reaches the renderer through the engine's lock-free command queue.
+    let mut renderer = engine.audio_handle();
     let engine = Arc::new(Mutex::new(engine));
 
-    playback.master_gain_db = 0.0;
-    let state = Arc::new(Mutex::new(playback));
-
-    let levels = Arc::new(Mutex::new([0.0_f32; NUM_SPEAKERS]));
-    let eng_cb = engine.clone();
-    let state_cb = state.clone();
+    let master_gain_db = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+    let levels: Arc<[AtomicU32; NUM_SPEAKERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
+    let master_cb = master_gain_db.clone();
     let levels_cb = levels.clone();
     let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
@@ -380,13 +388,9 @@ fn setup_audio_engine() -> AudioEngine {
             data.fill(0.0);
             if total_frames == 0 { return; }
 
-            let mut w = match state_cb.lock() {
-                Ok(guard) => guard,
-                Err(_) => return,
-            };
-            let nch = w.channels;
-            let ratio = w.rate_ratio;
-            let master_gain = 10.0_f32.powf(w.master_gain_db / 20.0);
+            let nch = playback.channels;
+            let ratio = playback.rate_ratio;
+            let master_gain = 10.0_f32.powf(f32::from_bits(master_cb.load(AtomicOrdering::Relaxed)) / 20.0);
             let mut remain = total_frames;
             let mut offset = 0;
 
@@ -397,28 +401,24 @@ fn setup_audio_engine() -> AudioEngine {
                 for k in 0..nch.min(NUM_SPEAKERS) {
                     let ch = src.channel_mut(k as u16);
                     for i in 0..block {
-                        let pos = w.read_pos + i as f64 * ratio;
+                        let pos = playback.read_pos + i as f64 * ratio;
                         let fa = pos.floor() as u64;
                         let fb = fa + 1;
                         let frac = (pos - fa as f64) as f32;
-                        ch[i] = w.source_sample(fa, k) + (w.source_sample(fb, k) - w.source_sample(fa, k)) * frac;
+                        ch[i] = playback.source_sample(fa, k) + (playback.source_sample(fb, k) - playback.source_sample(fa, k)) * frac;
                     }
                 }
-                if let Ok(mut lvls) = levels_cb.lock() {
-                    for k in 0..nch.min(NUM_SPEAKERS) {
-                        let ch = src.channel(k as u16);
-                        let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
-                        lvls[k] = (sum_sq / block as f32).sqrt();
-                    }
+                for k in 0..nch.min(NUM_SPEAKERS) {
+                    let ch = src.channel(k as u16);
+                    let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
+                    levels_cb[k].store((sum_sq / block as f32).sqrt().to_bits(), AtomicOrdering::Relaxed);
                 }
                 let source_frames = (block as f64 * ratio).ceil() as u64;
-                w.stream.advance_read(source_frames);
-                w.read_pos += block as f64 * ratio;
+                playback.stream.advance_read(source_frames);
+                playback.read_pos += block as f64 * ratio;
 
                 let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
-                if let Ok(mut e) = eng_cb.lock() {
-                    e.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
-                }
+                renderer.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
 
                 for i in 0..block {
                     let dst = offset + i;
@@ -435,7 +435,7 @@ fn setup_audio_engine() -> AudioEngine {
     ).expect("build output stream");
     stream.play().expect("play stream");
 
-    AudioEngine { engine, _state: state, _stream: stream, levels, source_id, outputs, listener_id }
+    AudioEngine { engine, _stream: stream, master_gain_db, levels, source_id, outputs, listener_id }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -1097,10 +1097,11 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if let Ok(mut engine) = state._audio_engine.engine.lock() {
-                    engine.debug_audio_stage = (engine.debug_audio_stage + 1) % 5;
+                    let stage = (engine.debug_audio_stage + 1) % 5;
+                    engine.set_debug_audio_stage(stage);
                     println!("[audio] dsp stage {}: {}",
-                        engine.debug_audio_stage,
-                        match engine.debug_audio_stage {
+                        stage,
+                        match stage {
                             0 => "silence",
                             1 => "raw pull only (reduce master vol with [!)",
                             2 => "+ occlusion",
@@ -1235,9 +1236,11 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Ok(mut w) = state._audio_engine._state.lock() {
-                    w.master_gain_db = (w.master_gain_db - 3.0).max(-60.0);
-                    println!("[audio] master gain = {} dB", w.master_gain_db);
+                {
+                    let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
+                    let db = (f32::from_bits(g) - 3.0).max(-60.0);
+                    state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+                    println!("[audio] master gain = {} dB", db);
                 }
             }
             WindowEvent::KeyboardInput {
@@ -1249,9 +1252,11 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Ok(mut w) = state._audio_engine._state.lock() {
-                    w.master_gain_db = (w.master_gain_db + 3.0).min(36.0);
-                    println!("[audio] master gain = {} dB", w.master_gain_db);
+                {
+                    let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
+                    let db = (f32::from_bits(g) + 3.0).min(36.0);
+                    state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+                    println!("[audio] master gain = {} dB", db);
                 }
             }
 
@@ -1457,7 +1462,8 @@ impl AppState {
         renderer.debug_cone((listener_pos + forward * 0.2).into(), forward.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
 
         // Billboard speaker icons at each speaker position, flash on audio activity
-        let src_levels = if let Ok(lvls) = self._audio_engine.levels.lock() { *lvls } else { [0.0; NUM_SPEAKERS] };
+        let src_levels: [f32; NUM_SPEAKERS] =
+            std::array::from_fn(|i| f32::from_bits(self._audio_engine.levels[i].load(AtomicOrdering::Relaxed)));
         let billboards: Vec<helio::BillboardInstance> = SPEAKER_POSITIONS.iter().enumerate().map(|(i, &pos)| {
             let lvl = src_levels[i];
             let active = lvl > 0.005;

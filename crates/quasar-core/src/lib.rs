@@ -11,6 +11,7 @@ pub mod distance;
 pub mod air;
 pub mod reverb_model;
 pub mod streaming_source;
+pub mod spsc;
 
 /// Nebula audio import bridge (optional, behind `nebula-import` feature).
 #[cfg(feature = "nebula-import")]

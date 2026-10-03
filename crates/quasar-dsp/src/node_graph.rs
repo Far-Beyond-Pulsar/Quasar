@@ -1,10 +1,40 @@
-use crate::audio_buffer::AudioBuffer;
+use crate::audio_buffer::{AudioBuffer, MAX_AUDIO_CHANNELS};
+use crate::crossfader::EqualPowerCrossfader;
+use quasar_core::param_exchange::SpatialCoefficients;
 
 pub trait AudioNode: Send {
     fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, params: &quasar_core::param_exchange::SpatialCoefficients);
     fn reset(&mut self);
     fn input_channels(&self) -> u16;
     fn output_channels(&self) -> u16;
+}
+
+/// Indexed read access to per-source [`SpatialCoefficients`], so a caller can lend its
+/// own storage (e.g. a crossfader bank) to [`AudioNodeGraph::process_with_params`] without
+/// cloning the coefficients into a temporary `Vec` on the audio thread (#79).
+pub trait ParamSource {
+    /// Number of sources that have parameters.
+    fn param_count(&self) -> usize;
+    /// Parameters of source `i`, or `None` if out of range.
+    fn params_at(&self, i: usize) -> Option<&SpatialCoefficients>;
+}
+
+impl ParamSource for [SpatialCoefficients] {
+    fn param_count(&self) -> usize {
+        self.len()
+    }
+    fn params_at(&self, i: usize) -> Option<&SpatialCoefficients> {
+        self.get(i)
+    }
+}
+
+impl ParamSource for [EqualPowerCrossfader] {
+    fn param_count(&self) -> usize {
+        self.len()
+    }
+    fn params_at(&self, i: usize) -> Option<&SpatialCoefficients> {
+        self.get(i).map(|c| c.current_coefficients())
+    }
 }
 
 /// A connection between two nodes in the graph.
@@ -23,6 +53,12 @@ pub struct AudioNodeGraph {
     nodes: Vec<Box<dyn AudioNode>>,
     connections: Vec<AudioConnection>,
     scratch: Vec<AudioBuffer>,
+    /// Per connection: staging buffer for the gain-scaled routed channel (preallocated at
+    /// config time so `process` never allocates; a ~32 KB `AudioBuffer` must not live on the stack).
+    temps: Vec<AudioBuffer>,
+    /// Per node: `true` if it has an outgoing connection (intermediate, not mixed to the output).
+    /// Maintained at config time.
+    has_outgoing: Vec<bool>,
 }
 
 impl AudioNodeGraph {
@@ -31,6 +67,28 @@ impl AudioNodeGraph {
             nodes: Vec::new(),
             connections: Vec::new(),
             scratch: Vec::new(),
+            temps: Vec::new(),
+            has_outgoing: Vec::new(),
+        }
+    }
+
+    /// Recompute the preallocated routing scratch (config time only; allocates).
+    fn rebuild_routing_scratch(&mut self) {
+        self.has_outgoing.clear();
+        self.has_outgoing.resize(self.nodes.len(), false);
+        for conn in &self.connections {
+            if let Some(f) = self.has_outgoing.get_mut(conn.from_node) {
+                *f = true;
+            }
+        }
+        self.temps.clear();
+        for conn in &self.connections {
+            let (ch, n) = self
+                .scratch
+                .get(conn.from_node)
+                .map(|s| (s.channels(), s.samples()))
+                .unwrap_or((2, 256));
+            self.temps.push(AudioBuffer::new(ch, n));
         }
     }
 
@@ -44,6 +102,7 @@ impl AudioNodeGraph {
         } else {
             self.scratch.push(AudioBuffer::new(2, 256));
         }
+        self.rebuild_routing_scratch();
         idx
     }
 
@@ -70,6 +129,7 @@ impl AudioNodeGraph {
             gain,
             source_id,
         });
+        self.rebuild_routing_scratch();
     }
 
     /// Connect with unity gain.
@@ -80,6 +140,7 @@ impl AudioNodeGraph {
     /// Remove all connections from a node.
     pub fn disconnect_node(&mut self, node: usize) {
         self.connections.retain(|c| c.from_node != node && c.to_node != node);
+        self.rebuild_routing_scratch();
     }
 
     /// Process the entire graph.
@@ -87,78 +148,82 @@ impl AudioNodeGraph {
     /// `inputs`: one `AudioBuffer` per source being rendered.
     /// `params`: one `SpatialCoefficients` per source.
     /// `output`: the final mixed output buffer.
+    ///
+    /// Never allocates (all scratch is preallocated by `add_node` / `connect*`).
     pub fn process(
         &mut self,
         inputs: &[&AudioBuffer],
-        params: &[quasar_core::param_exchange::SpatialCoefficients],
+        params: &[SpatialCoefficients],
+        output: &mut AudioBuffer,
+    ) {
+        self.process_with_params(inputs, params, output);
+    }
+
+    /// Like [`process`](Self::process) but reads the per-source parameters through a
+    /// [`ParamSource`] (e.g. a `[EqualPowerCrossfader]`) instead of a slice of owned values.
+    /// Sources/connections whose parameters are missing are skipped. Never allocates.
+    pub fn process_with_params<P: ParamSource + ?Sized>(
+        &mut self,
+        inputs: &[&AudioBuffer],
+        params: &P,
         output: &mut AudioBuffer,
     ) {
         output.clear();
 
-        let num_sources = inputs.len().min(self.nodes.len());
+        let num_sources = inputs.len().min(self.nodes.len()).min(params.param_count());
 
         // Phase 1: process each source node with its input and params
         for src_idx in 0..num_sources {
-            let input = inputs[src_idx];
-            let param = &params[src_idx];
+            let Some(param) = params.params_at(src_idx) else { continue };
             let node = &mut *self.nodes[src_idx];
             let scratch = &mut self.scratch[src_idx];
-            node.process(input, scratch, param);
+            node.process(inputs[src_idx], scratch, param);
         }
 
         // Phase 2: route connections using per-source params
-        let num_connections = self.connections.len();
-        if num_connections > 0 {
-            for conn_idx in 0..num_connections {
-                let conn = &self.connections[conn_idx];
-                if conn.from_node < self.nodes.len() && conn.to_node < self.nodes.len() {
-                    let from_idx = conn.from_node;
-                    let to_idx = conn.to_node;
-                    let from_ch = conn.from_channel as usize;
-                    let to_ch = conn.to_channel as usize;
-                    let gain = conn.gain;
+        for conn_idx in 0..self.connections.len() {
+            let conn = &self.connections[conn_idx];
+            if conn.from_node >= self.nodes.len() || conn.to_node >= self.nodes.len() {
+                continue;
+            }
+            let from_idx = conn.from_node;
+            let to_idx = conn.to_node;
+            let from_ch = conn.from_channel as usize;
+            let to_ch = conn.to_channel as usize;
+            let gain = conn.gain;
 
-                    // Use the connection's source_id to pick the right params
-                    let conn_params = if conn.source_id < params.len() {
-                        &params[conn.source_id]
-                    } else {
-                        &params[0]
-                    };
+            // Use the connection's source_id to pick the right params (fall back to source 0).
+            let Some(conn_params) = params.params_at(conn.source_id).or_else(|| params.params_at(0)) else {
+                continue;
+            };
 
-                    let src_scratch = &self.scratch[from_idx];
-
-                    let mut temp = AudioBuffer::new(src_scratch.channels(), src_scratch.samples());
-                    if from_ch < src_scratch.channels() as usize {
-                        let src_ch_data = src_scratch.channel(from_ch as u16);
-                        let dst_ch = temp.channel_mut(to_ch as u16);
-                        let len = dst_ch.len().min(src_ch_data.len());
-                        for i in 0..len {
-                            dst_ch[i] = src_ch_data[i] * gain;
-                        }
-                    }
-
-                    let node = &mut *self.nodes[to_idx];
-                    let dst_scratch = &mut self.scratch[to_idx];
-                    node.process(&temp, dst_scratch, conn_params);
+            let src_scratch = &self.scratch[from_idx];
+            let Some(temp) = self.temps.get_mut(conn_idx) else { continue };
+            temp.clear();
+            if from_ch < src_scratch.channels() as usize && to_ch < MAX_AUDIO_CHANNELS {
+                let src_ch_data = src_scratch.channel(from_ch as u16);
+                let dst_ch = temp.channel_mut(to_ch as u16);
+                let len = dst_ch.len().min(src_ch_data.len());
+                for i in 0..len {
+                    dst_ch[i] = src_ch_data[i] * gain;
                 }
             }
+
+            let node = &mut *self.nodes[to_idx];
+            let dst_scratch = &mut self.scratch[to_idx];
+            node.process(temp, dst_scratch, conn_params);
         }
 
         // Phase 3: sum only leaf nodes (nodes with no outgoing connections)
         // into output. Intermediate buffers (occlusion, reverb) are not output.
-        let mut is_source = vec![false; self.nodes.len()];
-        for conn in &self.connections {
-            if conn.from_node < is_source.len() {
-                is_source[conn.from_node] = true; // has outgoing connection
-            }
-        }
         for ch in 0..output.channels() as usize {
             let out_ch = output.channel_mut(ch as u16);
             for src_idx in 0..self.scratch.len() {
-                if is_source[src_idx] { continue; } // skip intermediate nodes
+                if self.has_outgoing.get(src_idx).copied().unwrap_or(false) {
+                    continue; // skip intermediate nodes
+                }
                 let sc = &self.scratch[src_idx];
-                let src_chs = sc.channels() as usize;
-                if ch < src_chs {
+                if ch < sc.channels() as usize {
                     let src_slice = sc.channel(ch as u16);
                     let len = out_ch.len().min(src_slice.len());
                     for i in 0..len {

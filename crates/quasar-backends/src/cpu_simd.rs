@@ -86,24 +86,24 @@ impl Default for CpuSimdConfig {
 
 /// Rays per occlusion query: the source centre plus 12 points of a golden-angle
 /// sunflower on a disc around the source (deterministic, no RNG).
-const OCCLUSION_RAYS: usize = 13;
+pub(crate) const OCCLUSION_RAYS: usize = 13;
 /// Radius (m) of the disc of target points around the source (its apparent size).
-const OCCLUSION_SOURCE_RADIUS: f32 = 0.35;
+pub(crate) const OCCLUSION_SOURCE_RADIUS: f32 = 0.35;
 /// Golden angle (rad) between consecutive sunflower points.
-const GOLDEN_ANGLE: f32 = 2.399_963_2;
+pub(crate) const GOLDEN_ANGLE: f32 = 2.399_963_2;
 /// Surfaces crossed by one ray beyond this count as opaque.
-const OCCLUSION_MAX_CROSSINGS: usize = 8;
+pub(crate) const OCCLUSION_MAX_CROSSINGS: usize = 8;
 /// Epsilon (m) kept clear at both ends of every occlusion segment and after each crossing.
-const OCCLUSION_EPS: f32 = 1e-3;
+pub(crate) const OCCLUSION_EPS: f32 = 1e-3;
 /// Lateral directions probed when looking for the shortest detour around an occluder.
-const OCCLUSION_DETOUR_DIRS: usize = 8;
+pub(crate) const OCCLUSION_DETOUR_DIRS: usize = 8;
 /// First / last lateral offset (m) of the exponential detour search.
-const OCCLUSION_DETOUR_MIN_OFFSET: f32 = 0.05;
-const OCCLUSION_DETOUR_MAX_OFFSET: f32 = 26.0;
+pub(crate) const OCCLUSION_DETOUR_MIN_OFFSET: f32 = 0.05;
+pub(crate) const OCCLUSION_DETOUR_MAX_OFFSET: f32 = 26.0;
 /// Bisection refinements of the detour offset (resolution about offset / 32).
-const OCCLUSION_BISECT_STEPS: usize = 5;
+pub(crate) const OCCLUSION_BISECT_STEPS: usize = 5;
 /// How far (m) a detour leg is extended past the detour point when checking it.
-const OCCLUSION_DETOUR_MARGIN: f32 = 0.02;
+pub(crate) const OCCLUSION_DETOUR_MARGIN: f32 = 0.02;
 /// Cap of the single-edge diffraction attenuation (dB).
 const OCCLUSION_MAX_DIFFRACTION_DB: f32 = 30.0;
 /// Lowest per-band occlusion amplitude (-80 dB): a fully blocked path is attenuated, not NaN/zero.
@@ -117,7 +117,7 @@ struct OcclusionResult {
     occluded: bool,
 }
 /// Barycentric slack of the ray-triangle test (watertightness across shared edges).
-const BARY_EPS: f32 = 1e-5;
+pub(crate) const BARY_EPS: f32 = 1e-5;
 /// Relative padding of BVH boxes (a few ULPs), so flat boxes and grazing rays are kept.
 const AABB_PAD: f32 = 1e-6;
 
@@ -125,9 +125,9 @@ const AABB_PAD: f32 = 1e-6;
 
 /// Axis-aligned bounding box.
 #[derive(Clone, Copy, Debug)]
-struct Aabb {
-    min: [f32; 3],
-    max: [f32; 3],
+pub(crate) struct Aabb {
+    pub(crate) min: [f32; 3],
+    pub(crate) max: [f32; 3],
 }
 
 impl Aabb {
@@ -207,12 +207,12 @@ impl Aabb {
 
 /// A single triangle for intersection testing.
 #[derive(Clone, Debug)]
-struct Triangle {
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    normal: [f32; 3],
-    material_handle: u32,
+pub(crate) struct Triangle {
+    pub(crate) a: [f32; 3],
+    pub(crate) b: [f32; 3],
+    pub(crate) c: [f32; 3],
+    pub(crate) normal: [f32; 3],
+    pub(crate) material_handle: u32,
     #[allow(dead_code)]
     mesh_id: u64,
 }
@@ -259,7 +259,7 @@ impl Triangle {
     /// are rejected relative to the triangle size (`|det| <= 1e-9 |e1| |e2|`),
     /// not by an absolute f32 threshold, so glancing hits on large triangles
     /// survive.
-    fn intersect_max(&self, ray: &Ray, t_max: f32) -> Option<f32> {
+    pub(crate) fn intersect_max(&self, ray: &Ray, t_max: f32) -> Option<f32> {
         let edge1 = sub3(self.b, self.a);
         let edge2 = sub3(self.c, self.a);
         let h = cross3(ray.direction, edge2);
@@ -314,7 +314,7 @@ impl Triangle {
         ]
     }
 
-    fn aabb(&self) -> Aabb {
+    pub(crate) fn aabb(&self) -> Aabb {
         Aabb::from_points(&[self.a, self.b, self.c])
     }
 }
@@ -494,40 +494,74 @@ impl BvhNode {
     }
 }
 
+/// Final stage of the direct-path occlusion, shared with the GPU backend: from the
+/// number of `visible` / `blocked` probe rays (of [`OCCLUSION_RAYS`]), the summed
+/// squared per-band transmission `t2_sum` of the blocked rays and the shortest
+/// detour path difference `delta` (`None` = no detour found), compute the
+/// Kurze-Anderson diffraction amplitude and the dB blend with the visibility
+/// (see `compute_occlusion`). `blocked` must be non-zero.
+pub(crate) fn combine_occlusion(
+    visible: usize,
+    blocked: usize,
+    t2_sum: &[f32; 8],
+    delta: Option<f32>,
+    speed_of_sound: f32,
+) -> Band8 {
+    let mut diffraction = [0.0_f32; 8];
+    if let Some(delta) = delta {
+        for b in 0..8 {
+            let f = quasar_core::bands::FREQ_BAND_CENTRES[b];
+            let n = 2.0 * delta * f / speed_of_sound;
+            let x = (2.0 * std::f32::consts::PI * n).sqrt();
+            let ratio = if x < 1e-3 { 1.0 } else { x / x.tanh() };
+            let a_db = (5.0 + 20.0 * ratio.log10()).min(OCCLUSION_MAX_DIFFRACTION_DB);
+            diffraction[b] = 10.0_f32.powf(-a_db / 20.0);
+        }
+    }
+    let v = visible as f32 / OCCLUSION_RAYS as f32;
+    let mut bands = Band8::splat(1.0);
+    for b in 0..8 {
+        let t2 = t2_sum[b] / blocked as f32;
+        let shadow = (t2 + diffraction[b] * diffraction[b]).sqrt().clamp(OCCLUSION_FLOOR, 1.0);
+        bands.0[b] = shadow.powf(1.0 - v);
+    }
+    bands
+}
+
 // ── Mirror planes (image-source early reflections) ────────────────────
 
 /// Maximum specular order the image-source tracer supports (fixed-size stack arrays).
-const MAX_IMAGE_ORDER: usize = 8;
+pub(crate) const MAX_IMAGE_ORDER: usize = 8;
 /// Largest number of image-tree nodes expanded per query; beyond it the search
 /// stops (deterministically, in depth-first order) and the strongest paths found
 /// so far are returned.
-const MAX_IMAGE_NODES: usize = 250_000;
+pub(crate) const MAX_IMAGE_NODES: usize = 250_000;
 /// Triangles whose unit normals have a dot product above this (about 0.36 deg) and
 /// whose plane offsets differ by less than [`PLANE_OFFSET_TOL`] share one mirror plane.
 const PLANE_NORMAL_COS: f32 = 0.99998;
 const PLANE_OFFSET_TOL: f32 = 2e-3;
 /// A point closer than this (m) to a mirror plane counts as lying on it (no reflection).
-const PLANE_SIDE_EPS: f32 = 1e-4;
+pub(crate) const PLANE_SIDE_EPS: f32 = 1e-4;
 /// Padding (m) of a plane's bounding box when locating a bounce point.
-const PLANE_BOX_PAD: f32 = 2e-3;
+pub(crate) const PLANE_BOX_PAD: f32 = 2e-3;
 /// Hard cap on the number of image paths returned by one query.
-const MAX_REFLECTION_PATHS: usize = 64;
+pub(crate) const MAX_REFLECTION_PATHS: usize = 64;
 
 /// A candidate mirror plane: every triangle (of any mesh) lying in one plane.
 ///
 /// The normal is canonical (its largest component is positive), so triangles of
 /// opposite winding fall in the same plane.
-struct ReflectPlane {
-    normal: [f32; 3],
+pub(crate) struct ReflectPlane {
+    pub(crate) normal: [f32; 3],
     /// `normal . p` for any point `p` of the plane.
-    offset: f32,
-    area: f32,
-    aabb: Aabb,
+    pub(crate) offset: f32,
+    pub(crate) area: f32,
+    pub(crate) aabb: Aabb,
     /// Indices into the backend's flat triangle list.
-    tris: Vec<usize>,
+    pub(crate) tris: Vec<usize>,
     /// Edges used by exactly one triangle of the plane: its outer border (and
     /// the border of any hole), the places the reflecting surface ends.
-    boundary: Vec<([f32; 3], [f32; 3])>,
+    pub(crate) boundary: Vec<([f32; 3], [f32; 3])>,
 }
 
 impl ReflectPlane {
@@ -561,9 +595,9 @@ struct ImageSearch {
 }
 
 /// A validated path with the energy used to rank it.
-struct PathCandidate {
-    energy: f32,
-    refl: EarlyReflection,
+pub(crate) struct PathCandidate {
+    pub(crate) energy: f32,
+    pub(crate) refl: EarlyReflection,
 }
 
 /// Distance from `p` to the segment `a b`.
@@ -577,7 +611,7 @@ fn point_segment_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
 /// Group `triangles` into deduplicated mirror planes, keep the `max_planes`
 /// largest (by total area; ties keep the lower index) and compute their borders.
 /// Deterministic; runs when the scene is (re)built, not per query.
-fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<ReflectPlane> {
+pub(crate) fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<ReflectPlane> {
     use std::collections::HashMap;
 
     let mut planes: Vec<ReflectPlane> = Vec::new();
@@ -659,6 +693,102 @@ fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<ReflectPlane> 
     planes
 }
 
+/// Gain stage of one validated image path, shared with the GPU backend (which finds
+/// and validates the geometry on the device and calls this on the host with the
+/// bounce data): the reflection coefficient per band (product over the bounces of
+/// `sqrt(1 - alpha)` at each bounce's incidence angle), the shared distance law and
+/// air absorption over the TOTAL path length, and the edge window `edge_w`.
+///
+/// `seq[k]` is the plane index of bounce `k` (source side first), `tri_of[k]` the
+/// triangle it lies on, `pts[k]` the bounce point; `total` the full path length.
+/// `None` when the path carries no energy.
+pub(crate) fn path_candidate(
+    cfg: &CpuSimdConfig,
+    distance_model: &DistanceModel,
+    planes: &[ReflectPlane],
+    triangles: &[Triangle],
+    seq: &[usize],
+    tri_of: &[usize],
+    pts: &[[f32; 3]],
+    source: [f32; 3],
+    listener: [f32; 3],
+    total: f32,
+    edge_w: f32,
+    materials: &dyn MaterialProvider,
+) -> Option<PathCandidate> {
+    let n = seq.len();
+    // Reflection coefficient per band: product over the bounces.
+    let mut refl = Band8::splat(1.0);
+    let mut before = source;
+    for k in 0..n {
+        let plane = &planes[seq[k]];
+        let tri = &triangles[tri_of[k]];
+        let dir = normalize3(sub3(pts[k], before));
+        let cos_i = dot3(dir, plane.normal).abs().clamp(0.0, 1.0);
+        let ctx = RayInteractionContext {
+            surface_normal: plane.normal,
+            ray_direction: dir,
+            incident_angle_rad: cos_i.acos(),
+            temperature_celsius: cfg.temperature_celsius,
+            humidity_percent: cfg.humidity_percent,
+        };
+        let absorption = materials.evaluate_material(tri.material_handle, &ctx);
+        for b in 0..8 {
+            let a = absorption.0[b];
+            let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
+            refl.0[b] *= (1.0 - a).sqrt();
+        }
+        before = pts[k];
+    }
+
+    // Full path attenuation (distance law x air absorption over the TOTAL length).
+    let path = Band8::splat(distance_model.gain(total)).mul(&quasar_core::air::air_absorption_gain(
+        total,
+        cfg.temperature_celsius,
+        cfg.humidity_percent,
+    ));
+    let gain = refl.mul(&path).scale(edge_w);
+    let energy: f32 = gain.0.iter().map(|g| g * g).sum();
+    if !(energy > 1e-14) {
+        return None;
+    }
+    Some(PathCandidate {
+        energy,
+        refl: EarlyReflection {
+            direction: normalize3(sub3(pts[n - 1], listener)),
+            delay_samples: total * cfg.sample_rate / cfg.speed_of_sound,
+            gain,
+            order: n as u32,
+        },
+    })
+}
+
+/// Rank validated paths and keep the strongest `max_reflections`: strongest first
+/// (energy, then order, then delay: a total order, deterministic), near-identical
+/// paths merged (same order, length and direction; the strongest is kept).
+pub(crate) fn rank_reflections(mut found: Vec<PathCandidate>, cfg: &CpuSimdConfig) -> Vec<EarlyReflection> {
+    found.sort_by(|a, b| {
+        b.energy
+            .partial_cmp(&a.energy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.refl.order.cmp(&b.refl.order))
+            .then(a.refl.delay_samples.partial_cmp(&b.refl.delay_samples).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut out: Vec<EarlyReflection> = Vec::new();
+    for c in found {
+        let dup = out.iter().any(|o| {
+            o.order == c.refl.order
+                && (o.delay_samples - c.refl.delay_samples).abs() * cfg.speed_of_sound / cfg.sample_rate < 1e-3
+                && dot3(o.direction, c.refl.direction) > 1.0 - 1e-6
+        });
+        if !dup {
+            out.push(c.refl);
+        }
+    }
+    out.truncate(cfg.max_reflections.min(MAX_REFLECTION_PATHS));
+    out
+}
+
 // ── Room statistics (late-reverb estimate) ────────────────────────────
 
 /// Midpoint angles of the random-incidence (Paris) integration.
@@ -666,19 +796,19 @@ const PARIS_ANGLES: usize = 16;
 
 /// Scene statistics for the statistical late-field estimate, computed once when the
 /// scene is built.
-struct RoomStats {
+pub(crate) struct RoomStats {
     /// Room volume (m^3).
-    volume: f32,
+    pub(crate) volume: f32,
     /// Total surface area (m^2) and its split per material handle (sorted by handle).
-    area: f32,
-    by_material: Vec<(u32, f32)>,
+    pub(crate) area: f32,
+    pub(crate) by_material: Vec<(u32, f32)>,
     /// Bounding box of the scene.
-    min: [f32; 3],
-    max: [f32; 3],
+    pub(crate) min: [f32; 3],
+    pub(crate) max: [f32; 3],
 }
 
 impl RoomStats {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self { volume: 0.0, area: 0.0, by_material: Vec::new(), min: [0.0; 3], max: [0.0; 3] }
     }
 
@@ -692,7 +822,7 @@ impl RoomStats {
     /// its reverse); the net `|sum|` is then the cavity minus any closed solids (columns
     /// wound outward, the room shell wound inward). Otherwise the bounding-box VOLUME
     /// (a warning is printed: the figure is only right for box-like rooms).
-    fn build(triangles: &[Triangle]) -> Self {
+    pub(crate) fn build(triangles: &[Triangle]) -> Self {
         use std::collections::{BTreeMap, HashMap};
         if triangles.is_empty() {
             return Self::empty();
@@ -757,17 +887,17 @@ fn random_incidence_absorption(materials: &dyn MaterialProvider, handle: u32, cf
 // ── Vec3 helpers ──────────────────────────────────────────────────────
 
 #[inline]
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+pub(crate) fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 #[inline]
-fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
 #[inline]
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -776,7 +906,7 @@ fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 #[inline]
-fn normalize3(v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if len > 1e-12 {
         [v[0] / len, v[1] / len, v[2] / len]
@@ -786,7 +916,7 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 }
 
 #[inline]
-fn distance3(a: [f32; 3], b: [f32; 3]) -> f32 {
+pub(crate) fn distance3(a: [f32; 3], b: [f32; 3]) -> f32 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
@@ -839,7 +969,7 @@ impl CpuSimdComputeBackend {
         self.planes.len()
     }
 
-    fn triangles_from_scene(scene: &AcousticScene) -> Vec<Triangle> {
+    pub(crate) fn triangles_from_scene(scene: &AcousticScene) -> Vec<Triangle> {
         let mut tris = Vec::new();
         for mesh in &scene.meshes {
             for chunk in mesh.indices.chunks_exact(3) {
@@ -1133,27 +1263,8 @@ impl CpuSimdComputeBackend {
         }
 
         // Diffraction amplitude per band for the blocked rays.
-        let mut diffraction = [0.0_f32; 8];
-        if let Some((target, h)) = reference {
-            if let Some(delta) = self.detour_extra_path(*listener, target, h, u, w) {
-                for b in 0..8 {
-                    let f = quasar_core::bands::FREQ_BAND_CENTRES[b];
-                    let n = 2.0 * delta * f / self.config.speed_of_sound;
-                    let x = (2.0 * std::f32::consts::PI * n).sqrt();
-                    let ratio = if x < 1e-3 { 1.0 } else { x / x.tanh() };
-                    let a_db = (5.0 + 20.0 * ratio.log10()).min(OCCLUSION_MAX_DIFFRACTION_DB);
-                    diffraction[b] = 10.0_f32.powf(-a_db / 20.0);
-                }
-            }
-        }
-
-        let v = visible as f32 / OCCLUSION_RAYS as f32;
-        let mut bands = Band8::splat(1.0);
-        for b in 0..8 {
-            let t2 = t2_sum[b] / blocked as f32;
-            let shadow = (t2 + diffraction[b] * diffraction[b]).sqrt().clamp(OCCLUSION_FLOOR, 1.0);
-            bands.0[b] = shadow.powf(1.0 - v);
-        }
+        let delta = reference.and_then(|(target, h)| self.detour_extra_path(*listener, target, h, u, w));
+        let bands = combine_occlusion(visible, blocked, &t2_sum, delta, self.config.speed_of_sound);
         OcclusionResult { bands, occluded: true }
     }
 
@@ -1228,30 +1339,7 @@ impl CpuSimdComputeBackend {
         };
         st.images[0] = *source;
         self.expand_images(&mut st, 0, materials);
-        let mut found = st.found;
-
-        // Strongest first; ties by order, then delay (total order: deterministic).
-        found.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.refl.order.cmp(&b.refl.order))
-                .then(a.refl.delay_samples.partial_cmp(&b.refl.delay_samples).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        // Merge near-identical paths (keep the first = strongest).
-        let mut out: Vec<EarlyReflection> = Vec::new();
-        for c in found {
-            let dup = out.iter().any(|o| {
-                o.order == c.refl.order
-                    && (o.delay_samples - c.refl.delay_samples).abs() * self.config.speed_of_sound / self.config.sample_rate < 1e-3
-                    && dot3(o.direction, c.refl.direction) > 1.0 - 1e-6
-            });
-            if !dup {
-                out.push(c.refl);
-            }
-        }
-        out.truncate(self.config.max_reflections.min(MAX_REFLECTION_PATHS));
-        out
+        rank_reflections(st.found, &self.config)
     }
 
     /// Depth-first image-tree expansion: node at `depth` holds `images[0..=depth]`
@@ -1339,51 +1427,21 @@ impl CpuSimdComputeBackend {
         if !(total.is_finite() && total > 0.0) || total > self.config.max_reflection_distance {
             return None;
         }
-
-        // Reflection coefficient per band: product over the bounces.
-        let mut refl = Band8::splat(1.0);
-        let mut before = st.source;
-        for k in 0..n {
-            let plane = &self.planes[st.seq[k]];
-            let tri = &self.triangles[tri_of[k]];
-            let dir = normalize3(sub3(pts[k], before));
-            let cos_i = dot3(dir, plane.normal).abs().clamp(0.0, 1.0);
-            let ctx = RayInteractionContext {
-                surface_normal: plane.normal,
-                ray_direction: dir,
-                incident_angle_rad: cos_i.acos(),
-                temperature_celsius: self.config.temperature_celsius,
-                humidity_percent: self.config.humidity_percent,
-            };
-            let absorption = materials.evaluate_material(tri.material_handle, &ctx);
-            for b in 0..8 {
-                let a = absorption.0[b];
-                let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
-                refl.0[b] *= (1.0 - a).sqrt();
-            }
-            before = pts[k];
-        }
-
-        // Full path attenuation (distance law x air absorption over the TOTAL length).
-        let path = Band8::splat(self.distance_model.gain(total)).mul(&quasar_core::air::air_absorption_gain(
+        let seq: [usize; MAX_IMAGE_ORDER] = st.seq;
+        path_candidate(
+            &self.config,
+            &self.distance_model,
+            &self.planes,
+            &self.triangles,
+            &seq[..n],
+            &tri_of[..n],
+            &pts[..n],
+            st.source,
+            st.listener,
             total,
-            self.config.temperature_celsius,
-            self.config.humidity_percent,
-        ));
-        let gain = refl.mul(&path).scale(edge_w);
-        let energy: f32 = gain.0.iter().map(|g| g * g).sum();
-        if !(energy > 1e-14) {
-            return None;
-        }
-        Some(PathCandidate {
-            energy,
-            refl: EarlyReflection {
-                direction: normalize3(sub3(pts[n - 1], st.listener)),
-                delay_samples: total * self.config.sample_rate / self.config.speed_of_sound,
-                gain,
-                order: n as u32,
-            },
-        })
+            edge_w,
+            materials,
+        )
     }
 
     /// Triangle of `plane` containing the in-plane point `p` plus the edge window
@@ -1438,56 +1496,68 @@ impl CpuSimdComputeBackend {
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
     ) -> LateReverbEstimate {
-        let room = &self.room;
-        if room.area < 1e-6 || room.volume < 1e-6 || room.by_material.is_empty() {
-            // No geometry = no room: effectively anechoic.
-            return LateReverbEstimate {
-                t60: Band8::splat(0.3),
-                early_late_split_secs: 0.05,
-                late_loudness_db: quasar_core::reverb_model::LATE_DB_MIN,
-            };
-        }
-        let mut abs_area = [0.0_f32; 8];
-        for &(handle, area) in &room.by_material {
-            let a = random_incidence_absorption(materials, handle, &self.config);
-            for b in 0..8 {
-                abs_area[b] += a.0[b] * area;
-            }
-        }
-        let mut t60 = [0.0_f32; 8];
-        let mut a_mean = 0.0_f32;
+        late_reverb_from_room(&self.room, &self.config, source, listener, materials)
+    }
+}
+
+/// The statistical late-field estimate of [`CpuSimdComputeBackend::estimate_late_reverb`]
+/// as a free function of the precomputed room statistics, so other backends (the WGPU
+/// backend precomputes the same [`RoomStats`] at `update_scene`) produce bit-identical
+/// results from identical inputs.
+pub(crate) fn late_reverb_from_room(
+    room: &RoomStats,
+    cfg: &CpuSimdConfig,
+    source: &[f32; 3],
+    listener: &[f32; 3],
+    materials: &dyn MaterialProvider,
+) -> LateReverbEstimate {
+    if room.area < 1e-6 || room.volume < 1e-6 || room.by_material.is_empty() {
+        // No geometry = no room: effectively anechoic.
+        return LateReverbEstimate {
+            t60: Band8::splat(0.3),
+            early_late_split_secs: 0.05,
+            late_loudness_db: quasar_core::reverb_model::LATE_DB_MIN,
+        };
+    }
+    let mut abs_area = [0.0_f32; 8];
+    for &(handle, area) in &room.by_material {
+        let a = random_incidence_absorption(materials, handle, cfg);
         for b in 0..8 {
-            let a_bar = (abs_area[b] / room.area).clamp(0.001, 0.999);
-            a_mean += a_bar / 8.0;
-            // Air energy attenuation m (Np/m) = dB/m / 4.343.
-            let m = quasar_core::air::air_absorption_db_per_m(
-                quasar_core::bands::FREQ_BAND_CENTRES[b],
-                self.config.temperature_celsius,
-                self.config.humidity_percent,
-            ) / 4.343;
-            let denom = -room.area * (1.0 - a_bar).ln() + 4.0 * m * room.volume;
-            t60[b] = (quasar_core::reverb_model::SABINE_K * room.volume / denom).clamp(0.05, 20.0);
+            abs_area[b] += a.0[b] * area;
         }
-        let t_mean = t60.iter().sum::<f32>() / 8.0;
+    }
+    let mut t60 = [0.0_f32; 8];
+    let mut a_mean = 0.0_f32;
+    for b in 0..8 {
+        let a_bar = (abs_area[b] / room.area).clamp(0.001, 0.999);
+        a_mean += a_bar / 8.0;
+        // Air energy attenuation m (Np/m) = dB/m / 4.343.
+        let m = quasar_core::air::air_absorption_db_per_m(
+            quasar_core::bands::FREQ_BAND_CENTRES[b],
+            cfg.temperature_celsius,
+            cfg.humidity_percent,
+        ) / 4.343;
+        let denom = -room.area * (1.0 - a_bar).ln() + 4.0 * m * room.volume;
+        t60[b] = (quasar_core::reverb_model::SABINE_K * room.volume / denom).clamp(0.05, 20.0);
+    }
+    let t_mean = t60.iter().sum::<f32>() / 8.0;
 
-        let room_constant = room.area * a_mean / (1.0 - a_mean);
-        let mut level_db = 10.0 * (16.0 * std::f32::consts::PI / room_constant).log10();
-        let r = distance3(*source, *listener);
-        level_db -= 60.0 * r / (self.config.speed_of_sound * t_mean); // exp(-13.82 r / (c T)), in dB
-        for p in [source, listener] {
-            if !room.contains(*p) {
-                level_db -= 20.0;
-            }
-        }
-
-        LateReverbEstimate {
-            t60: Band8::new(t60),
-            // Late field begins after the mixing time ~ sqrt(V) ms (V in m^3), 20 .. 150 ms.
-            early_late_split_secs: (room.volume.sqrt() * 1e-3).clamp(0.02, 0.15),
-            late_loudness_db: level_db.clamp(quasar_core::reverb_model::LATE_DB_MIN, quasar_core::reverb_model::LATE_DB_MAX),
+    let room_constant = room.area * a_mean / (1.0 - a_mean);
+    let mut level_db = 10.0 * (16.0 * std::f32::consts::PI / room_constant).log10();
+    let r = distance3(*source, *listener);
+    level_db -= 60.0 * r / (cfg.speed_of_sound * t_mean); // exp(-13.82 r / (c T)), in dB
+    for p in [source, listener] {
+        if !room.contains(*p) {
+            level_db -= 20.0;
         }
     }
 
+    LateReverbEstimate {
+        t60: Band8::new(t60),
+        // Late field begins after the mixing time ~ sqrt(V) ms (V in m^3), 20 .. 150 ms.
+        early_late_split_secs: (room.volume.sqrt() * 1e-3).clamp(0.02, 0.15),
+        late_loudness_db: level_db.clamp(quasar_core::reverb_model::LATE_DB_MIN, quasar_core::reverb_model::LATE_DB_MAX),
+    }
 }
 
 impl IAcousticComputeBackend for CpuSimdComputeBackend {

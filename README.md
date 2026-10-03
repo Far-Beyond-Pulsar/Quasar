@@ -108,13 +108,20 @@ let listener = engine.add_listener(ListenerConfig {
     physical_layout: PhysicalOutputLayout::Stereo,
 });
 
-// Compute thread (15-30 Hz):
-engine.update_scene_spatial();
+// 7. Split off the audio side: an `AudioRenderer` (Send) that owns the render state and
+//    consumes a lock-free command queue. Move it into the audio callback; no mutex is shared
+//    with the compute / configuration thread (which keeps `engine`).
+let mut renderer = engine.audio_handle();
 
-// Audio thread (48 kHz):
+// Compute thread (15-30 Hz), any time, may take as long as it likes:
+engine.update_scene_spatial();
+// Live edits (also from the compute thread) are ramped and applied at the next block:
+engine.set_pull_gain(speaker, src, 0, -6.0);
+
+// Audio thread (48 kHz): never blocks, locks or allocates.
 let src_buf = AudioBuffer::new(2, 256);
-let mut out = AudioBuffer::new(2, 256);
-engine.process_audio_scene(&[&src_buf], &mut [&mut out]);
+let mut out = [AudioBuffer::new(2, 256)];
+renderer.process_audio_scene(&[&src_buf], &mut out);
 ```
 
 ---
