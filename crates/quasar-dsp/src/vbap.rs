@@ -139,6 +139,19 @@ pub struct VbapPanner {
     kind: Kind,
 }
 
+/// Interpolate two constant-power gain vectors without a power dip.
+///
+/// `dot` is their dot product and `t` is in `[0, 1]`. Speaker gains are
+/// non-negative, so linear interpolation remains in the same hemisphere; this
+/// normalization keeps a moving pan at unit power between block targets.
+#[inline]
+pub fn normalized_lerp_gain(from: f32, to: f32, dot: f32, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let gain = from + (to - from) * t;
+    let norm_sq = (1.0 - t) * (1.0 - t) + t * t + 2.0 * t * (1.0 - t) * dot.clamp(0.0, 1.0);
+    gain / norm_sq.max(1e-12).sqrt()
+}
+
 fn unit(p: [f32; 3]) -> Option<[f64; 3]> {
     let v = [p[0] as f64, p[1] as f64, p[2] as f64];
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();

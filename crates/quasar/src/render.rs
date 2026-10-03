@@ -31,7 +31,7 @@ use quasar_dsp::master_decoder::{layout_lfe, layout_panner, SpeakerLayout};
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayBus, PatchBayNode, PatchEntry};
 use quasar_dsp::reflection_decoder::{ReflectionDecoder, TapTarget};
-use quasar_dsp::vbap::VbapPanner;
+use quasar_dsp::vbap::{normalized_lerp_gain, VbapPanner};
 
 /// Maximum number of scene outputs (emitters). Capacity of the audio-side vectors, reserved at
 /// construction so structural edits never reallocate.
@@ -438,6 +438,12 @@ impl SceneRenderState {
                         pair.prev_valid = true;
                     }
                     let combined_ch = combined.channel(0);
+                    let pan_dot = prev[..n]
+                        .iter()
+                        .zip(&target[..n])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        .clamp(0.0, 1.0);
                     for sp in 0..n {
                         let g0 = prev[sp];
                         let g1 = target[sp];
@@ -446,15 +452,14 @@ impl SceneRenderState {
                             continue;
                         }
                         let ch = out.channel_mut(sp as u16);
-                        if g0 == g1 {
-                            for i in 0..block {
-                                ch[i] += combined_ch[i] * g1;
-                            }
-                        } else {
-                            let step = (g1 - g0) / block.max(1) as f32;
-                            for i in 0..block {
-                                ch[i] += combined_ch[i] * (g0 + step * (i + 1) as f32);
-                            }
+                        for i in 0..block {
+                            let t = (i + 1) as f32 / block.max(1) as f32;
+                            let gain = if g0 == g1 {
+                                g1
+                            } else {
+                                normalized_lerp_gain(g0, g1, pan_dot, t)
+                            };
+                            ch[i] += combined_ch[i] * gain;
                         }
                     }
                 }

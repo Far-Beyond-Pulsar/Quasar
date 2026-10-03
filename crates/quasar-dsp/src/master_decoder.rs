@@ -2,7 +2,7 @@ use quasar_core::param_exchange::SpatialCoefficients;
 use crate::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNELS};
 use crate::binaural::{BinauralRenderer, ParametricBinauralRenderer};
 use crate::node_graph::AudioNode;
-use crate::vbap::VbapPanner;
+use crate::vbap::{normalized_lerp_gain, VbapPanner};
 
 /// Speaker layout for VBAP panning.
 #[derive(Clone, Debug)]
@@ -123,8 +123,8 @@ impl AudioNode for MasterSpatialDecoderNode {
             }
             DecoderMode::Vbap { .. } => {
                 // Constant-power VBAP via the shared panner (LFE slots stay silent),
-                // with a per-sample linear gain ramp from the previous block's gains
-                // so block-rate pan changes do not zipper.
+                // with a per-sample, constant-power ramp between the previous block's gains
+                // so block-rate pan changes do not zipper or dip in level.
                 let mut target = [0.0_f32; MAX_AUDIO_CHANNELS];
                 let out_chs = (output.channels() as usize).min(MAX_AUDIO_CHANNELS);
                 if let Some(panner) = &self.panner {
@@ -136,6 +136,12 @@ impl AudioNode for MasterSpatialDecoderNode {
                 }
                 let in_chs = input.channels() as usize;
                 let inv_in = 1.0 / in_chs.max(1) as f32;
+                let pan_dot = self.prev_gains[..out_chs]
+                    .iter()
+                    .zip(&target[..out_chs])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    .clamp(0.0, 1.0);
                 for ch in 0..out_chs {
                     let g0 = self.prev_gains[ch];
                     let g1 = target[ch];
@@ -143,14 +149,19 @@ impl AudioNode for MasterSpatialDecoderNode {
                     if g0 == 0.0 && g1 == 0.0 {
                         continue;
                     }
-                    let step = (g1 - g0) / num_samples.max(1) as f32;
                     let dst = output.channel_mut(ch as u16);
                     for i in 0..num_samples {
                         let mut mono = 0.0;
                         for c in 0..in_chs {
                             mono += input.channel(c as u16)[i];
                         }
-                        dst[i] = mono * inv_in * (g0 + step * (i + 1) as f32);
+                        let t = (i + 1) as f32 / num_samples.max(1) as f32;
+                        let gain = if g0 == g1 {
+                            g1
+                        } else {
+                            normalized_lerp_gain(g0, g1, pan_dot, t)
+                        };
+                        dst[i] = mono * inv_in * gain;
                     }
                 }
             }
