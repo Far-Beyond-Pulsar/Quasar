@@ -2,12 +2,21 @@
 //! follow the direct distance attenuation, decoded diffusely.
 
 use quasar_audio::quasar_backends::hw_stub::HardwareAcceleratorStub;
+use quasar_audio::quasar_backends::cpu_simd::CpuSimdConfig;
+use quasar_audio::quasar_backends::CpuSimdComputeBackend;
+use quasar_audio::quasar_core::bands::Band8;
+use quasar_audio::quasar_core::backend::{DirectPathResult, IAcousticComputeBackend, LateReverbEstimate, MaterialProvider, SpatialQuery, SpatialQueryResult, SPEED_OF_SOUND};
+use quasar_audio::quasar_core::distance::DistanceModel;
+use quasar_audio::quasar_core::error::SpatialAudioError;
+use quasar_audio::quasar_core::rays::{Ray, RayHit};
 use quasar_audio::quasar_core::hybrid::HybridSamplingStrategy;
-use quasar_audio::quasar_core::scene::Movability;
+use quasar_audio::quasar_core::scene::{AcousticMesh, AcousticScene, Movability};
 use quasar_audio::quasar_core::scene_output::{
     ChannelPull, ListenerConfig, PhysicalOutputLayout, SceneOutputConfig, SourceConfig,
 };
 use quasar_audio::quasar_dsp::audio_buffer::AudioBuffer;
+use quasar_audio::quasar_materials::instance::AcousticMaterialInstance;
+use quasar_audio::quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
 use quasar_audio::SpatialAudioEngine;
 
 const SR: f32 = 48_000.0;
@@ -76,6 +85,66 @@ fn reverb_only(mk: &dyn Fn() -> SpatialAudioEngine, channels: u16, blocks: usize
 
 fn db(r: f32) -> f32 {
     20.0 * r.max(1e-12).log10()
+}
+
+/// Closed 60 x 10 x 60 m room, CPU backend, with a single emitter and listener.
+fn cpu_box_engine(listener: [f32; 3]) -> SpatialAudioEngine {
+    let mut engine = SpatialAudioEngine::new(0, SR, 15.0);
+    engine.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
+    let material = engine.materials().add_instance(AcousticMaterialInstance::new(
+        TABULAR_MODEL_ID,
+        Tabular8BandEvaluator::create_params(Band8::splat(0.2), Band8::zeros(), Band8::zeros()),
+    ));
+    // Vertices at x/z = +/-30 m, y = 0/10 m; 12 triangles form a closed box.
+    let positions = vec![
+        [-30.0, 0.0, -30.0], [30.0, 0.0, -30.0], [30.0, 10.0, -30.0], [-30.0, 10.0, -30.0],
+        [-30.0, 0.0, 30.0], [30.0, 0.0, 30.0], [30.0, 10.0, 30.0], [-30.0, 10.0, 30.0],
+    ];
+    let indices = vec![
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+        0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
+        0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+    ];
+    let mut scene = AcousticScene::new();
+    scene.add_mesh(AcousticMesh::new(1, positions, indices, material));
+    engine.set_backend(Box::new(CpuSimdComputeBackend::new(scene, CpuSimdConfig::default())));
+    engine.set_strategy(HybridSamplingStrategy::RealTimeOnly);
+    let src = engine.load_source(SourceConfig { path: "noise.wav".into(), channels: 1 }).expect("source");
+    let output = engine.add_scene_output(SceneOutputConfig::new([0.0, 5.0, 0.0], Movability::Static));
+    engine.connect_pull(output, ChannelPull::new(src, 0, 0.0));
+    engine.add_listener(ListenerConfig { position: listener, heading: [0.0, 0.0, -1.0], physical_layout: PhysicalOutputLayout::Stereo });
+    engine.update_scene_spatial();
+    engine
+}
+
+fn cpu_box_reverb_level(listener: [f32; 3]) -> f32 {
+    let mk = || cpu_box_engine(listener);
+    let rev = reverb_only(&mk, 2, 180, 60);
+    rms(&rev[0]).hypot(rms(&rev[1]))
+}
+
+/// CPU engine output follows Barron's distance term (60 r / (c T) dB) and
+/// the backend's 20 dB penalty when the listener lies outside the closed room.
+#[test]
+fn cpu_backend_reverb_distance_matches_barron_and_outside_room_terms() {
+    let near = cpu_box_reverb_level([2.0, 5.0, 0.0]);
+    let far = cpu_box_reverb_level([20.0, 5.0, 0.0]);
+    let outside = cpu_box_reverb_level([35.0, 5.0, 0.0]);
+    assert!(near > 1e-5 && far > 1e-5 && outside > 1e-7, "reverb present: {near}, {far}, {outside}");
+
+    // Both source and listener remain inside for the first comparison. T60 is
+    // around 3 s for this box, so the analytic 18 m change is about 1 dB.
+    // Use 2 dB tolerance to include FDN finite-window variation.
+    let observed_inside_db = db(far / near);
+    let expected_inside_db = -60.0 * (18.0 / 343.0) / 3.0; // T60 ≈ 3 s
+    assert!((observed_inside_db - expected_inside_db).abs() < 2.0,
+        "inside distance term: observed {observed_inside_db:.2} dB, expected about {expected_inside_db:.2} dB");
+
+    // Outside the box the CPU estimator applies -20 dB in addition to the small
+    // Barron correction. Allow 3 dB for the measured FDN tail window.
+    let outside_db = db(outside / far);
+    assert!((outside_db + 20.0).abs() < 3.0,
+        "outside-room term: observed {outside_db:.2} dB, expected -20 dB");
 }
 
 #[test]
@@ -180,6 +249,79 @@ fn decoded_reverb_channels_are_decorrelated() {
         let (mx, mn) = (live.iter().cloned().fold(0.0, f32::max), live.iter().cloned().fold(f32::MAX, f32::min));
         assert!(db(mx / mn) < 6.0, "{name}: channel levels {levels:?}");
     }
+}
+
+/// Small controllable backend for checking the engine's split-time handover.
+struct SplitBackend { sample_rate: f32, split: f32 }
+
+impl IAcousticComputeBackend for SplitBackend {
+    fn query_spatial(&self, queries: &[SpatialQuery], _materials: &dyn MaterialProvider) -> Vec<SpatialQueryResult> {
+        queries.iter().map(|q| {
+            let distance = ((q.source_position[0] - q.listener_position[0]).powi(2)
+                + (q.source_position[1] - q.listener_position[1]).powi(2)
+                + (q.source_position[2] - q.listener_position[2]).powi(2)).sqrt();
+            SpatialQueryResult {
+                source_id: q.source_id,
+                direct_path: DirectPathResult {
+                    attenuation: Band8::splat(1.0),
+                    delay_samples: distance * self.sample_rate / SPEED_OF_SOUND,
+                    distance,
+                    occluded: false,
+                    occlusion_factor: 1.0,
+                    occlusion: Band8::splat(1.0),
+                },
+                early_reflections: Vec::new(),
+                late_reverb: LateReverbEstimate {
+                    t60: Band8::splat(0.5),
+                    early_late_split_secs: self.split,
+                    late_loudness_db: -10.0,
+                },
+            }
+        }).collect()
+    }
+    fn set_sample_rate(&mut self, sample_rate: f32) { self.sample_rate = sample_rate; }
+    fn set_distance_model(&mut self, _model: DistanceModel) {}
+    fn update_scene(&mut self, _scene: &AcousticScene) -> Result<(), SpatialAudioError> { Ok(()) }
+    fn trace_ray(&self, _ray: &Ray) -> Vec<RayHit> { Vec::new() }
+}
+
+fn render_split_impulse(split: f32, stage: u8) -> Vec<f32> {
+    let mut engine = SpatialAudioEngine::new(0, SR, 15.0);
+    engine.set_backend(Box::new(SplitBackend { sample_rate: SR, split }));
+    engine.set_strategy(HybridSamplingStrategy::RealTimeOnly);
+    let source = engine.load_source(SourceConfig { path: "impulse.wav".into(), channels: 1 }).unwrap();
+    let output = engine.add_scene_output(SceneOutputConfig::new([0.0, 1.6, 0.0], Movability::Static));
+    engine.connect_pull(output, ChannelPull::new(source, 0, 0.0));
+    engine.add_listener(ListenerConfig { position: [0.0, 1.6, 2.0], heading: [0.0, 0.0, -1.0], physical_layout: PhysicalOutputLayout::Stereo });
+    engine.update_scene_spatial();
+    let mut input = AudioBuffer::new(1, BLOCK as u16);
+    let mut out = AudioBuffer::new(2, BLOCK as u16);
+    let mut samples = Vec::new();
+    engine.debug_audio_stage = stage;
+    for block in 0..180 {
+        input.clear();
+        if block == 0 { input.set(0, 0, 1.0); }
+        out.clear();
+        engine.process_audio_scene(&[&input], std::slice::from_mut(&mut out));
+        samples.extend_from_slice(&out.channel(0)[..BLOCK]);
+    }
+    samples
+}
+
+fn split_impulse_onset(split: f32) -> usize {
+    let wet = render_split_impulse(split, 4);
+    let dry_and_early = render_split_impulse(split, 3);
+    wet.iter().zip(dry_and_early.iter()).position(|(a, b)| (a - b).abs() > 1e-8).expect("diffuse tail onset")
+}
+
+#[test]
+fn probe_split_time_moves_engine_diffuse_tail_onset() {
+    let early_split_onset = split_impulse_onset(0.03);
+    let late_split_onset = split_impulse_onset(0.11);
+    let measured = late_split_onset as isize - early_split_onset as isize;
+    let expected = ((0.11 - 0.03) * SR) as isize;
+    assert!((measured - expected).abs() <= BLOCK as isize,
+        "onset moved {measured} samples; expected about {expected} (early {early_split_onset}, late {late_split_onset})");
 }
 
 #[test]

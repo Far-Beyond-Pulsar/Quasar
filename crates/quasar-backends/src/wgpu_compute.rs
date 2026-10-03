@@ -31,17 +31,18 @@
 //!
 //! # Limits
 //!
-//! * **Scaling.** Triangles are tested brute force: every ray costs `O(triangles)`
-//!   (no BVH on the GPU). Intended for room-model scenes (up to a few thousand
-//!   triangles); a flattened BVH is future work. Cost per query is roughly
-//!   `(13 + 8 * (2 * (log2(26 / 0.05) + 5)) + P^order) * T` triangle tests.
+//! * **Scaling.** Triangles are tested through an uploaded flattened BVH. The
+//!   median-split tree has leaves of at most four triangles and a bounded traversal
+//!   stack. Each traversal is typically logarithmic plus the visited leaves, with
+//!   linear worst-case cost for highly overlapping bounds.
 //! * **Planes.** At most 64 mirror planes (one GPU thread per first-bounce plane,
 //!   workgroup size 64), reflection order at most 8; the image-tree node budget is
 //!   per thread (`MAX_IMAGE_NODES / planes`, the CPU applies it per query).
 //! * **Candidate capacity.** At most [`WgpuComputeConfig::max_candidates_per_query`]
-//!   validated paths per query come back; beyond that paths are dropped in a
-//!   non-deterministic order (a message is printed once). Raise the capacity if a
-//!   scene is that rich; the CPU backend has no such cap before ranking.
+//!   validated paths per query fit in the output buffer. If the shader discovers
+//!   more, the fallible query returns an explicit backend error instead of
+//!   presenting an arbitrary subset as a complete result. Raise the capacity if
+//!   a scene is that rich; the CPU backend has no such cap before ranking.
 //! * **Precision.** All geometry runs in f32 on the device (transcendental-free; the
 //!   disc / detour direction tables are precomputed). A ray grazing a triangle edge
 //!   can flip between devices; the parity test documents its tolerances.
@@ -73,7 +74,7 @@ use quasar_core::rays::{Ray, RayHit, RayInteractionContext};
 use quasar_core::scene::AcousticScene;
 
 use crate::cpu_simd::{
-    build_planes, combine_occlusion, cross3, distance3, late_reverb_from_room, normalize3,
+    build_planes, combine_occlusion, distance3, late_reverb_from_room, normalize3, probe_basis,
     path_candidate, rank_reflections, sub3, CpuSimdComputeBackend, CpuSimdConfig, PathCandidate,
     ReflectPlane, RoomStats, Triangle, BARY_EPS, GOLDEN_ANGLE, MAX_IMAGE_NODES, MAX_IMAGE_ORDER,
     OCCLUSION_BISECT_STEPS, OCCLUSION_DETOUR_DIRS, OCCLUSION_DETOUR_MARGIN,
@@ -91,7 +92,7 @@ const _: () = assert!(MAX_IMAGE_ORDER == 8);
 /// Threads per workgroup = most mirror planes (one thread per first-bounce plane).
 const WORKGROUP_SIZE: usize = 64;
 /// Storage buffers the pipeline binds (a limit the device must offer).
-const STORAGE_BUFFERS: u32 = 7;
+const STORAGE_BUFFERS: u32 = 8;
 
 /// Configuration for the WGPU compute backend.
 #[derive(Clone, Debug)]
@@ -181,15 +182,20 @@ struct HostScene {
     triangles: Vec<Triangle>,
     planes: Vec<ReflectPlane>,
     room: RoomStats,
+    /// The CPU visibility evaluator is shared with the CPU backend so reflected
+    /// paths receive the same per-material, nine-ray transmission as CPU results.
+    visibility: CpuSimdComputeBackend,
 }
 
 /// Scene buffers on the device.
 struct GpuScene {
     tris: wgpu::Buffer,
+    bvh: wgpu::Buffer,
     planes: wgpu::Buffer,
     plane_tris: wgpu::Buffer,
     edges: wgpu::Buffer,
     n_tris: u32,
+    n_bvh_nodes: u32,
     n_planes: u32,
 }
 
@@ -208,7 +214,6 @@ pub struct WgpuComputeBackend {
     /// Queries per dispatch after the device's buffer limits.
     chunk_len: usize,
     error_logged: AtomicBool,
-    overflow_logged: AtomicBool,
 }
 
 impl WgpuComputeBackend {
@@ -319,7 +324,6 @@ impl WgpuComputeBackend {
             distance_model: DistanceModel::default(),
             chunk_len,
             error_logged: AtomicBool::new(false),
-            overflow_logged: AtomicBool::new(false),
         })
     }
 
@@ -354,6 +358,7 @@ impl WgpuComputeBackend {
                 entry(5, ro, std::mem::size_of::<GpuEdge>()),
                 entry(6, rw, std::mem::size_of::<GpuHead>()),
                 entry(7, rw, std::mem::size_of::<GpuCand>()),
+                entry(8, ro, std::mem::size_of::<GpuBvhNode>()),
             ],
         })
     }
@@ -380,6 +385,7 @@ impl WgpuComputeBackend {
                 mat: [t.material_handle, 0, 0, 0],
             })
             .collect();
+        let gpu_bvh = build_gpu_bvh(&triangles);
         let mut plane_tris: Vec<u32> = Vec::new();
         let mut edges: Vec<GpuEdge> = Vec::new();
         let gpu_planes: Vec<GpuPlane> = planes
@@ -403,10 +409,12 @@ impl WgpuComputeBackend {
 
         let limits = device.limits();
         let tri_bytes = (gpu_tris.len() * std::mem::size_of::<GpuTri>()) as u64;
-        if tri_bytes > (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size) {
+        let bvh_bytes = (gpu_bvh.len() * std::mem::size_of::<GpuBvhNode>()) as u64;
+        let max_bind = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        if tri_bytes > max_bind || bvh_bytes > max_bind {
             return Err(SpatialAudioError::InvalidScene(format!(
-                "{} triangles do not fit one storage binding of this device",
-                gpu_tris.len()
+                "scene geometry does not fit GPU storage bindings ({} triangles: {tri_bytes} triangle bytes and {bvh_bytes} BVH bytes, limit {max_bind})",
+                gpu_tris.len(),
             )));
         }
 
@@ -427,13 +435,16 @@ impl WgpuComputeBackend {
         };
         let gpu = GpuScene {
             tris: upload("quasar_tris", bytemuck::cast_slice(&gpu_tris), std::mem::size_of::<GpuTri>()),
+            bvh: upload("quasar_bvh", bytemuck::cast_slice(&gpu_bvh), std::mem::size_of::<GpuBvhNode>()),
             planes: upload("quasar_planes", bytemuck::cast_slice(&gpu_planes), std::mem::size_of::<GpuPlane>()),
             plane_tris: upload("quasar_plane_tris", bytemuck::cast_slice(&plane_tris), 4),
             edges: upload("quasar_edges", bytemuck::cast_slice(&edges), std::mem::size_of::<GpuEdge>()),
             n_tris: gpu_tris.len() as u32,
+            n_bvh_nodes: gpu_bvh.len() as u32,
             n_planes: gpu_planes.len() as u32,
         };
-        Ok((HostScene { triangles, planes, room }, gpu))
+        let visibility = CpuSimdComputeBackend::new(scene.clone(), config.cpu());
+        Ok((HostScene { triangles, planes, room, visibility }, gpu))
     }
 
     /// Shader uniform for a dispatch of `n` queries.
@@ -458,7 +469,7 @@ impl WgpuComputeBackend {
                 self.config.max_candidates_per_query,
                 OCCLUSION_BISECT_STEPS as u32,
                 (MAX_IMAGE_NODES / (self.gpu.n_planes.max(1) as usize)).max(1) as u32,
-                0,
+                self.gpu.n_bvh_nodes,
             ],
             limits0: [
                 OCCLUSION_EPS,
@@ -526,6 +537,7 @@ impl WgpuComputeBackend {
                 wgpu::BindGroupEntry { binding: 5, resource: self.gpu.edges.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: heads_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: cands_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.gpu.bvh.as_entire_binding() },
             ],
         });
 
@@ -585,6 +597,12 @@ impl WgpuComputeBackend {
                 let head: GpuHead = bytemuck::pod_read_unaligned(
                     &heads[i * std::mem::size_of::<GpuHead>()..(i + 1) * std::mem::size_of::<GpuHead>()],
                 );
+                if head.info[0] > self.config.max_candidates_per_query {
+                    return Err(SpatialAudioError::Backend(format!(
+                        "wgpu compute candidate capacity exceeded for source {}: found {} paths, capacity is {}; increase WgpuComputeConfig::max_candidates_per_query",
+                        q.source_id, head.info[0], self.config.max_candidates_per_query
+                    )));
+                }
                 out.push(self.decode(q, &head, cands, i, materials));
             }
         }
@@ -644,9 +662,7 @@ impl WgpuComputeBackend {
         }
         // Same basis / probe pattern as the shader (and the CPU backend).
         let axis = normalize3(sub3(src, lis));
-        let helper = if axis[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
-        let u = normalize3(cross3(axis, helper));
-        let w = cross3(axis, u);
+        let (u, w) = probe_basis(axis);
         let params = self.params(0);
 
         let mut visible = 0usize;
@@ -705,14 +721,8 @@ impl WgpuComputeBackend {
         index: usize,
         materials: &dyn MaterialProvider,
     ) -> Vec<quasar_core::backend::EarlyReflection> {
-        let cap = self.config.max_candidates_per_query as usize;
         let found = head.info[0] as usize;
-        if found > cap && !self.overflow_logged.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "quasar-backends: wgpu compute found {found} image paths for one query but \
-                 max_candidates_per_query = {cap}; the excess is dropped (raise the capacity)"
-            );
-        }
+        let cap = self.config.max_candidates_per_query as usize;
         let stride = std::mem::size_of::<GpuCand>();
         let base = index * cap * stride;
         let mut raw: Vec<GpuCand> = (0..found.min(cap))
@@ -736,7 +746,7 @@ impl WgpuComputeBackend {
                 continue; // corrupt record: never index out of range
             }
             let pts: Vec<[f32; 3]> = c.pts[..n].iter().map(|p| [p[0], p[1], p[2]]).collect();
-            if let Some(p) = path_candidate(
+            if let Some(mut p) = path_candidate(
                 &self.cpu_config,
                 &self.distance_model,
                 &self.host.planes,
@@ -750,6 +760,21 @@ impl WgpuComputeBackend {
                 c.head[0],
                 materials,
             ) {
+                // The shader validates image geometry, while the shared CPU host
+                // computes material-dependent visibility. Keep that calculation
+                // identical to CpuSimdComputeBackend, including its nine-ray bundle.
+                let mut blocker_gain = Band8::splat(1.0);
+                let mut from = lis;
+                for &point in pts.iter().rev() {
+                    blocker_gain = blocker_gain.mul(&self.host.visibility.segment_soft_transmission(from, point, materials));
+                    from = point;
+                }
+                blocker_gain = blocker_gain.mul(&self.host.visibility.segment_soft_transmission(from, src, materials));
+                p.refl.gain = p.refl.gain.mul(&blocker_gain);
+                p.energy = p.refl.gain.0.iter().map(|g| g * g).sum();
+                if p.energy <= 1e-14 {
+                    continue;
+                }
                 paths.push(p);
             }
         }
@@ -878,7 +903,7 @@ fn block_on<F: Future>(device: Option<&wgpu::Device>, fut: F) -> F::Output {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuParams {
     counts0: [u32; 4],
-    counts1: [u32; 4],
+    counts1: [u32; 4], // max candidates, bisections, image-node budget, BVH nodes
     limits0: [f32; 4],
     limits1: [f32; 4],
     limits2: [f32; 4],
@@ -903,6 +928,79 @@ struct GpuTri {
     c: [f32; 4],
     n: [f32; 4],
     mat: [u32; 4],
+}
+
+/// Flattened GPU BVH node: bounds, child indices or leaf count, and up to four
+/// original triangle indices. Internal nodes have `meta.w == 0`; leaves have 1.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuBvhNode {
+    bmin: [f32; 4],
+    bmax: [f32; 4],
+    meta: [u32; 4],
+    tris: [u32; 4],
+}
+
+fn build_gpu_bvh(triangles: &[Triangle]) -> Vec<GpuBvhNode> {
+    fn recurse(indices: &mut [u32], triangles: &[Triangle], out: &mut Vec<GpuBvhNode>) -> u32 {
+        let index = out.len() as u32;
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        let mut max_edge = 0.0_f32;
+        for &i in indices.iter() {
+            let t = &triangles[i as usize];
+            let edge_len = |a: [f32; 3], b: [f32; 3]| {
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            };
+            max_edge = max_edge.max(edge_len(t.a, t.b)).max(edge_len(t.b, t.c)).max(edge_len(t.c, t.a));
+            for p in [t.a, t.b, t.c] {
+                for axis in 0..3 { lo[axis] = lo[axis].min(p[axis]); hi[axis] = hi[axis].max(p[axis]); }
+            }
+        }
+        // The intersection routine accepts barycentrics 1e-5 beyond an edge;
+        // pad bounds enough to retain those edge-tolerant hits during traversal.
+        for axis in 0..3 {
+            let pad = max_edge * BARY_EPS * 2.0 + lo[axis].abs().max(hi[axis].abs()) * 1e-6;
+            lo[axis] -= pad;
+            hi[axis] += pad;
+        }
+        out.push(GpuBvhNode {
+            bmin: [lo[0], lo[1], lo[2], 0.0],
+            bmax: [hi[0], hi[1], hi[2], 0.0],
+            meta: [0; 4],
+            tris: [u32::MAX; 4],
+        });
+        if indices.len() <= 4 {
+            let mut ids = [u32::MAX; 4];
+            ids[..indices.len()].copy_from_slice(indices);
+            out[index as usize].meta = [0, 0, indices.len() as u32, 1];
+            out[index as usize].tris = ids;
+        } else {
+            let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            let axis = if extent[0] >= extent[1] && extent[0] >= extent[2] { 0 } else if extent[1] >= extent[2] { 1 } else { 2 };
+            indices.sort_by(|&a, &b| {
+                let centroid = |i: u32| {
+                    let t = &triangles[i as usize];
+                    (t.a[axis] + t.b[axis] + t.c[axis]) / 3.0
+                };
+                centroid(a).total_cmp(&centroid(b)).then_with(|| a.cmp(&b))
+            });
+            let mid = indices.len() / 2;
+            let (left, right) = indices.split_at_mut(mid);
+            let l = recurse(left, triangles, out);
+            let r = recurse(right, triangles, out);
+            out[index as usize].meta = [l, r, 0, 0];
+        }
+        index
+    }
+
+    if triangles.is_empty() {
+        return vec![GpuBvhNode { bmin: [0.0; 4], bmax: [0.0; 4], meta: [0, 0, 0, 1], tris: [u32::MAX; 4] }];
+    }
+    let mut indices: Vec<u32> = (0..triangles.len() as u32).collect();
+    let mut nodes = Vec::with_capacity(triangles.len().saturating_mul(2));
+    recurse(&mut indices, triangles, &mut nodes);
+    nodes
 }
 
 /// 64 bytes.
@@ -976,6 +1074,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuParams>(), 416);
         assert_eq!(std::mem::size_of::<GpuQuery>(), 32);
         assert_eq!(std::mem::size_of::<GpuTri>(), 80);
+        assert_eq!(std::mem::size_of::<GpuBvhNode>(), 64);
         assert_eq!(std::mem::size_of::<GpuPlane>(), 64);
         assert_eq!(std::mem::size_of::<GpuEdge>(), 32);
         assert_eq!(std::mem::size_of::<GpuCrossing>(), 32);

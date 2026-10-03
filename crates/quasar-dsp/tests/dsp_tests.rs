@@ -118,6 +118,7 @@ fn coeffs(source_id: u32, gain: f32, delay: f32, azimuth: f32, version: u64) -> 
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        early_late_split_secs: 0.0,
         directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version,
     }

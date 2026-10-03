@@ -29,6 +29,8 @@ pub struct SpatialCoefficients {
     pub late_t60: Band8,
     /// Late reverb gain relative to direct (dB).
     pub late_gain_db: f32,
+    /// Delay from the direct arrival to the estimated late-field boundary, in seconds.
+    pub early_late_split_secs: f32,
     /// Monotonically increasing version counter for change detection.
     pub version: u64,
 }

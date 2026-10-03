@@ -9,8 +9,9 @@ pub const MAX_CROSSFADE_REFLECTIONS: usize = 64;
 /// Manages smooth transitions between spatial coefficient sets.
 ///
 /// The compute thread publishes new params; the audio thread reads them
-/// and crossfades from the in-flight value at retarget time to the target
-/// over a fixed window.
+/// and crossfades from the in-flight value at retarget time to the target.
+/// After the first target, the fade window follows the measured interval
+/// between target updates so moving-source delays do not plateau between them.
 ///
 /// The blend is applied to PARAMETERS (gains, delays, angles), not to audio
 /// signals, so it is a plain linear interpolation `from + (to - from) * t`
@@ -40,6 +41,9 @@ pub struct EqualPowerCrossfader {
     ref_to: Vec<EarlyReflectionCoeffs>,
     fade_frames: u32,
     frame_counter: u32,
+    configured_fade_frames: u32,
+    frames_since_target: u64,
+    has_target: bool,
 }
 
 /// Shortest signed angular difference `b - a`, wrapped to [-π, π].
@@ -88,6 +92,7 @@ fn copy_coeffs(dst: &mut SpatialCoefficients, src: &SpatialCoefficients) {
     dst.direct_elevation = src.direct_elevation;
     dst.late_t60 = src.late_t60;
     dst.late_gain_db = src.late_gain_db;
+    dst.early_late_split_secs = src.early_late_split_secs;
     dst.version = src.version;
     copy_reflections(&mut dst.early_reflections, &src.early_reflections);
 }
@@ -104,6 +109,7 @@ fn with_capacity(src: &SpatialCoefficients) -> SpatialCoefficients {
         early_reflections: Vec::with_capacity(MAX_CROSSFADE_REFLECTIONS),
         late_t60: src.late_t60,
         late_gain_db: src.late_gain_db,
+        early_late_split_secs: src.early_late_split_secs,
         version: src.version,
     };
     copy_reflections(&mut c.early_reflections, &src.early_reflections);
@@ -120,13 +126,17 @@ impl EqualPowerCrossfader {
         let fade_frames = ((fade_ms / 1000.0) * sample_rate).round() as u32;
         let mut ref_to = Vec::with_capacity(MAX_CROSSFADE_REFLECTIONS);
         copy_reflections(&mut ref_to, &initial.early_reflections);
+        let fade_frames = fade_frames.max(1);
         Self {
             current: with_capacity(&initial),
             target: with_capacity(&initial),
             from: with_capacity(&initial),
             ref_to,
-            fade_frames: fade_frames.max(1),
-            frame_counter: fade_frames.max(1),
+            fade_frames,
+            frame_counter: fade_frames,
+            configured_fade_frames: fade_frames,
+            frames_since_target: 0,
+            has_target: false,
         }
     }
 
@@ -141,8 +151,24 @@ impl EqualPowerCrossfader {
         if self.current.source_id != target.source_id {
             // Source identity changed — instant switch to avoid stale panning
             self.snap_internal();
+            self.frames_since_target = 0;
+            self.has_target = true;
             return;
         }
+
+        // Spatial targets arrive at the compute cadence (usually 20–30 Hz).
+        // Use the measured audio time between targets as this transition's
+        // duration. For a continuously moving source, consecutive delay targets
+        // then form adjacent linear segments with no fade-length plateau and
+        // the slope matches the source's radial velocity. Keep the configured
+        // duration until a second target establishes the actual cadence.
+        if self.has_target && self.frames_since_target > 0 {
+            self.fade_frames = self.frames_since_target.min(u32::MAX as u64) as u32;
+        } else {
+            self.fade_frames = self.configured_fade_frames;
+        }
+        self.frames_since_target = 0;
+        self.has_target = true;
 
         // Fade start = whatever `current` is right now (possibly mid-fade).
         let c = &self.current;
@@ -154,6 +180,7 @@ impl EqualPowerCrossfader {
         self.from.direct_elevation = c.direct_elevation;
         self.from.late_t60 = c.late_t60;
         self.from.late_gain_db = c.late_gain_db;
+        self.from.early_late_split_secs = c.early_late_split_secs;
 
         self.align_reflections();
         self.frame_counter = 0;
@@ -258,6 +285,7 @@ impl EqualPowerCrossfader {
     /// `current` is recomputed from the fixed `from`/`target` pair (never
     /// compounded in place). Returns the current blend factor.
     pub fn advance(&mut self, block_size: usize) -> f32 {
+        self.frames_since_target = self.frames_since_target.saturating_add(block_size as u64);
         if self.frame_counter >= self.fade_frames {
             return 1.0;
         }
@@ -288,6 +316,7 @@ impl EqualPowerCrossfader {
             lerp(self.from.direct_elevation, self.target.direct_elevation, t);
         lerp_band(&self.from.late_t60, &self.target.late_t60, t, &mut self.current.late_t60);
         self.current.late_gain_db = lerp(self.from.late_gain_db, self.target.late_gain_db, t);
+        self.current.early_late_split_secs = lerp(self.from.early_late_split_secs, self.target.early_late_split_secs, t);
 
         for ((dst, a), b) in self
             .current
@@ -311,6 +340,8 @@ impl EqualPowerCrossfader {
     pub fn snap_to_ref(&mut self, coefficients: &SpatialCoefficients) {
         copy_coeffs(&mut self.target, coefficients);
         self.snap_internal();
+        self.frames_since_target = 0;
+        self.has_target = true;
     }
 
     /// Reset to a new starting point instantly (no crossfade).

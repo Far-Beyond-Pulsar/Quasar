@@ -9,7 +9,7 @@ const SR: f32 = 48_000.0;
 const N: usize = 256;
 
 fn tap(delay: f32, gain: f32, az: f32) -> TapTarget {
-    TapTarget { delay_samples: delay, gain_lo: gain, gain_hi: gain, azimuth: az, elevation: 0.0 }
+    TapTarget { delay_samples: delay, gains: [gain; 8], azimuth: az, elevation: 0.0 }
 }
 
 fn impulse_block() -> AudioBuffer {
@@ -56,7 +56,7 @@ fn taps_vanish_when_their_target_disappears_and_slots_are_bounded() {
 
     // More targets than slots (and non-finite junk): never panics, slots stay bounded.
     let mut targets: Vec<TapTarget> = (0..64).map(|i| tap(50.0 + 20.0 * i as f32, 0.1, 0.0)).collect();
-    targets.push(TapTarget { delay_samples: f32::NAN, gain_lo: f32::NAN, gain_hi: 1.0, azimuth: f32::NAN, elevation: f32::NAN });
+    targets.push(TapTarget { delay_samples: f32::NAN, gains: [f32::NAN, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], azimuth: f32::NAN, elevation: f32::NAN });
     line.push_block(&sil);
     dec.render_add(&line, &targets, Some(&panner), &mut out, N);
     assert!(dec.active_taps() <= REFLECTION_SLOTS);
@@ -70,6 +70,26 @@ fn taps_vanish_when_their_target_disappears_and_slots_are_bounded() {
     line.push_block(&sil);
     dec.render_add(&line, &[], Some(&panner), &mut out, N);
     assert_eq!(dec.active_taps(), 0);
+}
+
+#[test]
+fn target_overflow_keeps_the_strongest_taps_instead_of_the_first_taps() {
+    let panner = layout_panner(&SpeakerLayout::Stereo);
+    let mut line = EarlyReflectionDelayNode::new(1, SR, 0.2, 16);
+    let mut dec = ReflectionDecoder::new(SR, false);
+    let mut out = AudioBuffer::new(2, N as u16);
+    let mut targets: Vec<_> = (0..16).map(|i| tap(20.0 + i as f32, 0.01, 0.0)).collect();
+    // Deliberately last in the input; it must survive the 16-target cap.
+    targets.push(tap(100.0, 1.0, 0.0));
+
+    line.push_block(&AudioBuffer::new(1, N as u16));
+    dec.render_add(&line, &targets, Some(&panner), &mut out, N);
+    out.clear();
+    line.push_block(&impulse_block());
+    dec.render_add(&line, &targets, Some(&panner), &mut out, N);
+
+    let energy_at_strong_tap = (0..2).map(|ch| out.get(ch, 100).powi(2)).sum::<f32>();
+    assert!(energy_at_strong_tap > 0.5, "strong overflow tap was dropped: {energy_at_strong_tap}");
 }
 
 #[test]

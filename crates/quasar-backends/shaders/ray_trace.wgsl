@@ -10,9 +10,9 @@
 // distance law, air absorption, diffraction blend, ranking and the statistical late
 // reverb are evaluated on the host with the same code the CPU backend uses.
 //
-// Geometry is a flat triangle list tested brute force: O(triangles) per ray (no BVH
-// on the GPU), fine for the small scenes a room model has, see the scaling note in
-// wgpu_compute.rs.
+// Geometry uses a host-built flattened median BVH uploaded alongside the triangle
+// list. Leaves contain at most four original triangle indices; traversal uses a
+// bounded 64-entry private stack (tree depth is <= 32 for supported buffer sizes).
 //
 // ----------------------------------------------------------------------------
 // MEMORY LAYOUT. Every struct below is built only from 16-byte `vec4` fields and
@@ -33,7 +33,7 @@ const NONE: u32 = 0xffffffffu;
 struct Params {
     // x: queries in this dispatch, y: triangles, z: mirror planes, w: max reflection order
     counts0: vec4<u32>,
-    // x: max candidate paths per query, y: bisection steps, z: max image nodes per thread
+    // x: max candidate paths per query, y: bisection steps, z: max image nodes per thread, w: BVH node count
     counts1: vec4<u32>,
     // x: occlusion eps, y: detour min offset, z: detour max offset, w: detour margin
     limits0: vec4<f32>,
@@ -58,6 +58,13 @@ struct Tri {
     c: vec4<f32>,
     n: vec4<f32>,        // unit normal
     mat: vec4<u32>,      // x = material handle
+}
+
+struct BvhNode {
+    bmin: vec4<f32>,
+    bmax: vec4<f32>,
+    info: vec4<u32>, // internal: left/right; leaf: count and flag (w = 1)
+    tri: vec4<u32>,  // original triangle indices for a leaf
 }
 
 struct Plane {
@@ -105,6 +112,7 @@ struct Cand {
 @group(0) @binding(5) var<storage, read> edges: array<Edge>;
 @group(0) @binding(6) var<storage, read_write> heads: array<Head>;
 @group(0) @binding(7) var<storage, read_write> cands: array<Cand>;
+@group(0) @binding(8) var<storage, read> bvh: array<BvhNode>;
 
 var<workgroup> n_cand: atomic<u32>;
 var<workgroup> g_ref_valid: u32;
@@ -153,6 +161,24 @@ fn tri_hit(i: u32, o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> f32 {
     return hit_t;
 }
 
+fn box_hit(node: BvhNode, o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
+    var near_t = 0.0;
+    var far_t = tmax;
+    for (var axis = 0u; axis < 3u; axis++) {
+        if abs(d[axis]) < 1e-20 {
+            if o[axis] < node.bmin[axis] || o[axis] > node.bmax[axis] { return false; }
+        } else {
+            let inv = 1.0 / d[axis];
+            let a = (node.bmin[axis] - o[axis]) * inv;
+            let b = (node.bmax[axis] - o[axis]) * inv;
+            near_t = max(near_t, min(a, b));
+            far_t = min(far_t, max(a, b));
+            if far_t < near_t { return false; }
+        }
+    }
+    return far_t >= max(near_t, 0.0);
+}
+
 // Closest hit: x = distance, y = bitcast triangle index (NONE = miss).
 struct Hit {
     t: f32,
@@ -162,20 +188,53 @@ struct Hit {
 fn closest_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Hit {
     var best = tmax;
     var idx = NONE;
-    for (var i = 0u; i < params.counts0.y; i++) {
-        let t = tri_hit(i, o, d, tmin, best);
-        if t >= 0.0 && (idx == NONE || t < best) {
-            best = t;
-            idx = i;
+    if params.counts1.w == 0u { return Hit(best, idx); }
+    var stack: array<u32, 64>;
+    var size = 1u;
+    stack[0] = 0u;
+    loop {
+        if size == 0u { break; }
+        size -= 1u;
+        let node = bvh[stack[size]];
+        if !box_hit(node, o, d, best) { continue; }
+        if node.info.w == 1u {
+            for (var j = 0u; j < node.info.z; j++) {
+                let t = tri_hit(node.tri[j], o, d, tmin, best);
+                // Preserve the CPU's input-order tie break despite spatial BVH ordering.
+                if t >= 0.0 && (idx == NONE || t < best || (t == best && node.tri[j] < idx)) {
+                    best = t;
+                    idx = node.tri[j];
+                }
+            }
+        } else {
+            stack[size] = node.info.y;
+            size += 1u;
+            stack[size] = node.info.x;
+            size += 1u;
         }
     }
     return Hit(best, idx);
 }
 
 fn any_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> bool {
-    for (var i = 0u; i < params.counts0.y; i++) {
-        if tri_hit(i, o, d, tmin, tmax) >= 0.0 {
-            return true;
+    if params.counts1.w == 0u { return false; }
+    var stack: array<u32, 64>;
+    var size = 1u;
+    stack[0] = 0u;
+    loop {
+        if size == 0u { break; }
+        size -= 1u;
+        let node = bvh[stack[size]];
+        if !box_hit(node, o, d, tmax) { continue; }
+        if node.info.w == 1u {
+            for (var j = 0u; j < node.info.z; j++) {
+                if tri_hit(node.tri[j], o, d, tmin, tmax) >= 0.0 { return true; }
+            }
+        } else {
+            stack[size] = node.info.y;
+            size += 1u;
+            stack[size] = node.info.x;
+            size += 1u;
         }
     }
     return false;
@@ -195,11 +254,12 @@ fn segment_clear_overshoot(a: vec3<f32>, b: vec3<f32>, after: f32, before: f32) 
 }
 
 fn basis_u(axis: vec3<f32>) -> vec3<f32> {
-    var helper = vec3<f32>(0.0, 1.0, 0.0);
-    if abs(axis.y) >= 0.9 {
-        helper = vec3<f32>(1.0, 0.0, 0.0);
+    if axis.z < -0.9999999 {
+        return vec3<f32>(0.0, -1.0, 0.0);
     }
-    return normalize(cross(axis, helper));
+    let a = 1.0 / (1.0 + axis.z);
+    let b = -axis.x * axis.y * a;
+    return vec3<f32>(1.0 - axis.x * axis.x * a, b, -axis.x);
 }
 
 // ------------------------------------------------------------ direct-path probes
@@ -406,16 +466,14 @@ fn validate_path(q: u32, n: u32, src: vec3<f32>, lis: vec3<f32>) {
             break;
         }
         let seg_b = p_pts[k - 1u];
-        if !segment_clear_overshoot(seg_a, seg_b, 0.0, 0.0) {
-            return;
-        }
+        // Material-dependent reflected-path visibility is evaluated by the host
+        // using the CPU backend's nine-ray transmission bundle. Do not reject
+        // geometrically valid image paths here when a blocker is transmissive.
         total += distance(seg_a, seg_b);
         seg_a = seg_b;
         k -= 1u;
     }
-    if !segment_clear_overshoot(seg_a, src, 0.0, 0.0) {
-        return;
-    }
+    // See above: the host applies per-band blocker transmission after download.
     total += distance(seg_a, src);
     if !(total > 0.0 && total <= params.limits1.x) {
         return;

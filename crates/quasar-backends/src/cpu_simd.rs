@@ -20,8 +20,8 @@ use quasar_core::scene::AcousticScene;
 /// - Dynamic scene update support (rebuilds BVH)
 pub struct CpuSimdComputeBackend {
     scene: AcousticScene,
-    bvh: Option<BvhNode>,
-    /// Flat world-space triangle list (the BVH owns sorted copies of the same data).
+    bvh: Option<FlatBvh>,
+    /// Flat world-space triangle list used by reflection-plane construction.
     triangles: Vec<Triangle>,
     /// Deduplicated candidate mirror planes (largest first, capped), see [`ReflectPlane`].
     planes: Vec<ReflectPlane>,
@@ -89,6 +89,10 @@ impl Default for CpuSimdConfig {
 /// Rays per occlusion query: the source centre plus 12 points of a golden-angle
 /// sunflower on a disc around the source (deterministic, no RNG).
 pub(crate) const OCCLUSION_RAYS: usize = 13;
+/// Parallel rays used to estimate reflected-path visibility through a 12 cm tube.
+const REFLECTION_VISIBILITY_RAYS: usize = 9;
+/// Radius of the reflected-path visibility tube, in metres.
+const REFLECTION_VISIBILITY_RADIUS: f32 = 0.06;
 /// Radius (m) of the disc of target points around the source (its apparent size).
 pub(crate) const OCCLUSION_SOURCE_RADIUS: f32 = 0.35;
 /// Golden angle (rad) between consecutive sunflower points.
@@ -338,6 +342,7 @@ enum BvhNode {
     },
 }
 
+#[allow(dead_code)] // The pointer tree is used only as a temporary SAH build representation.
 impl BvhNode {
     /// Build a BVH from triangles using the Surface Area Heuristic.
     fn build(triangles: &mut [Triangle]) -> Self {
@@ -496,6 +501,69 @@ impl BvhNode {
     }
 }
 
+/// Cache-friendly BVH storage: nodes and leaf triangles each occupy contiguous arrays.
+/// Child and triangle ranges are 32-bit offsets; no heap pointers are followed while tracing.
+struct FlatNode { aabb: Aabb, left: u32, right: u32, start: u32, len: u32 }
+struct FlatBvh { nodes: Vec<FlatNode>, triangles: Vec<Triangle> }
+
+impl FlatBvh {
+    fn build(root: &BvhNode) -> Self {
+        fn append(node: &BvhNode, out: &mut FlatBvh) -> u32 {
+            let index = out.nodes.len() as u32;
+            out.nodes.push(FlatNode { aabb: node.aabb().clone(), left: 0, right: 0, start: 0, len: 0 });
+            match node {
+                BvhNode::Internal { left, right, .. } => {
+                    let l = append(left, out); let r = append(right, out);
+                    out.nodes[index as usize].left = l;
+                    out.nodes[index as usize].right = r;
+                }
+                BvhNode::Leaf { triangles, .. } => {
+                    let start = out.triangles.len() as u32;
+                    out.triangles.extend(triangles.iter().cloned());
+                    out.nodes[index as usize].start = start;
+                    out.nodes[index as usize].len = triangles.len() as u32;
+                }
+            }
+            index
+        }
+        let mut out = Self { nodes: Vec::new(), triangles: Vec::new() };
+        append(root, &mut out);
+        out
+    }
+
+    fn intersect(&self, ray: &Ray) -> Option<RayHit> {
+        let mut stack = vec![0u32];
+        let mut best = ray.max_distance;
+        let mut closest = None;
+        while let Some(i) = stack.pop() {
+            let node = &self.nodes[i as usize];
+            if node.aabb.intersect_t(ray, best).is_none() { continue; }
+            if node.len > 0 {
+                for tri in &self.triangles[node.start as usize..(node.start + node.len) as usize] {
+                    if let Some(t) = tri.intersect_max(ray, best) {
+                        if t < best || closest.is_none() {
+                            best = t;
+                            closest = Some(RayHit { distance: t, point: ray.point_at(t), normal: tri.normal, material_handle: tri.material_handle, hit: true });
+                        }
+                    }
+                }
+            } else {
+                let l = node.left; let r = node.right;
+                let tl = self.nodes[l as usize].aabb.intersect_t(ray, best);
+                let tr = self.nodes[r as usize].aabb.intersect_t(ray, best);
+                match (tl, tr) {
+                    (Some(a), Some(b)) if a <= b => { stack.push(r); stack.push(l); }
+                    (Some(_), Some(_)) => { stack.push(l); stack.push(r); }
+                    (Some(_), None) => stack.push(l),
+                    (None, Some(_)) => stack.push(r),
+                    (None, None) => {}
+                }
+            }
+        }
+        closest
+    }
+}
+
 /// Final stage of the direct-path occlusion, shared with the GPU backend: from the
 /// number of `visible` / `blocked` probe rays (of [`OCCLUSION_RAYS`]), the summed
 /// squared per-band transmission `t2_sum` of the blocked rays and the shortest
@@ -526,6 +594,40 @@ pub(crate) fn combine_occlusion(
         let t2 = t2_sum[b] / blocked as f32;
         let shadow = (t2 + diffraction[b] * diffraction[b]).sqrt().clamp(OCCLUSION_FLOOR, 1.0);
         bands.0[b] = shadow.powf(1.0 - v);
+    }
+    bands
+}
+
+/// Per-band two-edge extension of `combine_occlusion`. This intentionally uses
+/// two cascaded Kurze-Anderson terms as a deterministic engineering approximation;
+/// it is not a uniform theory of diffraction (UTD) solution.
+fn combine_occlusion_two_edges(
+    visible: usize,
+    blocked: usize,
+    t2_sum: &[f32; 8],
+    deltas: Option<(f32, f32)>,
+    speed_of_sound: f32,
+) -> Band8 {
+    let mut diffraction = [0.0_f32; 8];
+    if let Some((delta_a, delta_b)) = deltas {
+        for b in 0..8 {
+            let attenuation = |delta: f32| {
+                let n = 2.0 * delta.max(0.0) * quasar_core::bands::FREQ_BAND_CENTRES[b] / speed_of_sound;
+                let x = (2.0 * std::f32::consts::PI * n).sqrt();
+                let ratio = if x < 1e-3 { 1.0 } else { x / x.tanh() };
+                10.0_f32.powf(-((5.0 + 20.0 * ratio.log10()).min(OCCLUSION_MAX_DIFFRACTION_DB)) / 20.0)
+            };
+            diffraction[b] = attenuation(delta_a) * attenuation(delta_b);
+        }
+    }
+    let v = visible as f32 / OCCLUSION_RAYS as f32;
+    let mut bands = Band8::splat(1.0);
+    for b in 0..8 {
+        let t2 = t2_sum[b] / blocked as f32;
+        bands.0[b] = (t2 + diffraction[b] * diffraction[b])
+            .sqrt()
+            .clamp(OCCLUSION_FLOOR, 1.0)
+            .powf(1.0 - v);
     }
     bands
 }
@@ -918,6 +1020,21 @@ pub(crate) fn normalize3(v: [f32; 3]) -> [f32; 3] {
     }
 }
 
+/// Smooth deterministic tangent frame for the source probe disc. The previous
+/// helper-axis switch rotated the finite probe pattern abruptly at |axis.y|=.9.
+/// This frame is continuous except at its unavoidable south-pole singularity.
+pub(crate) fn probe_basis(axis: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let (x, y, z) = (axis[0], axis[1], axis[2]);
+    let u = if z < -0.999_999_9 {
+        [0.0, -1.0, 0.0]
+    } else {
+        let a = 1.0 / (1.0 + z);
+        let b = -x * y * a;
+        [1.0 - x * x * a, b, -x]
+    };
+    (u, cross3(axis, u))
+}
+
 #[inline]
 pub(crate) fn distance3(a: [f32; 3], b: [f32; 3]) -> f32 {
     let dx = a[0] - b[0];
@@ -972,7 +1089,8 @@ impl CpuSimdComputeBackend {
             return;
         }
         let mut triangles = self.triangles.clone();
-        self.bvh = Some(BvhNode::build(&mut triangles));
+        let tree = BvhNode::build(&mut triangles);
+        self.bvh = Some(FlatBvh::build(&tree));
     }
 
     /// Whether the current scene is a closed, consistently wound surface (exact room
@@ -1119,6 +1237,50 @@ impl CpuSimdComputeBackend {
         (product, crossings, first)
     }
 
+    /// Estimate reflected-path visibility by averaging transmission over a small,
+    /// deterministic bundle of parallel rays. The centre ray plus eight rays on a
+    /// 6 cm radius ring make blocker edges fade over the bundle diameter instead of
+    /// removing the entire specular path at one exact intersection.
+    pub(crate) fn segment_soft_transmission(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+        materials: &dyn MaterialProvider,
+    ) -> Band8 {
+        let axis = normalize3(sub3(to, from));
+        let (u, w) = probe_basis(axis);
+        let mut sum = [0.0_f32; 8];
+        for ray_index in 0..REFLECTION_VISIBILITY_RAYS {
+            let offset = if ray_index == 0 {
+                [0.0; 3]
+            } else {
+                let angle = (ray_index - 1) as f32 * (2.0 * std::f32::consts::PI / 8.0);
+                let (s, c) = angle.sin_cos();
+                [
+                    REFLECTION_VISIBILITY_RADIUS * (u[0] * c + w[0] * s),
+                    REFLECTION_VISIBILITY_RADIUS * (u[1] * c + w[1] * s),
+                    REFLECTION_VISIBILITY_RADIUS * (u[2] * c + w[2] * s),
+                ]
+            };
+            // Keep the exact endpoints on the specular path so the visibility
+            // samples do not accidentally treat the reflecting surface at a bounce
+            // as an intervening blocker. The small two-leg kink represents a ray
+            // passing through the sampled point in the segment's cross-section.
+            let mid = [
+                0.5 * (from[0] + to[0]) + offset[0],
+                0.5 * (from[1] + to[1]) + offset[1],
+                0.5 * (from[2] + to[2]) + offset[2],
+            ];
+            let (gain_a, _, _) = self.segment_transmission(from, mid, materials);
+            let (gain_b, _, _) = self.segment_transmission(mid, to, materials);
+            let gain = gain_a.mul(&gain_b);
+            for band in 0..8 {
+                sum[band] += gain.0[band] / REFLECTION_VISIBILITY_RAYS as f32;
+            }
+        }
+        Band8(sum)
+    }
+
     /// True if nothing lies between `a` and `b`; the ray starts `before` metres before `a` and
     /// ends `after` metres past `b`.
     fn segment_clear_overshoot(&self, a: [f32; 3], b: [f32; 3], after: f32, before: f32) -> bool {
@@ -1201,6 +1363,60 @@ impl CpuSimdComputeBackend {
         best
     }
 
+    /// Find a deterministic two-corner route around sequential blockers. The
+    /// first waypoint is probed around the direct ray's first hit; the first hit
+    /// on that waypoint-to-target leg seeds a second probe. Returned excess
+    /// lengths are local to each edge and feed the cascaded diffraction model.
+    fn double_detour_excesses(
+        &self,
+        listener: [f32; 3],
+        target: [f32; 3],
+        first_hit: [f32; 3],
+        u: [f32; 3],
+        w: [f32; 3],
+    ) -> Option<(f32, f32)> {
+        let mut best: Option<(f32, f32, f32)> = None;
+        for a in 0..OCCLUSION_DETOUR_DIRS {
+            let phi_a = a as f32 * (2.0 * std::f32::consts::PI / OCCLUSION_DETOUR_DIRS as f32);
+            let (sa, ca) = phi_a.sin_cos();
+            let dir_a = [u[0] * ca + w[0] * sa, u[1] * ca + w[1] * sa, u[2] * ca + w[2] * sa];
+            let mut offset_a = OCCLUSION_DETOUR_MIN_OFFSET;
+            while offset_a <= OCCLUSION_DETOUR_MAX_OFFSET {
+                let p1 = [first_hit[0] + dir_a[0] * offset_a, first_hit[1] + dir_a[1] * offset_a, first_hit[2] + dir_a[2] * offset_a];
+                if self.segment_clear_overshoot(listener, p1, OCCLUSION_DETOUR_MARGIN, 0.0) {
+                    let leg = distance3(p1, target);
+                    let ray = Ray { origin: p1, direction: normalize3(sub3(target, p1)), min_distance: OCCLUSION_EPS, max_distance: leg - OCCLUSION_EPS };
+                    let Some(hit) = self.trace_single_ray(&ray).filter(|hit| hit.hit) else {
+                        offset_a *= 2.0;
+                        continue;
+                    };
+                    let h2 = hit.point;
+                    for b in 0..OCCLUSION_DETOUR_DIRS {
+                        let phi_b = b as f32 * (2.0 * std::f32::consts::PI / OCCLUSION_DETOUR_DIRS as f32);
+                        let (sb, cb) = phi_b.sin_cos();
+                        let dir_b = [u[0] * cb + w[0] * sb, u[1] * cb + w[1] * sb, u[2] * cb + w[2] * sb];
+                        let mut offset_b = OCCLUSION_DETOUR_MIN_OFFSET;
+                        while offset_b <= OCCLUSION_DETOUR_MAX_OFFSET {
+                            let p2 = [h2[0] + dir_b[0] * offset_b, h2[1] + dir_b[1] * offset_b, h2[2] + dir_b[2] * offset_b];
+                            if self.segment_clear_overshoot(p1, p2, OCCLUSION_DETOUR_MARGIN, 0.0)
+                                && self.segment_clear_overshoot(p2, target, 0.0, OCCLUSION_DETOUR_MARGIN)
+                            {
+                                let extra_a = (distance3(listener, p1) + distance3(p1, h2) - distance3(listener, h2)).max(0.0);
+                                let extra_b = (distance3(h2, p2) + distance3(p2, target) - distance3(h2, target)).max(0.0);
+                                let total = extra_a + extra_b;
+                                if best.map_or(true, |x| total < x.0) { best = Some((total, extra_a, extra_b)); }
+                                break;
+                            }
+                            offset_b *= 2.0;
+                        }
+                    }
+                }
+                offset_a *= 2.0;
+            }
+        }
+        best.map(|(_, a, b)| (a, b))
+    }
+
     /// Per-band direct-path occlusion (amplitude, 1 = clear, 0 = blocked).
     ///
     /// * **Transmission.** [`OCCLUSION_RAYS`] rays go from the listener to a
@@ -1213,12 +1429,24 @@ impl CpuSimdComputeBackend {
     /// * **Soft visibility.** `v` = fraction of unobstructed rays, so the result
     ///   varies smoothly while the source moves across an edge (penumbra of about
     ///   one disc diameter).
-    /// * **Diffraction.** For the blocked rays the shortest one-point detour around
-    ///   the occluder (see `detour_extra_path`, taken for the blocked ray nearest the
-    ///   centre) gives the path-length difference `delta`; per band the Fresnel number
+    /// * **Diffraction.** For blocked rays the shortest one-point detour around
+    ///   the occluder gives the path-length difference `delta`. When that route
+    ///   cannot clear the geometry, a deterministic two-waypoint search traces
+    ///   around a second blocker and cascades two Kurze-Anderson edge terms. This
+    ///   two-edge approximation is validated against synthetic geometry and the
+    ///   analytic cascade to 1e-6 amplitude; it has not been calibrated against
+    ///   BEM/UTD or measured doorway/corridor data. Per band the Fresnel number
     ///   `N = 2 delta f / c` feeds the Kurze-Anderson single-edge attenuation
     ///   `A = 5 + 20 log10(sqrt(2 pi N) / tanh sqrt(2 pi N))` dB, so high bands are
     ///   shadowed more than low ones. No detour within reach means no diffraction.
+    ///   This remains an engineering approximation, not a validated two-edge
+    ///   acoustics model: scene triangles have no diffraction-edge identity, wedge
+    ///   angle, finite edge extent, or complex phase. Published multiple-edge UTD
+    ///   formulations require those inputs and coherent fields. For example,
+    ///   Rodríguez et al. (JASA 2017, doi:10.1121/1.4997942) validates a special
+    ///   equal-height/equal-spacing obstacle array, not a staggered doorway. A
+    ///   doorway/corridor tolerance needs a geometry-matched BEM or measured
+    ///   reference and cannot be inferred from the synthetic route test below.
     /// * **Combination.** Shadow amplitude `S = min(1, sqrt(mean T^2 + D^2))` (through-wall
     ///   and around-edge energy add), blended in dB with the visibility:
     ///   `O = S^(1 - v)`. A fully clear path returns exactly 1 in every band.
@@ -1241,9 +1469,7 @@ impl CpuSimdComputeBackend {
 
         // Basis perpendicular to the line of sight.
         let axis = normalize3(sub3(*source, *listener));
-        let helper = if axis[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
-        let u = normalize3(cross3(axis, helper));
-        let w = cross3(axis, u);
+        let (u, w) = probe_basis(axis);
 
         let mut visible = 0usize;
         let mut blocked = 0usize;
@@ -1289,7 +1515,17 @@ impl CpuSimdComputeBackend {
 
         // Diffraction amplitude per band for the blocked rays.
         let delta = reference.and_then(|(target, h)| self.detour_extra_path(*listener, target, h, u, w));
-        let bands = combine_occlusion(visible, blocked, &t2_sum, delta, self.config.speed_of_sound);
+        // Preserve the calibrated single-edge path whenever it exists. The second
+        // edge search is a fallback for corner/doorway shadows the one-point route
+        // cannot clear, avoiding mode switching at ordinary single edges.
+        let two_edges = if delta.is_none() {
+            reference.and_then(|(target, h)| self.double_detour_excesses(*listener, target, h, u, w))
+        } else { None };
+        let bands = if let Some(deltas) = two_edges {
+            combine_occlusion_two_edges(visible, blocked, &t2_sum, Some(deltas), self.config.speed_of_sound)
+        } else {
+            combine_occlusion(visible, blocked, &t2_sum, delta, self.config.speed_of_sound)
+        };
         OcclusionResult { bands, occluded: true }
     }
 
@@ -1303,9 +1539,10 @@ impl CpuSimdComputeBackend {
     /// `B_N -> I_{N-1}` crosses `p_{N-1}` inside its surface, and so on down to
     /// `B_1`; the specular law then holds at every bounce by construction. Every
     /// segment `L B_N, B_N B_{N-1}, .., B_1 S` is cast against the BVH and must be
-    /// unobstructed (the surface being bounced from is excluded by an epsilon at
-    /// the segment ends). Anything in the scene blocks a reflected path, whatever
-    /// its transmission; scattering is not modelled (purely specular).
+    /// traced against the BVH (the surface being bounced from is excluded by an
+    /// epsilon at the segment ends). Per-band transmission gains multiply along
+    /// the segments, so fully transmissive blockers preserve the reflection.
+    /// Scattering is not modelled (purely specular).
     ///
     /// **Per path** (an [`EarlyReflection`]):
     /// * `direction`: unit vector from the listener toward the **last** reflection
@@ -1327,11 +1564,11 @@ impl CpuSimdComputeBackend {
     ///
     /// **Continuity.** A path fades to zero gain when its bounce point approaches
     /// the border of its surface (edge window above), so it appears / disappears
-    /// continuously as the listener moves across that boundary. Obstruction is
-    /// binary: when an occluder starts blocking a segment the path's whole gain
-    /// (up to its full path gain, order of `1/length` times the reflection
-    /// coefficients) drops to zero in one compute tick; the engine hides the step
-    /// by cross-fading coefficients over `fade_ms` and ramping each tap per sample.
+    /// continuously as the listener moves across that boundary. Every path segment
+    /// averages transmission over a deterministic 9-ray tube of 12 cm diameter.
+    /// One ray changing from clear to fully blocked changes that segment gain by at
+    /// most 1/9 of its unobstructed value per update. Fully transmissive blockers
+    /// preserve the reflection.
     ///
     /// **Cost** per query: the image tree has `sum_{d=1..N} P (P-1)^(d-1)` nodes
     /// (`P` = `max_reflection_planes`, `N` = order; 32 planes, order 3: 31.8 k), each
@@ -1436,24 +1673,23 @@ impl CpuSimdComputeBackend {
 
         // Visibility of every segment L -> B_n -> .. -> B_1 -> S.
         let mut total = 0.0_f32;
+        let mut blocker_gain = Band8::splat(1.0);
         let mut from = st.listener;
         for k in (0..n).rev() {
             let to = pts[k];
-            if !self.segment_clear_overshoot(from, to, 0.0, 0.0) {
-                return None;
-            }
+            let segment_gain = self.segment_soft_transmission(from, to, materials);
+            blocker_gain = blocker_gain.mul(&segment_gain);
             total += distance3(from, to);
             from = to;
         }
-        if !self.segment_clear_overshoot(from, st.source, 0.0, 0.0) {
-            return None;
-        }
+        let segment_gain = self.segment_soft_transmission(from, st.source, materials);
+        blocker_gain = blocker_gain.mul(&segment_gain);
         total += distance3(from, st.source);
         if !(total.is_finite() && total > 0.0) || total > self.config.max_reflection_distance {
             return None;
         }
         let seq: [usize; MAX_IMAGE_ORDER] = st.seq;
-        path_candidate(
+        let mut candidate = path_candidate(
             &self.config,
             &self.distance_model,
             &self.planes,
@@ -1466,7 +1702,10 @@ impl CpuSimdComputeBackend {
             total,
             edge_w,
             materials,
-        )
+        )?;
+        candidate.refl.gain = candidate.refl.gain.mul(&blocker_gain);
+        candidate.energy = candidate.refl.gain.0.iter().map(|g| g * g).sum();
+        (candidate.energy > 1e-14).then_some(candidate)
     }
 
     /// Triangle of `plane` containing the in-plane point `p` plus the edge window
@@ -1654,5 +1893,29 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
         }
 
         hits
+    }
+}
+
+#[cfg(test)]
+mod two_edge_diffraction_tests {
+    use super::*;
+
+    #[test]
+    // Synthetic analytical reference only: this does not establish agreement with
+    // BEM, UTD, or measured room responses.
+    fn cascaded_two_edge_attenuation_matches_analytic_kurze_anderson_within_1e_6() {
+        let deltas = (0.15_f32, 0.22_f32);
+        let got = combine_occlusion_two_edges(0, OCCLUSION_RAYS, &[0.0; 8], Some(deltas), 343.0);
+        for band in 0..8 {
+            let edge = |delta: f32| {
+                let n = 2.0 * delta * quasar_core::bands::FREQ_BAND_CENTRES[band] / 343.0;
+                let x = (2.0 * std::f32::consts::PI * n).sqrt();
+                let db = (5.0 + 20.0 * (x / x.tanh()).log10()).min(OCCLUSION_MAX_DIFFRACTION_DB);
+                let amplitude = 10.0_f32.powf(-db / 20.0);
+                amplitude
+            };
+            let expected = (edge(deltas.0) * edge(deltas.1)).max(OCCLUSION_FLOOR);
+            assert!((got.0[band] - expected).abs() <= 1.0e-6, "band {band}: {} vs {expected}", got.0[band]);
+        }
     }
 }

@@ -254,6 +254,34 @@ fn trace_ray_hits_the_nearest_surface() {
 }
 
 #[test]
+fn uploaded_bvh_keeps_cpu_gpu_direct_path_parity_across_separated_leaf_clusters() {
+    // Triangles surround (but do not cover) the tested direct ray. The ray enters
+    // the overall BVH bounds and visits internal nodes before pruning to leaves.
+    let mut scene = AcousticScene::new();
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for (cy, cz) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+        let base = vertices.len() as u32;
+        vertices.extend([
+            [0.0, cy - 0.4, cz - 0.4], [0.0, cy + 0.4, cz - 0.4],
+            [0.0, cy + 0.4, cz + 0.4], [0.0, cy - 0.4, cz + 0.4],
+        ]);
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    scene.add_mesh(AcousticMesh::new(900, vertices, indices, 0));
+    let config = WgpuComputeConfig { max_reflection_order: 0, ..WgpuComputeConfig::default() };
+    let Some(gpu) = gpu(scene.clone(), config) else { return };
+    let cpu = CpuSimdComputeBackend::new(scene, CpuSimdConfig { max_reflection_order: 0, ..CpuSimdConfig::default() });
+    let q = SpatialQuery { source_id: 91, source_position: [-1.0, 0.0, 0.0], listener_position: [1.0, 0.0, 0.0] };
+    let gr = gpu.try_query_spatial(std::slice::from_ref(&q), &Mats).expect("GPU query");
+    let cr = cpu.query_spatial(std::slice::from_ref(&q), &Mats);
+    assert_eq!(gr[0].direct_path.occlusion, cr[0].direct_path.occlusion);
+    for band in 0..8 {
+        assert!((gr[0].direct_path.attenuation.0[band] - cr[0].direct_path.attenuation.0[band]).abs() < 1e-5);
+    }
+}
+
+#[test]
 fn full_reflection_lists_match_without_truncation() {
     // Rank cut-offs at 16 paths could hide disagreements among weak paths: compare the
     // complete lists (up to 64 paths, order 3) as well.

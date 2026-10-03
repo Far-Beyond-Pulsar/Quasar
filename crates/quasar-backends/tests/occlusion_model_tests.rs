@@ -167,6 +167,30 @@ fn sweeping_a_source_across_a_column_edge_is_continuous() {
 }
 
 #[test]
+fn staggered_doorway_has_a_two_edge_diffraction_route() {
+    // Two staggered walls create an S-shaped route: the first opening is toward
+    // negative z and the second toward positive z. A single lateral waypoint
+    // cannot clear both panels; the two-corner search can.
+    let (reg, mat) = registry_with(Band8::zeros());
+    let mut scene = AcousticScene::new();
+    for (id, x, z0, z1) in [(1, 3.0, -30.0, 8.0), (2, 6.0, -8.0, 30.0)] {
+        scene.add_mesh(AcousticMesh::new(
+            id,
+            vec![[x, -30.0, z0], [x, 30.0, z0], [x, 30.0, z1], [x, -30.0, z1]],
+            vec![0, 1, 2, 0, 2, 3],
+            mat,
+        ));
+    }
+    // Synthetic geometry regression only; empirical BEM/UTD agreement is not
+    // inferred from this test. The separate analytic cascade unit test has a
+    // 1e-6 linear-amplitude tolerance.
+    let d = occlusion(scene, &reg, &query([10.0, 0.0, 0.0], [0.0, 0.0, 0.0]));
+    assert!(d.occluded);
+    assert!(d.occlusion.0.iter().all(|gain| *gain > 1.0e-4), "two-edge path should contribute above the documented floor: {:?}", d.occlusion);
+    assert!(d.occlusion.0[7] < d.occlusion.0[0], "higher bands should be more attenuated: {:?}", d.occlusion);
+}
+
+#[test]
 fn high_bands_are_shadowed_more_than_low_bands() {
     let curve = sweep(0.05);
     let mut checked = 0;
@@ -191,4 +215,3 @@ fn occlusion_is_deterministic() {
         assert_eq!(x.1, y.1);
     }
 }
-

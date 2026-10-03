@@ -3,6 +3,7 @@
 use quasar_core::bands::{Band8, FREQ_BAND_CENTRES};
 use quasar_core::param_exchange::SpatialCoefficients;
 use quasar_dsp::audio_buffer::AudioBuffer;
+use quasar_dsp::crossfader::EqualPowerCrossfader;
 use quasar_dsp::node_graph::AudioNode;
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 
@@ -19,6 +20,7 @@ fn params(gains: Band8, delay: f32) -> SpatialCoefficients {
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: 0.0,
+        early_late_split_secs: 0.0,
         directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }
@@ -277,6 +279,61 @@ fn constant_radial_speed_gives_the_expected_doppler_shift() {
         let nat = 2.0 * std::f32::consts::PI * freq / SR * (1.0 + r.abs());
         let max_step = all[skip..].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
         assert!(max_step <= nat * 1.05, "r={r}: click, step {max_step} vs {nat}");
+    }
+}
+
+/// Compute-rate coefficient updates must not imprint their cadence on the Doppler pitch.
+/// The crossfader measures the interval between targets and spans that interval, so a
+/// constant-velocity trajectory is one continuous delay ramp at 20 and 30 Hz.
+#[test]
+fn compute_rate_updates_preserve_steady_doppler_pitch() {
+    let freq = 2000.0_f32;
+    for update_blocks in [7usize, 9] { // 26.8 Hz and 20.8 Hz at 256 samples / 48 kHz
+        let mut fade = EqualPowerCrossfader::new(15.0, SR, params(Band8::splat(1.0), 0.0));
+        let mut node = AirAbsorptionOcclusionNode::new(1, SR, 1.0);
+        let mut input = AudioBuffer::new(1, BLOCK as u16);
+        let mut output = AudioBuffer::new(1, BLOCK as u16);
+        let mut rendered = Vec::new();
+        let mut frame = 0usize;
+        let mut next_update = 0usize;
+        let updates = 140usize;
+        let r = 0.05_f32;
+        while next_update < updates {
+            if frame == next_update * update_blocks * BLOCK {
+                let target = params(Band8::splat(1.0), 6000.0 + r * frame as f32);
+                if next_update == 0 {
+                    fade.snap_to_ref(&target);
+                } else {
+                    fade.set_target(&target);
+                }
+                next_update += 1;
+            }
+            for i in 0..BLOCK {
+                input.set(0, i as u16, (2.0 * std::f32::consts::PI * freq * (frame + i) as f32 / SR).sin());
+            }
+            let coeff = fade.current_coefficients();
+            node.process_with_gains(&input, &mut output, &coeff.direct_gain, coeff.direct_delay_samples);
+            rendered.extend_from_slice(&output.channel(0)[..BLOCK]);
+            fade.advance(BLOCK);
+            frame += BLOCK;
+        }
+
+        // Measure pitch in adjacent 0.5 s windows. The mean checks the ideal shift;
+        // the range catches an update-rate wobble hidden by a whole-render average.
+        let window = (SR as usize) / 2;
+        let skip = 6000;
+        let mut estimates = Vec::new();
+        let mut start = skip;
+        while start + window <= rendered.len() {
+            estimates.push(estimate_freq(&rendered[start..start + window]));
+            start += window;
+        }
+        let mean = estimates.iter().sum::<f32>() / estimates.len() as f32;
+        let range = estimates.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - estimates.iter().copied().fold(f32::INFINITY, f32::min);
+        let ideal = freq * (1.0 - r);
+        assert!((mean - ideal).abs() / ideal < 0.01, "{update_blocks} blocks: mean pitch {mean}, expected {ideal}");
+        assert!(range / ideal < 0.01, "{update_blocks} blocks: pitch range {range}, expected under 1% of {ideal}: {estimates:?}");
     }
 }
 

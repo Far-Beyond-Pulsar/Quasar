@@ -20,6 +20,7 @@ fn params() -> SpatialCoefficients {
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -120.0,
+        early_late_split_secs: 0.0,
         directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }

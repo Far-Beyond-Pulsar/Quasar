@@ -280,7 +280,7 @@ engine.set_pull_gain(output_id, src_id, 3, -3.0);
 | Backend | Feature | Description |
 |---------|---------|-------------|
 | `CpuSimdComputeBackend` | `cpu-simd` (default) | BVH + rayon-parallel ray tracing |
-| `WgpuComputeBackend` | `wgpu-compute` | WGSL compute shaders on GPU |
+| `WgpuComputeBackend` | `wgpu-compute` | GPU geometry queries with host-side acoustic material evaluation |
 | `HardwareAcceleratorStub` | always | Future hardware placeholder |
 
 ---
@@ -292,6 +292,46 @@ engine.set_pull_gain(output_id, src_id, 3, -3.0);
 | `quasar-core` | `nebula-import` | Nebula serialization bridge |
 | `quasar-backends` | `cpu-simd` | CPU SIMD backend (default) |
 | `quasar-backends` | `wgpu-compute` | WGPU GPU compute backend |
+
+The `wgpu-compute` feature also enables `cpu-simd`: the GPU backend reuses its
+scene preprocessing and host-side acoustic calculations.
+
+### WGPU Compute Backend
+
+`WgpuComputeBackend` runs geometric work in WGSL. Its dispatch traces the 13
+direct-path probe rays, searches for a one-point diffraction detour, then
+validates image-source reflection paths against the uploaded mirror planes.
+Triangles are traversed through a host-built flattened median BVH. Each leaf holds
+up to four triangles and GPU traversal uses a bounded stack; typical work is
+logarithmic in scene size, with linear worst-case behavior for overlapping bounds.
+The CPU BVH remains more suitable for large detailed meshes because it can use
+rayon-parallel queries and does not upload a geometry buffer per backend.
+
+The host evaluates material transmission and absorption, distance attenuation,
+ISO 9613-1 air absorption, the diffraction blend, reflection ranking and late
+reverb. Those stages share code with the CPU backend. The GPU geometry uses
+`f32`, so grazing-edge cases can differ by device and results are not bitwise
+identical. The reference parity tolerances and scene are recorded in
+[`wgpu_parity_tests.rs`](crates/quasar-backends/tests/wgpu_parity_tests.rs).
+
+`WgpuComputeConfig` controls sample rate, temperature, humidity, reflection
+distance, edge fade, output reflection count, reflection order, plane count,
+candidate capacity and maximum queries per dispatch. Defaults include 32 mirror
+planes (maximum 64), reflection order 3 (maximum 8), 128 pre-ranking candidate
+paths per query, 16 output reflections and 1024 queries per dispatch. If the
+candidate cap is exceeded, the fallible query returns an explicit backend error
+instead of a partial result; increase the capacity for richer scenes. Each dispatch
+uses a per-first-bounce-thread image-tree node budget, unlike the CPU backend's
+per-query budget. Batches exceeding the configured or device storage-buffer
+limit are split into dispatches.
+
+For headless use, `WgpuComputeBackend::new_headless` requests an adapter and
+device, or call `request_headless_device` and pass the returned handles to
+`new`. Missing adapters, insufficient device limits and shader/dispatch errors
+are returned as `SpatialAudioError::Backend` from the fallible APIs. The
+`IAcousticComputeBackend::query_spatial` trait method cannot return an error; on
+runtime failure it logs once and returns an empty result. Keep this blocking
+query on a compute thread, away from the audio callback.
 
 ---
 

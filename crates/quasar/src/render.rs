@@ -200,6 +200,7 @@ impl ListenerRender {
 
 /// Everything the audio thread renders with. See the module docs.
 pub(crate) struct SceneRenderState {
+    sample_rate: f32,
     patch_bay: PatchBayNode,
     outputs: Vec<Box<OutputRender>>,
     listeners: Vec<Box<ListenerRender>>,
@@ -217,6 +218,7 @@ impl SceneRenderState {
         let mut patch_bay = PatchBayNode::new(0);
         patch_bay.set_ramp_ms(quasar_dsp::patch_bay::DEFAULT_PULL_RAMP_MS, sample_rate);
         Self {
+            sample_rate,
             patch_bay,
             outputs: Vec::with_capacity(MAX_SCENE_OUTPUTS),
             listeners: Vec::with_capacity(MAX_LISTENERS),
@@ -468,14 +470,19 @@ impl SceneRenderState {
                 // into the listener frame, through the same decoder, with per-tap ramps (#58).
                 if stage >= 3 {
                     self.tap_targets.clear();
+                    // Hand discrete early taps to the diffuse field at the
+                    // estimated boundary. A short gain fade avoids a hard cut
+                    // as a tap crosses the boundary on a moving probe.
+                    let split_end = coeff.direct_delay_samples.max(0.0)
+                        + coeff.early_late_split_secs.max(0.0) * self.sample_rate;
+                    let split_fade = (0.010 * self.sample_rate).max(1.0);
                     for er in coeff.early_reflections.iter().take(MAX_CROSSFADE_REFLECTIONS) {
                         let (taz, tel) = basis.to_listener_angles(er.azimuth, er.elevation);
-                        let lo = er.gain.0[..4].iter().sum::<f32>() * 0.25;
-                        let hi = er.gain.0[4..].iter().sum::<f32>() * 0.25;
+                        let early_weight = ((split_end - er.delay_samples) / split_fade).clamp(0.0, 1.0);
+                        let gains = er.gain.0.map(|g| g * early_weight);
                         self.tap_targets.push(TapTarget {
                             delay_samples: er.delay_samples,
-                            gain_lo: lo,
-                            gain_hi: hi,
+                            gains,
                             azimuth: taz,
                             elevation: tel,
                         });
@@ -505,8 +512,9 @@ impl SceneRenderState {
                     let coeff = pair.crossfader.current_coefficients();
                     t60_sum = t60_sum.add(&coeff.late_t60);
                     let s1 = if coeff.late_gain_db.is_finite() { db_to_linear(coeff.late_gain_db.min(40.0)) } else { 0.0 };
-                    let d1 = if coeff.direct_delay_samples.is_finite() {
-                        coeff.direct_delay_samples.clamp(0.0, max_d)
+                    let late_onset = coeff.early_late_split_secs.max(0.0) * self.sample_rate;
+                    let d1 = if coeff.direct_delay_samples.is_finite() && late_onset.is_finite() {
+                        (coeff.direct_delay_samples + late_onset).clamp(0.0, max_d)
                     } else {
                         0.0
                     };
@@ -688,6 +696,7 @@ pub(crate) fn initial_scene_coeffs() -> SpatialCoefficients {
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: 0.0,
+        early_late_split_secs: 0.0,
         directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }

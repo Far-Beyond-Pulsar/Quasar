@@ -152,6 +152,8 @@ pub struct SpatialAudioEngine {
     /// Compute-side writer handles of the per-pair parameter triple buffers, `[listener][output]`
     /// (the audio-side `PairRender` holds the other `Arc`).
     pair_params: Vec<Vec<Arc<ParameterTripleBuffer>>>,
+    /// Last resolved source/listener poses, used to skip unchanged pairs (#128).
+    last_pair_poses: Vec<Vec<Option<([f32; 3], [f32; 3], [f32; 3])>>>,
 
     // ── P1 content model (data model that later phases render) ────────────
     /// Loaded multi-channel sources, indexed by `SourceId`.
@@ -208,8 +210,12 @@ impl SpatialAudioEngine {
 
         let triple_buffers = ParameterTripleBuffer::new(num_sources, initial.clone());
 
+        // Spatial targets normally arrive at 20–30 Hz. Keep parameter ramps alive
+        // across that update cadence so delay trajectories do not plateau between
+        // short user-configured fades (#120).
+        let spatial_fade_ms = fade_ms.max(50.0);
         let crossfaders = (0..num_sources)
-            .map(|_| EqualPowerCrossfader::new(fade_ms, sample_rate, initial.clone()))
+            .map(|_| EqualPowerCrossfader::new(spatial_fade_ms, sample_rate, initial.clone()))
             .collect();
 
         let (cmd_tx, cmd_rx) = spsc_channel::<Command>(COMMAND_QUEUE_CAPACITY);
@@ -233,12 +239,13 @@ impl SpatialAudioEngine {
             last_versions: vec![0; num_sources],
             num_sources,
             sample_rate,
-            fade_ms,
+            fade_ms: spatial_fade_ms,
             renderer: Some(renderer),
             cmd_tx,
             garbage_rx,
             shared,
             pair_params: Vec::new(),
+            last_pair_poses: Vec::new(),
             sources: Vec::new(),
             scene_outputs: Vec::new(),
             listeners: Vec::new(),
@@ -260,6 +267,7 @@ impl SpatialAudioEngine {
         // `delay_samples` it reports is in samples at the device rate.
         self.hybrid_sampler.set_sample_rate(self.sample_rate);
         self.hybrid_sampler.set_realtime_backend(backend);
+        self.last_pair_poses.clear();
     }
 
     /// Set baked probe grid data.
@@ -274,6 +282,7 @@ impl SpatialAudioEngine {
     /// backend, so the strategy does not change the direct-path loudness.
     pub fn set_distance_model(&mut self, model: DistanceModel) {
         self.hybrid_sampler.set_distance_model(model);
+        self.last_pair_poses.clear();
     }
 
     /// Set the air temperature (Celsius) and relative humidity (percent) used for
@@ -281,6 +290,7 @@ impl SpatialAudioEngine {
     /// on the next compute update (#121).
     pub fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
         self.hybrid_sampler.set_atmosphere(temperature_celsius, humidity_percent);
+        self.last_pair_poses.clear();
     }
 
     /// Override the distance model of one scene output (`None` = engine-wide model).
@@ -294,11 +304,13 @@ impl SpatialAudioEngine {
     pub fn set_scene_output_distance_model(&mut self, id: SceneOutputId, model: Option<DistanceModel>) {
         let idx = self.scene_output_index(id);
         self.distance_overrides[idx] = model;
+        self.last_pair_poses.clear();
     }
 
     /// Set hybrid sampling strategy.
     pub fn set_strategy(&mut self, strategy: HybridSamplingStrategy) {
         self.hybrid_sampler.set_strategy(strategy);
+        self.last_pair_poses.clear();
     }
 
     /// Get a reference to the material registry.
@@ -308,6 +320,7 @@ impl SpatialAudioEngine {
 
     /// Get a mutable reference to the material registry.
     pub fn materials_mut(&mut self) -> &mut AcousticMaterialRegistry {
+        self.last_pair_poses.clear();
         &mut self.material_registry
     }
 
@@ -377,6 +390,7 @@ impl SpatialAudioEngine {
                 early_reflections,
                 late_t60: res.late_reverb.t60,
                 late_gain_db: res.late_reverb.late_loudness_db,
+                early_late_split_secs: res.late_reverb.early_late_split_secs,
                 version: 0,
             };
 
@@ -436,6 +450,9 @@ impl SpatialAudioEngine {
     pub fn update_scene_spatial(&mut self) {
         let n_out = self.scene_outputs.len();
         let n_lis = self.listeners.len();
+        if self.last_pair_poses.len() != n_lis || self.last_pair_poses.iter().any(|r| r.len() != n_out) {
+            self.last_pair_poses = vec![vec![None; n_out]; n_lis];
+        }
 
         for l in 0..n_lis {
             for o in 0..n_out {
@@ -448,6 +465,8 @@ impl SpatialAudioEngine {
                     listener_position: self.listeners[l].position,
                     source_id: idx,
                 };
+                let pose = (query.source_position, query.listener_position, self.listeners[l].heading);
+                if self.last_pair_poses[l][o] == Some(pose) { continue; }
                 if let Ok(mut res) = self.hybrid_sampler.resolve(&query, &self.material_registry) {
                     if let Some(Some(ov)) = self.distance_overrides.get(o) {
                         let global = self.hybrid_sampler.distance_model().gain(res.direct_path.distance);
@@ -521,6 +540,7 @@ impl SpatialAudioEngine {
                         early_reflections,
                         late_t60: res.late_reverb.t60,
                         late_gain_db: res.late_reverb.late_loudness_db + diffuse_db,
+                        early_late_split_secs: res.late_reverb.early_late_split_secs,
                         version: 0,
                     };
 
@@ -528,6 +548,7 @@ impl SpatialAudioEngine {
                         *params.begin_write(0) = coeffs;
                     }
                     params.end_write(0);
+                    self.last_pair_poses[l][o] = Some(pose);
                 }
             }
         }
@@ -839,6 +860,7 @@ impl SpatialAudioEngine {
         let idx = self.scene_output_index(id);
         self.scene_outputs[idx].orientation = orientation;
         self.scene_outputs[idx].directivity = if directivity.is_finite() { directivity.clamp(0.0, 1.0) } else { 0.0 };
+        self.last_pair_poses.clear();
     }
 
     /// Set a scene output's LFE send (linear gain, `>= 0`; default 0 = none).

@@ -19,6 +19,16 @@ impl MaterialProvider for Abs {
     }
 }
 
+struct AbsTrans { absorption: f32, transmission: f32 }
+impl MaterialProvider for AbsTrans {
+    fn evaluate_material(&self, _h: u32, _c: &RayInteractionContext) -> Band8 {
+        Band8::splat(self.absorption)
+    }
+    fn evaluate_transmission(&self, _h: u32, _c: &RayInteractionContext) -> Band8 {
+        Band8::splat(self.transmission)
+    }
+}
+
 /// Absorption = incidence angle / (pi/2): 0 at normal incidence, 1 at grazing.
 struct AngleAbs;
 impl MaterialProvider for AngleAbs {
@@ -388,15 +398,14 @@ fn path_fades_to_zero_at_the_surface_border_without_steps() {
 }
 
 #[test]
-fn obstruction_is_a_documented_hard_step_of_the_full_path_gain() {
-    // A blocker edge crossing the listener leg removes the whole path in one step.
+fn reflected_path_visibility_fades_across_a_blocker_edge() {
     let mut s = mirror_wall();
     // Panel at z = -2.5, x from 0.9 .. 3 (blocks the leg from the bounce at x=0.5.. to the listener).
     quad(&mut s, 2, [[0.9, -3.0, -2.5], [3.0, -3.0, -2.5], [3.0, 3.0, -2.5], [0.9, 3.0, -2.5]]);
     let b = CpuSimdComputeBackend::new(s, cfg(1));
     let src = [-2.0, 0.0, 0.0];
     let find_wall_path = |lis: [f32; 3]| {
-        reflections(&b, &Abs(0.0), src, lis)
+        reflections(&b, &AbsTrans { absorption: 0.0, transmission: 0.0 }, src, lis)
             .into_iter()
             .filter(|r| r.direction[2] < -0.3 && r.order == 1)
             .map(|r| r.gain.0[3])
@@ -404,10 +413,32 @@ fn obstruction_is_a_documented_hard_step_of_the_full_path_gain() {
     };
     // Listener leg to bounce point (0.5 .. , -5): clear at lx = 0.6 (bounce x = -0.7), blocked at 3.
     let clear = find_wall_path([0.6, 0.0, 0.0]);
-    let blocked = find_wall_path([3.0, 0.0, 0.0]);
     assert!(clear > 0.05);
-    // At lx = 3 the leg to the wall bounce (x = 0.5) passes through the panel.
-    assert!(blocked < clear * 0.01, "blocked {blocked} vs clear {clear}");
+    let mut prev = clear;
+    let mut max_step = 0.0_f32;
+    let mut lx = 0.6;
+    while lx < 3.0 {
+        lx += 0.01;
+        let gain = find_wall_path([lx, 0.0, 0.0]);
+        max_step = max_step.max((gain - prev).abs());
+        prev = gain;
+    }
+    // Nine-ray bundle bounds an isolated sample transition to 1/9 of the
+    // unobstructed gain; allow three simultaneous transitions from geometry.
+    assert!(max_step < clear * (3.0 / 9.0), "largest 1 cm step {max_step}, clear {clear}");
+    assert!(prev < clear * 0.4, "well inside the blocker, gain {prev} vs clear {clear}");
+}
+
+#[test]
+fn fully_transmissive_blocker_preserves_reflected_path() {
+    let mut s = mirror_wall();
+    quad(&mut s, 2, [[0.9, -3.0, -2.5], [3.0, -3.0, -2.5], [3.0, 3.0, -2.5], [0.9, 3.0, -2.5]]);
+    let b = CpuSimdComputeBackend::new(s, cfg(1));
+    let src = [-2.0, 0.0, 0.0];
+    let lis = [3.0, 0.0, 0.0];
+    let r = reflections(&b, &AbsTrans { absorption: 0.0, transmission: 1.0 }, src, lis);
+    assert!(r.iter().any(|path| path.order == 1 && path.direction[2] < -0.3 && path.gain.0[3] > 0.05),
+        "the blocker must not remove a fully transmissive path: {r:?}");
 }
 
 // ── cost ──────────────────────────────────────────────────────────────

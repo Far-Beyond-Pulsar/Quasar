@@ -60,6 +60,7 @@ fn coeffs(direct: [f32; 8], delay: f32, t60: Band8, late_db: f32, refl: Vec<Earl
         early_reflections: refl,
         late_t60: t60,
         late_gain_db: late_db,
+        early_late_split_secs: 0.0,
         directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }
@@ -225,8 +226,7 @@ impl Scenario for DecoderSc {
         for (i, t) in targets.iter_mut().enumerate().take(self.taps) {
             *t = TapTarget {
                 delay_samples: 311.7 + 411.3 * i as f32 + 0.05 * b as f32,
-                gain_lo: 0.5 / (1.0 + i as f32 * 0.3),
-                gain_hi: 0.3 / (1.0 + i as f32 * 0.3),
+                gains: [0.5, 0.48, 0.44, 0.4, 0.37, 0.35, 0.32, 0.3].map(|g| g / (1.0 + i as f32 * 0.3)),
                 azimuth: (i as f32 * 0.9 + 0.02 * b as f32).sin() * 3.0,
                 elevation: (i as f32 * 0.5).sin() * 0.6,
             };
