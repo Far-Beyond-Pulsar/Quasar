@@ -275,3 +275,22 @@ fn source_id_change_snaps() {
     assert_eq!(cur.direct_gain.0[0], 0.9);
     assert_eq!(cur.early_reflections.len(), 1);
 }
+
+// ── snap_to_ref (#119) ───────────────────────────────────────────────
+
+#[test]
+fn snap_to_ref_jumps_to_the_target_by_reference_without_allocating() {
+    let mut a = coeffs(0, 1.0);
+    let mut x = EqualPowerCrossfader::new(15.0, 48_000.0, a.clone());
+    a.direct_delay_samples = 777.0;
+    a.direct_gain = Band8::splat(0.25);
+    a.early_reflections = vec![refl(100.0, 0.3, 0.5)];
+    let cap = x.current_coefficients().early_reflections.capacity();
+    x.snap_to_ref(&a);
+    let c = x.current_coefficients();
+    assert_eq!(c.direct_delay_samples, 777.0);
+    assert_eq!(c.direct_gain, Band8::splat(0.25));
+    assert_eq!(c.early_reflections.len(), 1);
+    assert_eq!(c.early_reflections.capacity(), cap, "no reallocation");
+    assert!(x.is_complete(), "snapped: nothing left to fade");
+}

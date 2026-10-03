@@ -238,6 +238,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var b = 0u; b < 8u; b = b + 1u) {
             let avg = total_absorption[b] / f32(hit_count);
             avg_abs = avg_abs + avg;
+            // STUB (#78): hard-coded room (V = 1000 m^3, S = 100 m^2), not the scene. The GPU path
+            // does not implement the statistical estimate of `CpuSimdComputeBackend` (mesh volume,
+            // random-incidence absorption, Eyring); it is a placeholder until it does.
             let t60 = 0.161 * 1000.0 / (100.0 * max(avg, 0.01));
             out.late_t60[b] = clamp(t60, 0.1, 10.0);
         }

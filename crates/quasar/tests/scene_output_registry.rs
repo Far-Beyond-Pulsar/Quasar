@@ -154,15 +154,22 @@ fn unload_middle_source_remaps_surviving_pulls() {
     // Registry invariant: every loaded source's ID equals its index.
     assert_eq!(engine.sources().len(), 3);
 
-    // Process one block through the scene pipeline. No backend is registered,
-    // so coefficients stay at their initial values; the patch bay must still
-    // mix the two surviving pulls and the listener output must be non-silent.
+    // Process one block through the scene pipeline. A pair renders silence until it has REAL
+    // coefficients (#119), so publish them with the geometry-free stub backend first; the
+    // patch bay must still mix the two surviving pulls and the listener output must be non-silent.
+    engine.set_backend(Box::new(quasar_audio::quasar_backends::hw_stub::HardwareAcceleratorStub::new()));
+    engine.set_strategy(quasar_audio::quasar_core::hybrid::HybridSamplingStrategy::RealTimeOnly);
+    engine.update_scene_spatial();
     let src_a_buf = AudioBuffer::from_channels(&[&[0.25f32; 64], &[0.0f32; 64]]);
     let src_c_buf = AudioBuffer::from_channels(&[&[0.25f32; 64], &[0.0f32; 64]]);
     let src_d_buf = AudioBuffer::from_channels(&[&[0.0f32; 64], &[0.0f32; 64]]);
     let inputs: Vec<&AudioBuffer> = vec![&src_a_buf, &src_c_buf, &src_d_buf];
     let mut listener_out = AudioBuffer::new(2, 64);
-    engine.process_audio_scene(&inputs, std::slice::from_mut(&mut listener_out));
+    // Several blocks: the direct sound now arrives after its propagation delay.
+    for _ in 0..200 {
+        listener_out.clear();
+        engine.process_audio_scene(&inputs, std::slice::from_mut(&mut listener_out));
+    }
     assert!(
         listener_out.peak() > 0.0,
         "surviving pulls must be audible after unloading a middle source"

@@ -56,6 +56,7 @@ impl IAcousticComputeBackend for HardwareAcceleratorStub {
                     late_reverb: LateReverbEstimate {
                         t60: Band8::splat(0.5),
                         early_late_split_secs: 0.05,
+                        // Stub backend: a fixed placeholder room (the CPU backend has the real model).
                         late_loudness_db: -10.0,
                     },
                 }

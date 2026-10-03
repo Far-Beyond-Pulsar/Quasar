@@ -537,6 +537,7 @@ impl WgpuComputeBackend {
                         occlusion: Band8::splat(1.0),
                     },
                     early_reflections: Vec::new(),
+                    // STUB (#78): constant late estimate; the CPU backend has the real model.
                     late_reverb: LateReverbEstimate {
                         t60: Band8::splat(0.5),
                         early_late_split_secs: 0.05,

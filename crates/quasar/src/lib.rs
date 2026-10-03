@@ -124,6 +124,9 @@ struct SceneRenderState {
     /// One crossfader per (listener × scene output), same flat indexing.
     crossfaders: Vec<EqualPowerCrossfader>,
     last_versions: Vec<u64>,
+    /// True once a pair has received its first REAL published coefficients (#119): until then the
+    /// pair renders silence instead of gliding / sounding from the default coefficients.
+    ready: Vec<bool>,
     /// Per scene output DSP chain (mono). Reference listener for occ/early/rev = listener 0.
     occ: Vec<AirAbsorptionOcclusionNode>,
     early: Vec<EarlyReflectionDelayNode>,
@@ -191,6 +194,7 @@ impl SceneRenderState {
             triple_buffers: ParameterTripleBuffer::new(0, initial.clone()),
             crossfaders: Vec::new(),
             last_versions: Vec::new(),
+            ready: Vec::new(),
             occ: Vec::new(),
             early: Vec::new(),
             rev_bus: Vec::new(),
@@ -642,7 +646,13 @@ impl SpatialAudioEngine {
             if ver > self.scene.last_versions[idx] {
                 self.scene.last_versions[idx] = ver;
                 let latest = unsafe { self.scene.triple_buffers.read(idx) };
-                self.scene.crossfaders[idx].set_target(latest);
+                if self.scene.ready[idx] {
+                    self.scene.crossfaders[idx].set_target(latest);
+                } else {
+                    // First real update of this pair: snap (no glide from the defaults).
+                    self.scene.crossfaders[idx].snap_to_ref(latest);
+                    self.scene.ready[idx] = true;
+                }
             }
         }
 
@@ -663,6 +673,10 @@ impl SpatialAudioEngine {
             .min(self.scene.combined.len())
             .min(self.scene.crossfaders.len());
         for o in 0..n_out_proc {
+            if !self.scene.ready[o] {
+                self.scene.combined[o].clear(); // no real coefficients yet: silence (#119)
+                continue;
+            }
             let coeff = self.scene.crossfaders[o].current_coefficients();
 
             match stage {
@@ -720,6 +734,9 @@ impl SpatialAudioEngine {
             let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
             for o in 0..n_out_proc {
                 let idx = l * n_out + o;
+                if !self.scene.ready[idx] {
+                    continue; // no real coefficients yet: silence (#119)
+                }
                 let coeff = self.scene.crossfaders[idx].current_coefficients();
                 let (az, el) = basis.to_listener_angles(coeff.direct_azimuth, coeff.direct_elevation);
 
@@ -814,8 +831,13 @@ impl SpatialAudioEngine {
                 let max_d = (self.scene.early[0].max_tap_delay() - block as f32).max(0.0);
                 self.scene.rev_in[..block].fill(0.0);
                 let mut t60_sum = Band8::zeros();
+                let mut n_ready = 0usize;
                 for o in 0..n_out_proc {
                     let idx = l * n_out + o;
+                    if !self.scene.ready[idx] {
+                        continue;
+                    }
+                    n_ready += 1;
                     let coeff = self.scene.crossfaders[idx].current_coefficients();
                     t60_sum = t60_sum.add(&coeff.late_t60);
                     let s1 = if coeff.late_gain_db.is_finite() { db_to_linear(coeff.late_gain_db.min(40.0)) } else { 0.0 };
@@ -843,7 +865,7 @@ impl SpatialAudioEngine {
                     }
                 }
                 let bus = &mut self.scene.rev_bus[l];
-                bus.set_t60(&t60_sum.scale(1.0 / n_out_proc.max(1) as f32));
+                bus.set_t60(&t60_sum.scale(1.0 / n_ready.max(1) as f32));
                 bus.set_wet(self.scene.rev_gain[l]);
                 let n_fdn = self.scene.rev_slots[l].len();
                 bus.process_bus(&self.scene.rev_in[..block], &mut self.scene.rev_out[l], n_fdn);
@@ -1045,6 +1067,7 @@ impl SpatialAudioEngine {
             triple_buffers,
             crossfaders,
             last_versions: vec![0; n_out * n_lis],
+            ready: vec![false; n_out * n_lis],
             occ,
             early,
             rev_bus,

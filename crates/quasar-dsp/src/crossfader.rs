@@ -296,6 +296,14 @@ impl EqualPowerCrossfader {
         t
     }
 
+    /// Snap to `coefficients` instantly (no crossfade), copying BY REFERENCE into the
+    /// preallocated storage: never allocates, safe on the audio thread. Used for the first
+    /// real update of a pair so it does not glide from the default coefficients (#119).
+    pub fn snap_to_ref(&mut self, coefficients: &SpatialCoefficients) {
+        copy_coeffs(&mut self.target, coefficients);
+        self.snap_internal();
+    }
+
     /// Reset to a new starting point instantly (no crossfade).
     pub fn snap_to(&mut self, coefficients: SpatialCoefficients) {
         copy_coeffs(&mut self.target, &coefficients);

@@ -138,7 +138,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f32 {
 /// Documented bound on the zero-lag inter-channel correlation of the decoded reverb
 /// (2 s of white-noise excitation): the Hadamard output tap sets are orthogonal, so the
 /// channels are decorrelated copies of the same tail.
-const REVERB_CORRELATION_BOUND: f32 = 0.2;
+const REVERB_CORRELATION_BOUND: f32 = 0.15; // measured max 0.085 (5.1), 0.04 stereo / HRTF
 
 #[test]
 fn decoded_reverb_channels_are_decorrelated() {
