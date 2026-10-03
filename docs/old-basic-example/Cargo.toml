@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "quasar-audio-example-basic"
+version = "0.1.0"
+edition = "2021"
+description = "Quasar spatial audio debug visualization demo (based on Helio indoor_cathedral)"
+
+[dependencies]
+quasar-audio = { path = "../../crates/quasar", features = ["streaming"] }
+quasar-core = { path = "../../crates/quasar-core" }
+quasar-materials = { path = "../../crates/quasar-materials" }
+quasar-dsp = { path = "../../crates/quasar-dsp" }
+quasar-backends = { path = "../../crates/quasar-backends", features = ["cpu-simd"] }
+
+helio =                    { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16", features = ["bake"] }
+helio-core =               { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+libhelio =                 { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+helio-default-graphs =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+helio-pass-perf-overlay =  { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+helio-pass-debug-overlay = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+helio-pass-postprocess =   { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+helio-pass-billboard =     { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "3139fa1d995dd77721483159c825746fd55c6f16" }
+
+wgpu = "30"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+hound = "3"
+cpal = "0.15"

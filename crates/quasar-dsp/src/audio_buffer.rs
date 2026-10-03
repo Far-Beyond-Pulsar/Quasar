@@ -54,6 +54,14 @@ impl AudioBuffer {
         self.num_samples
     }
 
+    /// Change the number of valid samples per channel (clamped to [`DEFAULT_BLOCK_SIZE`]), keeping
+    /// the storage. Used by the renderer to size its internal scratch buffers to the block it is
+    /// asked to render, so a short block is processed as a short block (not zero-padded to 256).
+    /// Never allocates.
+    pub fn set_samples(&mut self, num_samples: u16) {
+        self.num_samples = num_samples.min(DEFAULT_BLOCK_SIZE as u16);
+    }
+
     /// Get a reference to a channel's sample data.
     pub fn channel(&self, channel: u16) -> &[f32] {
         let idx = channel as usize;

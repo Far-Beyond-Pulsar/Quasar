@@ -32,6 +32,9 @@ pub struct CpuSimdComputeBackend {
     config: CpuSimdConfig,
     distance_model: DistanceModel,
     debug_capture: std::sync::Arc<crate::debug_capture::AcousticDebugCapture>,
+    /// Total BVH rays traced since the last [`Self::reset_ray_counter`] (always counted,
+    /// independent of the debug capture; one relaxed atomic add per ray).
+    rays_traced: std::sync::atomic::AtomicU64,
 }
 
 /// Configuration for the CPU SIMD backend.
@@ -66,6 +69,23 @@ pub struct CpuSimdConfig {
     /// overwrites it with its own rate through
     /// [`IAcousticComputeBackend::set_sample_rate`] when the backend is installed.
     pub sample_rate: f32,
+    /// Closed-room shortcuts (default: true). For a watertight scene (every edge shared by two
+    /// triangles; winding is irrelevant, unlike `room_is_closed`), a query with exactly ONE
+    /// endpoint outside the shell skips the geometrically impossible work: the diffraction
+    /// detour search (no one- or two-point detour can connect the two sides of a closed
+    /// surface; exact for any material) and, when the materials are fully opaque, the early
+    /// reflections (every path crosses the shell, which blocks it, see
+    /// `trace_early_reflections`). Results are identical to `false`, which keeps the
+    /// exhaustive search (used by the tests to compare both).
+    pub closed_room_shortcuts: bool,
+    /// With `closed_room_shortcuts`, a query whose endpoints are on opposite sides of the
+    /// shell skips early reflections when every material transmission is at most this
+    /// amplitude (default 0.0 = only fully opaque scenes: results identical to the
+    /// exhaustive search). A small positive value (e.g. 0.05 = -26 dB) is an approximation
+    /// for walls that leak slightly: every reflected path then crosses the shell once and is
+    /// at most that loud relative to the direct leakage, so dropping them is inaudible next
+    /// to the late field, and the tens of thousands of validation rays are saved.
+    pub separated_reflection_max_transmission: f32,
 }
 
 impl Default for CpuSimdConfig {
@@ -81,6 +101,8 @@ impl Default for CpuSimdConfig {
             temperature_celsius: 20.0,
             humidity_percent: 50.0,
             sample_rate: 48_000.0,
+            closed_room_shortcuts: true,
+            separated_reflection_max_transmission: 0.0,
         }
     }
 }
@@ -109,6 +131,12 @@ pub(crate) const OCCLUSION_DETOUR_MIN_OFFSET: f32 = 0.05;
 pub(crate) const OCCLUSION_DETOUR_MAX_OFFSET: f32 = 26.0;
 /// Bisection refinements of the detour offset (resolution about offset / 32).
 pub(crate) const OCCLUSION_BISECT_STEPS: usize = 5;
+/// Maximum BVH rays one direct-path query may spend on the diffraction detour searches
+/// (single detour: at most 8 directions x (10 exponential + 5 bisection steps) x 2 legs =
+/// 240 rays; the two-edge fallback is what grows without bound, up to ~10^4 rays when no
+/// route exists). When it is spent the search stops and reports the best route found so
+/// far (none = no diffraction). Chosen well above what any test geometry needs.
+const DIFFRACTION_PROBE_BUDGET: u32 = 2048;
 /// How far (m) a detour leg is extended past the detour point when checking it.
 pub(crate) const OCCLUSION_DETOUR_MARGIN: f32 = 0.02;
 /// Cap of the single-edge diffraction attenuation (dB).
@@ -895,6 +923,45 @@ pub(crate) fn rank_reflections(mut found: Vec<PathCandidate>, cfg: &CpuSimdConfi
     out
 }
 
+// ── Closed-room side test ─────────────────────────────────────────────
+
+/// Side of a closed surface a point lies on, see `CpuSimdComputeBackend::room_side`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomSide {
+    /// Odd number of surface crossings to infinity (the room cavity).
+    Inside,
+    /// Even number (open air / outside the shell).
+    Outside,
+    /// Scene not closed, or the rays disagreed: callers must not assume anything.
+    Unknown,
+}
+
+/// Per-query result of `shell_info`.
+#[derive(Clone, Copy)]
+struct ShellInfo {
+    source: RoomSide,
+    listener: RoomSide,
+    /// A watertight surface separates the endpoints: no diffraction detour exists.
+    separated: bool,
+    /// Additionally every reflected path is blocked by the (opaque enough) shell.
+    skip_reflections: bool,
+}
+
+/// Fixed, skew (never axis aligned: box edges and faces are) directions of the parity test.
+const SIDE_DIRS: [[f32; 3]; 5] = [
+    [0.371, 0.557, 0.743],
+    [-0.613, 0.489, 0.621],
+    [0.287, -0.771, 0.569],
+    [-0.532, -0.337, -0.776],
+    [0.809, 0.173, -0.563],
+];
+/// Restart distance behind a hit so an edge shared by two triangles counts once.
+const SIDE_RAY_EPS: f32 = 1.0e-4;
+/// More crossings than this along one ray: the ray is discarded.
+const SIDE_MAX_CROSSINGS: usize = 64;
+/// Points this far outside the scene's bounding box are outside a closed surface.
+const SIDE_BOX_EPS: f32 = 1.0e-3;
+
 // ── Room statistics (late-reverb estimate) ────────────────────────────
 
 /// Midpoint angles of the random-incidence (Paris) integration.
@@ -914,11 +981,16 @@ pub(crate) struct RoomStats {
     /// The triangle soup is a closed, consistently wound surface (the volume is exact);
     /// `false` means the bounding-box volume fallback was used (or the scene is empty).
     pub(crate) closed: bool,
+    /// Every edge is shared by exactly two triangles, whatever their winding: the soup
+    /// is a watertight surface, so the parity of surface crossings along any path decides
+    /// inside / outside (used by the closed-room shortcuts, which need no consistent
+    /// winding; implied by `closed`).
+    pub(crate) watertight: bool,
 }
 
 impl RoomStats {
     pub(crate) fn empty() -> Self {
-        Self { volume: 0.0, area: 0.0, by_material: Vec::new(), min: [0.0; 3], max: [0.0; 3], closed: false }
+        Self { volume: 0.0, area: 0.0, by_material: Vec::new(), min: [0.0; 3], max: [0.0; 3], closed: false, watertight: false }
     }
 
     /// Inside the bounding box padded by 0.5 m.
@@ -956,6 +1028,7 @@ impl RoomStats {
             }
         }
         let closed = edges.iter().all(|(&(p, q), &c)| c == 1 && edges.get(&(q, p)) == Some(&1));
+        let watertight = edges.iter().all(|(&(p, q), &c)| c + edges.get(&(q, p)).copied().unwrap_or(0) == 2);
         let box_volume = (0..3).map(|i| (aabb.max[i] - aabb.min[i]).max(0.0)).product::<f32>();
         let volume_closed = closed && signed.abs() > 1e-6;
         let volume = if volume_closed {
@@ -963,7 +1036,7 @@ impl RoomStats {
         } else {
             box_volume
         };
-        Self { volume, area, by_material: per.into_iter().collect(), min: aabb.min, max: aabb.max, closed: volume_closed }
+        Self { volume, area, by_material: per.into_iter().collect(), min: aabb.min, max: aabb.max, closed: volume_closed, watertight }
     }
 }
 
@@ -1068,6 +1141,7 @@ impl CpuSimdComputeBackend {
             config,
             distance_model: DistanceModel::default(),
             debug_capture: Default::default(),
+            rays_traced: std::sync::atomic::AtomicU64::new(0),
         };
         backend.build_bvh();
         backend
@@ -1109,6 +1183,103 @@ impl CpuSimdComputeBackend {
         self.room_warnings
     }
 
+    /// Which side of the closed surface `p` is on (see [`RoomSide`]). `Unknown` for
+    /// scenes that are not a watertight surface (callers then keep the
+    /// exhaustive behaviour). Outside the scene's bounding box is `Outside` without any
+    /// ray; otherwise the parity of surface crossings along [`SIDE_DIRS`] decides, with
+    /// 3 rays (unanimous) or 5 rays (at least 4 agreeing), else `Unknown`. A ray that
+    /// grazes an edge is tolerated: after every hit it restarts just behind the hit
+    /// point, so a double hit on a shared edge is counted once, and the other rays
+    /// outvote a ray that slips through a crack. Odd parity = enclosed (the room cavity,
+    /// or the inside of a solid wound the other way); even = open air.
+    pub fn room_side(&self, p: [f32; 3]) -> RoomSide {
+        if !self.room.watertight || self.bvh.is_none() || p.iter().any(|v| !v.is_finite()) {
+            return RoomSide::Unknown;
+        }
+        if (0..3).any(|i| p[i] < self.room.min[i] - SIDE_BOX_EPS || p[i] > self.room.max[i] + SIDE_BOX_EPS) {
+            return RoomSide::Outside;
+        }
+        let (mut inside, mut outside) = (0usize, 0usize);
+        for (i, d) in SIDE_DIRS.iter().enumerate() {
+            match self.crossings_along(p, normalize3(*d)) {
+                Some(n) if n % 2 == 1 => inside += 1,
+                Some(_) => outside += 1,
+                None => {}
+            }
+            if i == 2 && (inside == 3 || outside == 3) {
+                break;
+            }
+        }
+        if inside >= 4 || inside == 3 && outside == 0 {
+            RoomSide::Inside
+        } else if outside >= 4 || outside == 3 && inside == 0 {
+            RoomSide::Outside
+        } else {
+            RoomSide::Unknown
+        }
+    }
+
+    /// Number of surface crossings of the ray `p + t dir`, `None` if more than
+    /// [`SIDE_MAX_CROSSINGS`]. Uses the BVH directly (counted by `rays_traced`, never
+    /// captured by the debug overlay: these are bookkeeping rays, not acoustic paths).
+    fn crossings_along(&self, p: [f32; 3], dir: [f32; 3]) -> Option<usize> {
+        let bvh = self.bvh.as_ref()?;
+        let mut origin = p;
+        let mut n = 0usize;
+        loop {
+            self.rays_traced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ray = Ray { origin, direction: dir, min_distance: SIDE_RAY_EPS, max_distance: f32::MAX };
+            match bvh.intersect(&ray) {
+                Some(h) if h.hit => {
+                    n += 1;
+                    if n > SIDE_MAX_CROSSINGS {
+                        return None;
+                    }
+                    origin = h.point;
+                }
+                _ => return Some(n),
+            }
+        }
+    }
+
+    /// Largest per-band amplitude transmission over all materials of the scene (sampled at
+    /// 4 incidence angles; 0 = every material is fully opaque). Non-finite values count as 1.
+    fn max_transmission(&self, materials: &dyn MaterialProvider) -> f32 {
+        let mut max_t = 0.0_f32;
+        for &(handle, _) in &self.room.by_material {
+            for &theta in &[0.0_f32, 0.5, 1.0, 1.4] {
+                let ctx = RayInteractionContext {
+                    surface_normal: [0.0, 1.0, 0.0],
+                    ray_direction: [theta.sin(), -theta.cos(), 0.0],
+                    incident_angle_rad: theta,
+                    temperature_celsius: self.config.temperature_celsius,
+                    humidity_percent: self.config.humidity_percent,
+                };
+                for &t in &materials.evaluate_transmission(handle, &ctx).0 {
+                    max_t = max_t.max(if t.is_finite() { t } else { 1.0 });
+                }
+            }
+        }
+        max_t
+    }
+
+    /// Side of both endpoints and which closed-room shortcuts apply to this query.
+    /// `separated`: shortcuts enabled, both sides known and different (an odd number of
+    /// surface crossings on EVERY path between them): no detour exists (exact).
+    /// `skip_reflections`: additionally the shell blocks every reflected path, i.e. the
+    /// largest material transmission is `<= separated_reflection_max_transmission`.
+    fn shell_info(&self, source: [f32; 3], listener: [f32; 3], materials: &dyn MaterialProvider) -> ShellInfo {
+        let want_sides = self.config.closed_room_shortcuts || self.debug_capture.is_enabled();
+        if !want_sides || !self.room.watertight {
+            return ShellInfo { source: RoomSide::Unknown, listener: RoomSide::Unknown, separated: false, skip_reflections: false };
+        }
+        let (s, l) = (self.room_side(source), self.room_side(listener));
+        let differ = matches!((s, l), (RoomSide::Inside, RoomSide::Outside) | (RoomSide::Outside, RoomSide::Inside));
+        let separated = self.config.closed_room_shortcuts && differ;
+        let skip_reflections = separated && self.max_transmission(materials) <= self.config.separated_reflection_max_transmission;
+        ShellInfo { source: s, listener: l, separated, skip_reflections }
+    }
+
     /// Number of distinct mirror planes the early-reflection tracer considers
     /// (coplanar triangles merged, capped at `max_reflection_planes`).
     pub fn reflection_plane_count(&self) -> usize {
@@ -1145,10 +1316,23 @@ impl CpuSimdComputeBackend {
         self.debug_capture.clone()
     }
 
+    /// Number of BVH rays traced (all stages: occlusion, diffraction probing,
+    /// reflection validation, `trace_ray`) since construction or the last
+    /// [`Self::reset_ray_counter`].
+    pub fn rays_traced(&self) -> u64 {
+        self.rays_traced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reset [`Self::rays_traced`] to zero.
+    pub fn reset_ray_counter(&self) {
+        self.rays_traced.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn trace_single_ray(&self, ray: &Ray) -> Option<RayHit> {
+        self.rays_traced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hit = self.bvh.as_ref().and_then(|bvh| bvh.intersect(ray));
         if self.debug_capture.is_enabled() {
-            self.debug_capture.record_ray(ray.clone(), hit.clone());
+            self.debug_capture.record_ray(ray, &hit);
         }
         hit
     }
@@ -1162,10 +1346,11 @@ impl CpuSimdComputeBackend {
         source: &[f32; 3],
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
+        separated: bool,
     ) -> DirectPathResult {
         let dist = distance3(*source, *listener);
 
-        let occ = self.compute_occlusion(source, listener, materials);
+        let occ = self.compute_occlusion(source, listener, materials, separated);
 
         let atten = Band8::splat(self.distance_model.gain(dist));
         let air = quasar_core::air::air_absorption_gain(
@@ -1258,6 +1443,7 @@ impl CpuSimdComputeBackend {
         to: [f32; 3],
         materials: &dyn MaterialProvider,
     ) -> Band8 {
+        let _kind = self.debug_capture.scoped(crate::debug_capture::DebugRayKind::ReflectionValidation);
         let axis = normalize3(sub3(to, from));
         let (u, w) = probe_basis(axis);
         let mut sum = [0.0_f32; 8];
@@ -1310,6 +1496,20 @@ impl CpuSimdComputeBackend {
         !matches!(self.trace_single_ray(&ray), Some(h) if h.hit)
     }
 
+    /// Take `n` rays from the diffraction probe budget of one direct-path query; `false`
+    /// (and the budget is emptied) when fewer than `n` are left, so the search stops
+    /// firing rays and reports what it has found so far.
+    fn spend_probes(budget: &std::cell::Cell<u32>, n: u32) -> bool {
+        let left = budget.get();
+        if left >= n {
+            budget.set(left - n);
+            true
+        } else {
+            budget.set(0);
+            false
+        }
+    }
+
     /// Extra path length `|L-P| + |P-S| - |L-S|` of the shortest one-point detour
     /// around whatever blocks `listener -> target`, found by probing around the
     /// first hit `h`: for each of [`OCCLUSION_DETOUR_DIRS`] lateral directions the
@@ -1323,7 +1523,9 @@ impl CpuSimdComputeBackend {
         h: [f32; 3],
         u: [f32; 3],
         w: [f32; 3],
+        budget: &std::cell::Cell<u32>,
     ) -> Option<f32> {
+        let _kind = self.debug_capture.scoped(crate::debug_capture::DebugRayKind::DiffractionProbe);
         let direct = distance3(listener, target);
         let mut best: Option<f32> = None;
         for j in 0..OCCLUSION_DETOUR_DIRS {
@@ -1340,7 +1542,8 @@ impl CpuSimdComputeBackend {
                 // Each leg is checked a little beyond the detour point so a point that
                 // merely lies ON an occluding surface (e.g. in the plane of a wall) does
                 // not count as a way around it.
-                self.segment_clear_overshoot(listener, p, OCCLUSION_DETOUR_MARGIN, 0.0)
+                Self::spend_probes(budget, 2)
+                    && self.segment_clear_overshoot(listener, p, OCCLUSION_DETOUR_MARGIN, 0.0)
                     && self.segment_clear_overshoot(p, target, 0.0, OCCLUSION_DETOUR_MARGIN)
             };
 
@@ -1385,7 +1588,9 @@ impl CpuSimdComputeBackend {
         first_hit: [f32; 3],
         u: [f32; 3],
         w: [f32; 3],
+        budget: &std::cell::Cell<u32>,
     ) -> Option<(f32, f32)> {
+        let _kind = self.debug_capture.scoped(crate::debug_capture::DebugRayKind::DiffractionProbe);
         let mut best: Option<(f32, f32, f32)> = None;
         for a in 0..OCCLUSION_DETOUR_DIRS {
             let phi_a = a as f32 * (2.0 * std::f32::consts::PI / OCCLUSION_DETOUR_DIRS as f32);
@@ -1394,10 +1599,10 @@ impl CpuSimdComputeBackend {
             let mut offset_a = OCCLUSION_DETOUR_MIN_OFFSET;
             while offset_a <= OCCLUSION_DETOUR_MAX_OFFSET {
                 let p1 = [first_hit[0] + dir_a[0] * offset_a, first_hit[1] + dir_a[1] * offset_a, first_hit[2] + dir_a[2] * offset_a];
-                if self.segment_clear_overshoot(listener, p1, OCCLUSION_DETOUR_MARGIN, 0.0) {
+                if Self::spend_probes(budget, 1) && self.segment_clear_overshoot(listener, p1, OCCLUSION_DETOUR_MARGIN, 0.0) {
                     let leg = distance3(p1, target);
                     let ray = Ray { origin: p1, direction: normalize3(sub3(target, p1)), min_distance: OCCLUSION_EPS, max_distance: leg - OCCLUSION_EPS };
-                    let Some(hit) = self.trace_single_ray(&ray).filter(|hit| hit.hit) else {
+                    let Some(hit) = Self::spend_probes(budget, 1).then(|| self.trace_single_ray(&ray)).flatten().filter(|hit| hit.hit) else {
                         offset_a *= 2.0;
                         continue;
                     };
@@ -1409,7 +1614,8 @@ impl CpuSimdComputeBackend {
                         let mut offset_b = OCCLUSION_DETOUR_MIN_OFFSET;
                         while offset_b <= OCCLUSION_DETOUR_MAX_OFFSET {
                             let p2 = [h2[0] + dir_b[0] * offset_b, h2[1] + dir_b[1] * offset_b, h2[2] + dir_b[2] * offset_b];
-                            if self.segment_clear_overshoot(p1, p2, OCCLUSION_DETOUR_MARGIN, 0.0)
+                            if Self::spend_probes(budget, 2)
+                                && self.segment_clear_overshoot(p1, p2, OCCLUSION_DETOUR_MARGIN, 0.0)
                                 && self.segment_clear_overshoot(p2, target, 0.0, OCCLUSION_DETOUR_MARGIN)
                             {
                                 let extra_a = (distance3(listener, p1) + distance3(p1, h2) - distance3(listener, h2)).max(0.0);
@@ -1471,6 +1677,7 @@ impl CpuSimdComputeBackend {
         source: &[f32; 3],
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
+        separated: bool,
     ) -> OcclusionResult {
         let clear = OcclusionResult { bands: Band8::splat(1.0), occluded: false };
         let dist = distance3(*source, *listener);
@@ -1482,6 +1689,7 @@ impl CpuSimdComputeBackend {
         let axis = normalize3(sub3(*source, *listener));
         let (u, w) = probe_basis(axis);
 
+        let probe_kind = self.debug_capture.scoped(crate::debug_capture::DebugRayKind::OcclusionProbe);
         let mut visible = 0usize;
         let mut blocked = 0usize;
         let mut t2_sum = [0.0_f32; 8];
@@ -1520,17 +1728,21 @@ impl CpuSimdComputeBackend {
             }
         }
 
+        drop(probe_kind);
         if blocked == 0 {
             return clear;
         }
 
         // Diffraction amplitude per band for the blocked rays.
-        let delta = reference.and_then(|(target, h)| self.detour_extra_path(*listener, target, h, u, w));
+        // A closed opaque surface between the endpoints has no one- or two-point detour (the
+        // polyline L-P-S crosses it an odd number of times), so the search is skipped.
+        let budget = std::cell::Cell::new(DIFFRACTION_PROBE_BUDGET);
+        let delta = if separated { None } else { reference.and_then(|(target, h)| self.detour_extra_path(*listener, target, h, u, w, &budget)) };
         // Preserve the calibrated single-edge path whenever it exists. The second
         // edge search is a fallback for corner/doorway shadows the one-point route
         // cannot clear, avoiding mode switching at ordinary single edges.
-        let two_edges = if delta.is_none() {
-            reference.and_then(|(target, h)| self.double_detour_excesses(*listener, target, h, u, w))
+        let two_edges = if delta.is_none() && !separated {
+            reference.and_then(|(target, h)| self.double_detour_excesses(*listener, target, h, u, w, &budget))
         } else { None };
         let bands = if let Some(deltas) = two_edges {
             combine_occlusion_two_edges(visible, blocked, &t2_sum, Some(deltas), self.config.speed_of_sound)
@@ -1593,12 +1805,27 @@ impl CpuSimdComputeBackend {
         source: &[f32; 3],
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
+        separated: bool,
     ) -> Vec<EarlyReflection> {
         let order = (self.config.max_reflection_order as usize).min(MAX_IMAGE_ORDER);
         if order == 0 || self.planes.is_empty() || self.bvh.is_none() {
             return Vec::new();
         }
         if source.iter().chain(listener.iter()).any(|v| !v.is_finite()) {
+            return Vec::new();
+        }
+        // Closed-room shortcut (`skip_reflections`). When a watertight, opaque surface separates the endpoints (one
+        // inside, one outside: every polyline between them crosses it an odd number of
+        // times) some segment of every candidate path crosses the shell, and the visibility
+        // test below gives that segment transmission exactly 0, so the whole path is
+        // rejected after thousands of rays. The result is therefore the empty list.
+        // This relies on the CURRENT blocking policy (a surface blocks a reflected path
+        // up to its transmission, which `max_transmission` verified to be 0). If
+        // reflections that pass through walls with a non-zero transmission, or diffuse
+        // leakage, are ever modelled for opaque materials, this shortcut must be revisited.
+        // Both endpoints outside is NOT shortcut: reflections off the building's outer
+        // faces are valid paths.
+        if separated {
             return Vec::new();
         }
         let mut st = ImageSearch {
@@ -1656,6 +1883,13 @@ impl CpuSimdComputeBackend {
         }
     }
 
+    /// Hand a rejected image-source candidate to the debug capture (detailed mode only).
+    fn note_rejected(&self, st: &ImageSearch, bounces: &[[f32; 3]], reason: crate::debug_capture::RejectReason) {
+        if self.debug_capture.is_enabled() && self.debug_capture.rejected_enabled() {
+            self.debug_capture.record_rejected(st.source, st.listener, bounces, reason);
+        }
+    }
+
     /// Geometric + visibility validation of the sequence `st.seq[..n]` (images
     /// `st.images[..=n]`); builds the [`EarlyReflection`] when it is a real path.
     fn validate_image_path(
@@ -1684,8 +1918,12 @@ impl CpuSimdComputeBackend {
                 prev[1] + (target[1] - prev[1]) * t,
                 prev[2] + (target[2] - prev[2]) * t,
             ];
-            let (tri, w) = self.locate_on_plane(plane, b)?;
+            let located = self.locate_on_plane(plane, b);
             pts[k - 1] = b;
+            let Some((tri, w)) = located else {
+                self.note_rejected(st, &pts[k - 1..n], crate::debug_capture::RejectReason::OutsideSurface);
+                return None;
+            };
             tri_of[k - 1] = tri;
             edge_w *= w;
             prev = b;
@@ -1709,7 +1947,7 @@ impl CpuSimdComputeBackend {
             return None;
         }
         let seq: [usize; MAX_IMAGE_ORDER] = st.seq;
-        let mut candidate = path_candidate(
+        let candidate = path_candidate(
             &self.config,
             &self.distance_model,
             &self.planes,
@@ -1722,10 +1960,20 @@ impl CpuSimdComputeBackend {
             total,
             edge_w,
             materials,
-        )?;
+        );
+        let Some(mut candidate) = candidate else {
+            self.note_rejected(st, &pts[..n], crate::debug_capture::RejectReason::BelowEnergy);
+            return None;
+        };
         candidate.refl.gain = candidate.refl.gain.mul(&blocker_gain);
         candidate.energy = candidate.refl.gain.0.iter().map(|g| g * g).sum();
-        if !(candidate.energy > 1e-14) { return None; }
+        if !(candidate.energy > 1e-14) {
+            use crate::debug_capture::RejectReason;
+            let blocker_energy: f32 = blocker_gain.0.iter().map(|g| g * g).sum();
+            let reason = if edge_w < 1e-3 { RejectReason::EdgeFade } else if blocker_energy < 1e-6 { RejectReason::Blocked } else { RejectReason::BelowEnergy };
+            self.note_rejected(st, &pts[..n], reason);
+            return None;
+        }
         if self.debug_capture.is_enabled() {
             st.debug_paths.push(crate::debug_capture::DebugReflectionPath {
                 source: st.source,
@@ -1735,6 +1983,8 @@ impl CpuSimdComputeBackend {
                 material_handles: tri_of[..n].iter().map(|&i| self.triangles[i].material_handle).collect(),
                 reflection: candidate.refl.clone(),
                 selected: false,
+                source_id: 0,
+                query_index: 0,
             });
         }
         Some(candidate)
@@ -1863,18 +2113,41 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
         materials: &dyn MaterialProvider,
     ) -> Vec<SpatialQueryResult> {
         use rayon::iter::IntoParallelRefIterator;
+        use rayon::iter::IndexedParallelIterator;
         use rayon::iter::ParallelIterator;
 
         if queries.is_empty() {
             return Vec::new();
         }
 
+        let capturing = self.debug_capture.is_enabled();
         let results: Vec<SpatialQueryResult> = queries
             .par_iter()
-            .map(|q| {
-                let direct = self.compute_direct_path(&q.source_position, &q.listener_position, materials);
-                let early = self.trace_early_reflections(&q.source_position, &q.listener_position, materials);
+            .enumerate()
+            .map(|(index, q)| {
+                if capturing {
+                    self.debug_capture.begin_query(q.source_id, index as u32);
+                }
+                let shell = self.shell_info(q.source_position, q.listener_position, materials);
+                let direct = self.compute_direct_path(&q.source_position, &q.listener_position, materials, shell.separated);
+                let early = self.trace_early_reflections(&q.source_position, &q.listener_position, materials, shell.skip_reflections);
                 let late = self.estimate_late_reverb(&q.source_position, &q.listener_position, materials);
+                if capturing {
+                    let source_outside = shell.source == RoomSide::Outside;
+                    let listener_outside = shell.listener == RoomSide::Outside;
+                    self.debug_capture.end_query(crate::debug_capture::DebugDirect {
+                        source: q.source_position,
+                        listener: q.listener_position,
+                        source_id: q.source_id,
+                        query_index: index as u32,
+                        occluded: direct.occluded,
+                        occlusion_factor: direct.occlusion_factor,
+                        source_outside,
+                        listener_outside,
+                        reflections_skipped: shell.skip_reflections,
+                        rays_traced: 0,
+                    });
+                }
 
                 SpatialQueryResult {
                     source_id: q.source_id,

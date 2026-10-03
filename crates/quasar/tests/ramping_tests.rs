@@ -77,7 +77,9 @@ fn gain_change_is_ramped_per_sample() {
     let m = DistanceModel { rolloff_factor: 1.0, ..DistanceModel::default() }; // 1/8 at 8 m
     rig.engine.set_scene_output_distance_model(rig.out, Some(m));
     rig.engine.update_scene_spatial();
-    let tail = rig.blocks(12);
+    // The spatial crossfader spans the measured interval between updates (here 40 blocks
+    // ~ 213 ms, capped at 2x the 50 ms minimum fade = 100 ms), so give the glide time to complete before the level check.
+    let tail = rig.blocks(60);
 
     let level_before = 0.707_f32; // unity gain, centre pan
     let natural = level_before * 2.0 * std::f32::consts::PI * FREQ / SR;

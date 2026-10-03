@@ -205,11 +205,13 @@ impl HybridProbeSampler {
                     .ok_or_else(|| SpatialAudioError::Backend("real-time backend returned no results".into()))?;
 
                 // Overlay baked late reverb from the probe grid.
-                let sample = grid
-                    .sample(&query.listener_position)
-                    .ok_or_else(|| SpatialAudioError::ProbeGrid("listener position is outside the probe grid".into()))?;
-                result.late_reverb = baked_late_estimate(&sample, grid);
-
+                // A listener outside the grid (outside the building, or in a corner the grid
+                // does not span) keeps the backend's own statistical late estimate instead of
+                // failing the whole query, which dropped the direct and early paths too (the
+                // caller then never updated that pair).
+                if let Some(sample) = grid.sample(&query.listener_position) {
+                    result.late_reverb = baked_late_estimate(&sample, grid);
+                }
 
                 Ok(result)
             }

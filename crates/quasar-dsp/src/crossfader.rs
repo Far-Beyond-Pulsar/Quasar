@@ -163,7 +163,11 @@ impl EqualPowerCrossfader {
         // the slope matches the source's radial velocity. Keep the configured
         // duration until a second target establishes the actual cadence.
         if self.has_target && self.frames_since_target > 0 {
-            self.fade_frames = self.frames_since_target.min(u32::MAX as u64) as u32;
+            // An idle gap is not a cadence: cap the window at 2x the configured fade (100 ms
+            // for the engine default) so one change after a long pause is not glided over
+            // seconds.
+            let cap = (self.configured_fade_frames as u64).saturating_mul(2);
+            self.fade_frames = self.frames_since_target.min(cap).max(1) as u32;
         } else {
             self.fade_frames = self.configured_fade_frames;
         }

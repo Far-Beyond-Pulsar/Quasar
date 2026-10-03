@@ -171,7 +171,9 @@ fn stationary_tones_pass_with_unity_gain() {
     for (fin, fout) in PAIRS {
         let fp = passband_edge(fin, fout);
         for f in [50.0, 440.0, 1_000.0, 5_000.0, 10_000.0, 15_000.0, fp * 0.99] {
-            let input = sine(60_000, f, fin, 0.5);
+            // 1 s of input at ITS rate: the 0.2..0.8 s output window needs >= 0.8 s of source for
+            // every rate pair (60 000 frames was only 0.625 s at 96 kHz).
+            let input = sine(fin as usize, f, fin, 0.5);
             let mut r = PolyphaseResampler::new(1, fin, fout);
             let out = resample_all(&mut r, &input, 1024, 1024);
             let (a, b) = ((0.2 * fout) as usize, (0.8 * fout) as usize); // steady middle
@@ -297,7 +299,9 @@ fn input_above_the_lower_nyquist_is_rejected_when_downsampling() {
 fn input_needed_flow_produces_exact_blocks() {
     // The callback flow: input_needed(block) -> fetch -> process -> advance by `consumed`.
     for (fin, fout) in [(44_100.0, 48_000.0), (48_000.0, 44_100.0), (48_000.0, 48_000.0), (96_000.0, 48_000.0)] {
-        let src = noise(100_000, 11);
+        // 300 blocks of ~200 frames consume up to ~2x that many input frames when downsampling
+        // 2:1 (96 -> 48), so the source must be long enough for the worst ratio.
+        let src = noise(130_000, 11);
         let mut r = PolyphaseResampler::new(1, fin, fout);
         let mut r_ref = PolyphaseResampler::new(1, fin, fout);
         let reference = resample_all(&mut r_ref, &src, src.len(), 90_000);

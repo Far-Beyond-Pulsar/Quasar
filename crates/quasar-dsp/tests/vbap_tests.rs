@@ -281,7 +281,11 @@ fn decoder_node_ramps_across_block_boundary() {
             max_step = max_step.max((w[1] - w[0]).abs());
         }
     }
-    assert!(max_step < 1.5 / N as f32, "ramp step {max_step} exceeds slope bound");
+    // Since 09ee8d4 the block-to-block pan is a normalised (constant-power) lerp. For a full L -> R
+    // swing (orthogonal gain vectors, as here) its steepest slope is 1.62 / N per sample (at t ~ 0.65)
+    // instead of the plain lerp's 1 / N. A block-boundary step would be ~1.0 / 1 sample, so 1.7 / N
+    // still pins "ramped, not stepped".
+    assert!(max_step < 1.7 / N as f32, "ramp step {max_step} exceeds slope bound");
     // And the ramp did reach the new pan.
     assert!(stream[1][4 * N as usize - 1] > 0.99);
 }

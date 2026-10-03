@@ -218,9 +218,11 @@ fn reverb_send_follows_the_diffuse_field_average_not_the_listener_direction() {
         e.debug_audio_stage = 4;
         e.set_scene_output_directivity(o, Some([0.0, 0.0, -1.0]), directivity);
         e.update_scene_spatial();
-        let mut imp = vec![0.0f32; 30 * BLOCK];
+        // The diffuse tail starts `early_late_split_secs` (0.05 s = 2400 frames for the stub) after the
+        // direct sound (#120 wired the split into the renderer), so render long enough to see it.
+        let mut imp = vec![0.0f32; 70 * BLOCK];
         imp[20 * BLOCK] = 0.5;
-        let y = render(&mut e, &imp, 30);
+        let y = render(&mut e, &imp, 70);
         // Energy well after the direct sound: the reverberant tail only.
         y[23 * BLOCK..].iter().map(|v| v * v).sum::<f32>()
     };

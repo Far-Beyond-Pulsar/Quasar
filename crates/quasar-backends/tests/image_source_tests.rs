@@ -18,6 +18,8 @@ fn debug_capture_records_actual_paths_and_preserves_solver_results() {
     let baseline = reflections(&backend, &Abs(0.2), SRC, LIS);
     assert!(capture.take_frame().rays.is_empty());
 
+    // Probe / validation rays are stored only on request (default: none, see CaptureDetail).
+    capture.set_detail(quasar_backends::debug_capture::CaptureDetail::ALL);
     capture.set_enabled(true);
     let actual = reflections(&backend, &Abs(0.2), SRC, LIS);
     let frame = capture.take_frame();

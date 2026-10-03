@@ -179,6 +179,8 @@ pub struct SpatialAudioEngine {
     listener_meters: Vec<Arc<OutputMeter>>,
     /// Output-stage configuration of each listener, parallel to `listeners`.
     safety_cfgs: Vec<OutputSafetyConfig>,
+    /// User mix trims `[reverb_db, early_db]` of each listener, parallel to `listeners`.
+    mix_trims_db: Vec<[f32; 2]>,
 
     /// Debug stage selector for isolating noise sources:
     ///   0 = silence, 1 = raw pull only, 2 = +occlusion, 3 = +early reflections, 4 = full.
@@ -256,6 +258,7 @@ impl SpatialAudioEngine {
             next_listener_id: 0,
             listener_meters: Vec::new(),
             safety_cfgs: Vec::new(),
+            mix_trims_db: Vec::new(),
             debug_audio_stage: 4,
             timing,
         }
@@ -1000,6 +1003,7 @@ impl SpatialAudioEngine {
         let mut listener = ListenerRender::new(sr, &cfg);
         self.listener_meters.push(listener.meter());
         self.safety_cfgs.push(OutputSafetyConfig::default());
+        self.mix_trims_db.push([0.0, 0.0]);
         listener.set_pairs(pairs);
         self.pair_params.push(params_row);
         self.send(Command::AddListener(listener));
@@ -1026,10 +1030,76 @@ impl SpatialAudioEngine {
         self.next_listener_id = self.listeners.len() as u32;
         self.listener_meters.remove(idx);
         self.safety_cfgs.remove(idx);
+        self.mix_trims_db.remove(idx);
         if idx < self.pair_params.len() {
             self.pair_params.remove(idx);
         }
         self.send(Command::RemoveListener(idx));
+    }
+
+    // ── Mix trims (reverb / early reflections) ─────────────────────────
+
+    /// Trim the late reverb of a listener by `db` decibels (default 0 = the physical level).
+    ///
+    /// The engine's reverb is calibrated physically: relative to the direct sound of an emitter at
+    /// 1 m it has the diffuse-field level of the room (`rev/direct = 312.2 T60 / (V Q)` in power,
+    /// see `quasar_core::reverb_model`), so a distant emitter in a reverberant hall is mostly
+    /// reverb, as in reality. Games and installations usually want a different balance; this is
+    /// the "reverb send" fader for it. It scales ONLY this listener's late-reverb bus: the direct
+    /// sound and the early reflections are untouched.
+    ///
+    /// Sent through the lock-free command queue and applied by the renderer with a per-sample
+    /// linear ramp over the next block (no click, no allocation). `db` is clamped to
+    /// `-120 ..= +24`; values at or below `-100` mute the reverb; a NaN is ignored. 0 dB is
+    /// bit-identical to the engine without the trim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_reverb_gain_db(&mut self, id: ListenerId, db: f32) {
+        let idx = self.listener_index(id);
+        if let Some(db) = sanitize_trim_db(db) {
+            self.mix_trims_db[idx][0] = db;
+            self.send(Command::SetReverbTrim { listener: idx, gain: trim_db_to_linear(db) });
+        }
+    }
+
+    /// Reverb trim of a listener in dB (see [`set_reverb_gain_db`](Self::set_reverb_gain_db)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn reverb_gain_db(&self, id: ListenerId) -> f32 {
+        self.mix_trims_db[self.listener_index(id)][0]
+    }
+
+    /// Trim the discrete early reflections of a listener by `db` decibels (default 0 = physical).
+    ///
+    /// Scales the gain of every early-reflection tap of this listener (the traced / image-source
+    /// reflections handed to the reflection decoder); the direct sound and the late reverb are
+    /// untouched. Same transport, clamping and bit-identical default as
+    /// [`set_reverb_gain_db`](Self::set_reverb_gain_db); the per-tap gain ramp of the reflection
+    /// decoder makes the change click-free.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_early_reflection_gain_db(&mut self, id: ListenerId, db: f32) {
+        let idx = self.listener_index(id);
+        if let Some(db) = sanitize_trim_db(db) {
+            self.mix_trims_db[idx][1] = db;
+            self.send(Command::SetEarlyTrim { listener: idx, gain: trim_db_to_linear(db) });
+        }
+    }
+
+    /// Early-reflection trim of a listener in dB (see
+    /// [`set_early_reflection_gain_db`](Self::set_early_reflection_gain_db)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn early_reflection_gain_db(&self, id: ListenerId) -> f32 {
+        self.mix_trims_db[self.listener_index(id)][1]
     }
 
     // ── Output safety stage (#80) ──────────────────────────────────────
@@ -1140,6 +1210,26 @@ fn patch_entry(pull: &ChannelPull) -> PatchEntry {
 /// in the engine's convention (azimuth 0 = -Z, +X = right).
 fn direction_to_angles(d: [f32; 3]) -> (f32, f32) {
     (d[0].atan2(-d[2]), d[1].atan2((d[0] * d[0] + d[2] * d[2]).sqrt()))
+}
+
+/// Clamp a user trim to `-120 ..= +24` dB; `None` for NaN.
+fn sanitize_trim_db(db: f32) -> Option<f32> {
+    if db.is_nan() {
+        None
+    } else {
+        Some(db.clamp(-120.0, 24.0))
+    }
+}
+
+/// Linear amplitude of a trim in dB; `<= -100 dB` is exactly silence, 0 dB exactly 1.0.
+fn trim_db_to_linear(db: f32) -> f32 {
+    if db <= -100.0 {
+        0.0
+    } else if db == 0.0 {
+        1.0
+    } else {
+        10.0_f32.powf(db / 20.0)
+    }
 }
 
 #[cfg(test)]

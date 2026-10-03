@@ -144,6 +144,11 @@ pub(crate) struct ListenerRender {
     rev_slots: Vec<usize>,
     /// Layout normalisation of the diffuse level (constant total power).
     rev_gain: f32,
+    /// User mix trims (linear, default 1.0 = physical level): reverb send and early-reflection
+    /// taps of this listener, with the reverb trim of the previous block for the per-sample ramp.
+    rev_trim: f32,
+    rev_trim_prev: f32,
+    early_trim: f32,
     /// One pair per scene output, same order as `SceneRenderState::outputs`.
     pairs: Vec<Box<PairRender>>,
     /// Output safety stage (limiter, scrub, meters) of this listener's bus (#80).
@@ -179,8 +184,13 @@ impl ListenerRender {
                 .take(quasar_dsp::late_reverb::FDN_MAX_BUS_OUTPUTS)
                 .collect()
         };
-        // Constant TOTAL diffuse power across layouts, referenced to a stereo pair.
-        let rev_gain = (2.0 / rev_slots.len().max(2) as f32).sqrt();
+        // Constant TOTAL diffuse power across layouts. `late_gain_db` is the diffuse field relative to
+        // the direct sound of the same emitter at 1 m, and that direct sound has unit TOTAL power over
+        // the output channels (constant-power panning), so the decoded diffuse field must also have
+        // total power `send^2`: each of the `n` decorrelated channels carries `1/n` of it. (Until
+        // round 5 this was referenced to a stereo PAIR, i.e. total power `2 send^2`: +3 dB too loud
+        // against the direct sound in every layout.)
+        let rev_gain = (1.0 / rev_slots.len().max(1) as f32).sqrt();
         let rev_out = AudioBuffer::new(rev_slots.len().max(1) as u16, DEFAULT_BLOCK_SIZE as u16);
         Box::new(Self {
             heading: cfg.heading,
@@ -192,6 +202,9 @@ impl ListenerRender {
             rev_out,
             rev_slots,
             rev_gain,
+            rev_trim: 1.0,
+            rev_trim_prev: 1.0,
+            early_trim: 1.0,
             pairs: Vec::with_capacity(MAX_SCENE_OUTPUTS),
             safety: OutputSafety::new(sample_rate, OutputSafetyConfig::default()),
         })
@@ -308,6 +321,18 @@ impl SceneRenderState {
         }
     }
 
+    pub(crate) fn set_reverb_trim(&mut self, idx: usize, gain: f32) {
+        if let Some(l) = self.listeners.get_mut(idx) {
+            l.rev_trim = gain;
+        }
+    }
+
+    pub(crate) fn set_early_trim(&mut self, idx: usize, gain: f32) {
+        if let Some(l) = self.listeners.get_mut(idx) {
+            l.early_trim = gain;
+        }
+    }
+
     pub(crate) fn meter(&self, idx: usize) -> Option<&Arc<OutputMeter>> {
         self.listeners.get(idx).map(|l| l.safety.meter())
     }
@@ -346,6 +371,17 @@ impl SceneRenderState {
             return;
         }
         let block = listener_outputs[0].samples() as usize;
+        // Scratch buffers carry exactly this block (a device callback is rarely a multiple of the
+        // 256-sample capacity): the delay lines must advance by `block`, not by the capacity.
+        for out in self.outputs.iter_mut() {
+            out.mixed.set_samples(block as u16);
+        }
+        for lis in self.listeners.iter_mut() {
+            lis.rev_out.set_samples(block as u16);
+            for pair in lis.pairs.iter_mut() {
+                pair.direct.set_samples(block as u16);
+            }
+        }
 
         // 1. Publish + retarget. Re-target ONLY on a strictly newer version (the triple buffer
         //    rotates its read slot, so an old snapshot is re-read with its old version).
@@ -396,7 +432,7 @@ impl SceneRenderState {
             out.clear();
             let n_speakers = out.channels() as usize;
             let n_o = n_out.min(lis.pairs.len());
-            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, lfe_slots, lfe_filters, lfe_hot, safety, .. } = lis;
+            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, rev_trim, rev_trim_prev, early_trim, lfe_slots, lfe_filters, lfe_hot, safety, .. } = lis;
             let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
 
             for o in 0..n_o {
@@ -479,7 +515,7 @@ impl SceneRenderState {
                     for er in coeff.early_reflections.iter().take(MAX_CROSSFADE_REFLECTIONS) {
                         let (taz, tel) = basis.to_listener_angles(er.azimuth, er.elevation);
                         let early_weight = ((split_end - er.delay_samples) / split_fade).clamp(0.0, 1.0);
-                        let gains = er.gain.0.map(|g| g * early_weight);
+                        let gains = er.gain.0.map(|g| g * early_weight * *early_trim);
                         self.tap_targets.push(TapTarget {
                             delay_samples: er.delay_samples,
                             gains,
@@ -503,6 +539,8 @@ impl SceneRenderState {
                 self.rev_in[..block].fill(0.0);
                 let mut t60_sum = Band8::zeros();
                 let mut n_ready = 0usize;
+                // Per-sample ramp of the user reverb trim (1.0 -> 1.0 is exact: default is bit-identical).
+                let (tr0, tr1) = (*rev_trim_prev, *rev_trim);
                 for o in 0..n_o {
                     let pair = &mut *pairs[o];
                     if !pair.ready {
@@ -530,10 +568,11 @@ impl SceneRenderState {
                     }
                     let line = &self.outputs[o].early;
                     let acc = &mut self.rev_in[..block];
+                    let (a0, a1) = (s0 * tr0, s1 * tr1);
                     for j in 0..block {
                         let t = (j + 1) as f32 * inv_n;
                         let d = d0 + (d1 - d0) * t + (block - 1 - j) as f32;
-                        acc[j] += line.tap_at(d) * (s0 + (s1 - s0) * t);
+                        acc[j] += line.tap_at(d) * (a0 + (a1 - a0) * t);
                     }
                 }
                 rev_bus.set_t60(&t60_sum.scale(1.0 / n_ready.max(1) as f32));
@@ -550,6 +589,8 @@ impl SceneRenderState {
                     }
                 }
             }
+
+            *rev_trim_prev = *rev_trim;
 
             // LFE bus: sum the per-output sends (ramped per sample), low-pass once (the sum is
             // linear), add to the LFE slot(s).
@@ -652,6 +693,8 @@ pub(crate) enum Command {
     SetLfeSend { output: usize, gain: f32 },
     SetListenerHeading { listener: usize, heading: [f32; 3] },
     SetSafety { listener: usize, cfg: OutputSafetyConfig },
+    SetReverbTrim { listener: usize, gain: f32 },
+    SetEarlyTrim { listener: usize, gain: f32 },
     SetPullRampSamples(u32),
 }
 
@@ -680,6 +723,8 @@ impl SceneRenderState {
             Command::SetLfeSend { output, gain } => self.set_output_lfe_send(output, gain),
             Command::SetListenerHeading { listener, heading } => self.set_listener_pose(listener, heading),
             Command::SetSafety { listener, cfg } => self.set_safety(listener, cfg),
+            Command::SetReverbTrim { listener, gain } => self.set_reverb_trim(listener, gain),
+            Command::SetEarlyTrim { listener, gain } => self.set_early_trim(listener, gain),
             Command::SetPullRampSamples(n) => self.patch_bay.set_ramp_samples(n),
         }
     }
