@@ -23,3 +23,4 @@ target/
 examples/basic/assets/holiday.wav
 examples/basic/src/old_main.rs.txt
 examples/basic/src/old_v3.rs.txt
+/examples/basic/target-check

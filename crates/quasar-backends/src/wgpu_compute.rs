@@ -74,7 +74,7 @@ use quasar_core::rays::{Ray, RayHit, RayInteractionContext};
 use quasar_core::scene::AcousticScene;
 
 use crate::cpu_simd::{
-    build_planes, combine_occlusion, distance3, late_reverb_from_room, normalize3, probe_basis,
+    build_flat_bvh, build_planes, combine_occlusion, distance3, late_reverb_from_room, normalize3, probe_basis,
     path_candidate, rank_reflections, sub3, CpuSimdComputeBackend, CpuSimdConfig, PathCandidate,
     ReflectPlane, RoomStats, Triangle, BARY_EPS, GOLDEN_ANGLE, MAX_IMAGE_NODES, MAX_IMAGE_ORDER,
     OCCLUSION_BISECT_STEPS, OCCLUSION_DETOUR_DIRS, OCCLUSION_DETOUR_MARGIN,
@@ -372,7 +372,11 @@ impl WgpuComputeBackend {
         config: &WgpuComputeConfig,
     ) -> Result<(HostScene, GpuScene), SpatialAudioError> {
         let triangles = CpuSimdComputeBackend::triangles_from_scene(scene);
-        let planes = build_planes(&triangles, config.max_reflection_planes);
+        // Same plane selection as the CPU backend (duplicate / buried / merged facets), with a
+        // host BVH as the solid-geometry probe, so both backends share one plane set.
+        let probe_bvh = if triangles.is_empty() { None } else { Some(build_flat_bvh(&triangles)) };
+        let probe = |ray: &quasar_core::rays::Ray| probe_bvh.as_ref().is_some_and(|b| b.intersect(ray).is_some());
+        let planes = build_planes(&triangles, &config.cpu(), Some(&probe));
         let room = RoomStats::build(&triangles);
 
         let gpu_tris: Vec<GpuTri> = triangles
@@ -400,8 +404,8 @@ impl WgpuComputeBackend {
                 }));
                 GpuPlane {
                     no: [p.normal[0], p.normal[1], p.normal[2], p.offset],
-                    bmin: [p.aabb.min[0], p.aabb.min[1], p.aabb.min[2], 0.0],
-                    bmax: [p.aabb.max[0], p.aabb.max[1], p.aabb.max[2], 0.0],
+                    bmin: [p.aabb.min[0], p.aabb.min[1], p.aabb.min[2], p.spread],
+                    bmax: [p.aabb.max[0], p.aabb.max[1], p.aabb.max[2], if p.fitted { 1.0 } else { 0.0 }],
                     ranges: [tri_start, p.tris.len() as u32, edge_start, p.boundary.len() as u32],
                 }
             })

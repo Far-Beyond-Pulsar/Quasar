@@ -1,5 +1,6 @@
 pub mod audio_buffer;
 pub mod channel_matrix;
+pub mod channel_order;
 pub mod biquad;
 pub mod binaural;
 pub mod crossfader;
@@ -17,6 +18,7 @@ pub mod vbap;
 
 pub use audio_buffer::*;
 pub use channel_matrix::*;
+pub use channel_order::*;
 pub use binaural::*;
 pub use crossfader::*;
 pub use fractional_delay::*;

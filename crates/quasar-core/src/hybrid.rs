@@ -132,90 +132,121 @@ impl HybridProbeSampler {
 
     /// Resolve spatial parameters for one source-listener pair.
     ///
-    /// Called from the compute thread (15–30 Hz).
+    /// Called from the compute thread (15–30 Hz). Equivalent to a one-element
+    /// [`resolve_batch`](Self::resolve_batch).
     pub fn resolve(
         &self,
         query: &SpatialQuery,
         materials: &dyn MaterialProvider,
     ) -> Result<SpatialQueryResult, SpatialAudioError> {
+        self.resolve_batch(std::slice::from_ref(query), materials)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(SpatialAudioError::Backend("real-time backend returned no results".into())))
+    }
+
+    /// Resolve many source-listener pairs at once (#151).
+    ///
+    /// RealTimeOnly / HybridBlend issue ONE `query_spatial` for every query (the CPU backend
+    /// fans the pairs out over its rayon pool, the GPU backend does a single dispatch) and then
+    /// apply the per-query probe overlay; BakedOnly maps per query. Element `i` of the returned
+    /// vector is exactly what [`resolve`](Self::resolve) gives for `queries[i]`. A configuration
+    /// error (missing grid / backend) is reported for every query.
+    pub fn resolve_batch(
+        &self,
+        queries: &[SpatialQuery],
+        materials: &dyn MaterialProvider,
+    ) -> Vec<Result<SpatialQueryResult, SpatialAudioError>> {
+        if queries.is_empty() {
+            return Vec::new();
+        }
+        let fail_all = |make: &dyn Fn() -> SpatialAudioError| -> Vec<Result<SpatialQueryResult, SpatialAudioError>> {
+            queries.iter().map(|_| Err(make())).collect()
+        };
         match self.strategy {
             HybridSamplingStrategy::BakedOnly => {
-                let grid = self
-                    .probe_grid
-                    .as_ref()
-                    .ok_or_else(|| SpatialAudioError::ProbeGrid("no probe grid configured for BakedOnly strategy".into()))?;
-
-                // Sample the grid at the listener position to get reverb info.
-                let sample = grid
-                    .sample(&query.listener_position)
-                    .ok_or_else(|| SpatialAudioError::ProbeGrid("listener position is outside the probe grid".into()))?;
-
-                let dx = query.source_position[0] - query.listener_position[0];
-                let dy = query.source_position[1] - query.listener_position[1];
-                let dz = query.source_position[2] - query.listener_position[2];
-                let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-
-                // Shared distance law and ISO 9613-1 air absorption (same as the
-                // real-time backends, so the clear-path gain matches across strategies).
-                let attenuations = crate::bands::Band8::splat(self.distance_model.gain(distance))
-                    .mul(&crate::air::air_absorption_gain(distance, self.atmosphere.0, self.atmosphere.1));
-
-                Ok(SpatialQueryResult {
-                    source_id: query.source_id,
-                    direct_path: DirectPathResult {
-                        attenuation: attenuations,
-                        delay_samples: distance * self.sample_rate / SPEED_OF_SOUND,
-                        distance,
-                        occluded: false,
-                        occlusion_factor: 1.0,
-                        occlusion: crate::bands::Band8::splat(1.0),
-                    },
-                    early_reflections: Vec::new(),
-                    late_reverb: baked_late_estimate(&sample, grid),
-                })
+                let Some(grid) = self.probe_grid.as_ref() else {
+                    return fail_all(&|| SpatialAudioError::ProbeGrid("no probe grid configured for BakedOnly strategy".into()));
+                };
+                queries.iter().map(|query| self.resolve_baked(grid, query)).collect()
             }
             HybridSamplingStrategy::RealTimeOnly => {
-                let backend = self
-                    .realtime_backend
-                    .as_ref()
-                    .ok_or_else(|| SpatialAudioError::Backend("no real-time backend configured for RealTimeOnly strategy".into()))?;
-
-                let results = backend.query_spatial(&[query.clone()], materials);
-                results
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| SpatialAudioError::Backend("real-time backend returned no results".into()))
+                let Some(backend) = self.realtime_backend.as_ref() else {
+                    return fail_all(&|| SpatialAudioError::Backend("no real-time backend configured for RealTimeOnly strategy".into()));
+                };
+                Self::backend_batch(backend.as_ref(), queries, materials)
             }
             HybridSamplingStrategy::HybridBlend => {
-                let backend = self
-                    .realtime_backend
-                    .as_ref()
-                    .ok_or_else(|| SpatialAudioError::Backend("no real-time backend configured for HybridBlend strategy".into()))?;
-
-                let grid = self
-                    .probe_grid
-                    .as_ref()
-                    .ok_or_else(|| SpatialAudioError::ProbeGrid("no probe grid configured for HybridBlend strategy".into()))?;
-
-                // Get real-time result for direct + early reflections.
-                let mut result = backend
-                    .query_spatial(&[query.clone()], materials)
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| SpatialAudioError::Backend("real-time backend returned no results".into()))?;
-
+                let Some(backend) = self.realtime_backend.as_ref() else {
+                    return fail_all(&|| SpatialAudioError::Backend("no real-time backend configured for HybridBlend strategy".into()));
+                };
+                let Some(grid) = self.probe_grid.as_ref() else {
+                    return fail_all(&|| SpatialAudioError::ProbeGrid("no probe grid configured for HybridBlend strategy".into()));
+                };
+                let mut out = Self::backend_batch(backend.as_ref(), queries, materials);
                 // Overlay baked late reverb from the probe grid.
                 // A listener outside the grid (outside the building, or in a corner the grid
                 // does not span) keeps the backend's own statistical late estimate instead of
                 // failing the whole query, which dropped the direct and early paths too (the
                 // caller then never updated that pair).
-                if let Some(sample) = grid.sample(&query.listener_position) {
-                    result.late_reverb = baked_late_estimate(&sample, grid);
+                for (query, r) in queries.iter().zip(out.iter_mut()) {
+                    if let Ok(result) = r {
+                        if let Some(sample) = grid.sample(&query.listener_position) {
+                            result.late_reverb = baked_late_estimate(&sample, grid);
+                        }
+                    }
                 }
-
-                Ok(result)
+                out
             }
         }
+    }
+
+    /// One `query_spatial` for the whole batch; results are matched to queries by position.
+    fn backend_batch(
+        backend: &dyn IAcousticComputeBackend,
+        queries: &[SpatialQuery],
+        materials: &dyn MaterialProvider,
+    ) -> Vec<Result<SpatialQueryResult, SpatialAudioError>> {
+        let mut results = backend.query_spatial(queries, materials).into_iter();
+        queries
+            .iter()
+            .map(|_| {
+                results
+                    .next()
+                    .ok_or_else(|| SpatialAudioError::Backend("real-time backend returned no results".into()))
+            })
+            .collect()
+    }
+
+    fn resolve_baked(&self, grid: &AcousticProbeGrid, query: &SpatialQuery) -> Result<SpatialQueryResult, SpatialAudioError> {
+        // Sample the grid at the listener position to get reverb info.
+        let sample = grid
+            .sample(&query.listener_position)
+            .ok_or_else(|| SpatialAudioError::ProbeGrid("listener position is outside the probe grid".into()))?;
+
+        let dx = query.source_position[0] - query.listener_position[0];
+        let dy = query.source_position[1] - query.listener_position[1];
+        let dz = query.source_position[2] - query.listener_position[2];
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        // Shared distance law and ISO 9613-1 air absorption (same as the
+        // real-time backends, so the clear-path gain matches across strategies).
+        let attenuations = crate::bands::Band8::splat(self.distance_model.gain(distance))
+            .mul(&crate::air::air_absorption_gain(distance, self.atmosphere.0, self.atmosphere.1));
+
+        Ok(SpatialQueryResult {
+            source_id: query.source_id,
+            direct_path: DirectPathResult {
+                attenuation: attenuations,
+                delay_samples: distance * self.sample_rate / SPEED_OF_SOUND,
+                distance,
+                occluded: false,
+                occlusion_factor: 1.0,
+                occlusion: crate::bands::Band8::splat(1.0),
+            },
+            early_reflections: Vec::new(),
+            late_reverb: baked_late_estimate(&sample, grid),
+        })
     }
 }
 

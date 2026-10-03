@@ -248,13 +248,51 @@ impl ChannelMatrix {
     /// [`DEFAULT_BLOCK_SIZE`]); channels beyond this matrix's counts are left untouched / ignored.
     /// Never allocates, locks or panics.
     pub fn process(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) {
+        self.run(input, output, false);
+    }
+
+    /// Like [`process`](Self::process) but ACCUMULATES into `output` (it is not cleared first), so
+    /// several matrices can be summed (cross-fading two conversions). Never allocates.
+    pub fn process_add(&mut self, input: &AudioBuffer, output: &mut AudioBuffer) {
+        self.run(input, output, true);
+    }
+
+    /// Ramp every gain to zero (no allocation): fade a conversion out.
+    pub fn fade_to_zero(&mut self) {
+        self.tgt.fill(0.0);
+        if self.ramp_samples == 0 {
+            self.cur.fill(0.0);
+            self.step.fill(0.0);
+            self.remaining = 0;
+        } else {
+            let inv = 1.0 / self.ramp_samples as f32;
+            for (s, &c) in self.step.iter_mut().zip(&self.cur) {
+                *s = -c * inv;
+            }
+            self.remaining = self.ramp_samples;
+        }
+    }
+
+    /// True when no ramp is running (current gains equal the target).
+    pub fn is_settled(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// True when settled at an all-zero matrix.
+    pub fn is_silent(&self) -> bool {
+        self.remaining == 0 && self.cur.iter().all(|&g| g == 0.0)
+    }
+
+    fn run(&mut self, input: &AudioBuffer, output: &mut AudioBuffer, add: bool) {
         let n = (input.samples() as usize).min(output.samples() as usize).min(DEFAULT_BLOCK_SIZE);
         let in_ch = self.in_ch.min(input.channels() as usize);
         let out_ch = self.out_ch.min(output.channels() as usize);
         let row = self.in_ch;
         for o in 0..out_ch {
             let dst = &mut output.channel_mut(o as u16)[..n];
-            dst.fill(0.0);
+            if !add {
+                dst.fill(0.0);
+            }
             for i in 0..in_ch {
                 let src = &input.channel(i as u16)[..n];
                 let idx = o * row + i;

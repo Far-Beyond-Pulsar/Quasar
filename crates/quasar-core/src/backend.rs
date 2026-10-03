@@ -140,6 +140,16 @@ pub trait IAcousticComputeBackend: Send + Sync {
     /// absorption may ignore it. Called off the audio thread (#121).
     fn set_atmosphere(&mut self, _temperature_celsius: f32, _humidity_percent: f32) {}
 
+    /// Replace the emitter table (#156): for each query `source_id`, the emitter's resolved
+    /// radiation pattern, forward axis and physical shape. Backends may use it to rank and prune
+    /// image-source paths by the pattern and to spread the soft-occlusion probes over the real
+    /// aperture. They must NOT apply the pattern to the gains they return (the engine applies it
+    /// once, per band, to the direct path, each reflection and the reverb send). Ids without an
+    /// entry are omnidirectional point-like emitters with the historic 0.35 m aperture. The
+    /// default ignores the table (the results are then exactly those of an omnidirectional
+    /// emitter, only slower for narrow patterns). Called off the audio thread.
+    fn set_emitters(&mut self, _emitters: &[(u32, crate::emitter_pattern::EmitterTrace)]) {}
+
     /// Whether this backend supports dynamic scene updates.
     fn supports_dynamic_geometry(&self) -> bool {
         false

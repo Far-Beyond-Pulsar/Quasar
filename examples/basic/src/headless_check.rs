@@ -278,7 +278,16 @@ pub fn run() -> Result<(), String> {
 
     // Speaker clearance and position checks.
     let speakers = audio_demo::speaker_positions(AUDIENCE);
+    let t_planes = Instant::now();
     let probe_backend = CpuSimdComputeBackend::new(ex.scene.clone(), audio_demo::tracer_config(SR));
+    println!("[check] backend (BVH + importance-ranked planes) rebuilt in {:.0} ms; selected mirror-plane groups:", t_planes.elapsed().as_secs_f64() * 1e3);
+    for (i, p) in probe_backend.reflection_planes().iter().enumerate() {
+        println!(
+            "[check]   group #{i:<2} n=({:+.2},{:+.2},{:+.2}) area {:8.1} m2, centroid ({:+7.1},{:+6.1},{:+7.1}), {:6} tris{}",
+            p.normal[0], p.normal[1], p.normal[2], p.area, p.centroid[0], p.centroid[1], p.centroid[2], p.triangles,
+            if p.merged { format!(", merged facets (spread {:.2} m)", p.spread) } else { String::new() }
+        );
+    }
     for (i, &sp) in speakers.iter().enumerate() {
         let clearance = tris.iter().map(|(t, _)| point_triangle_distance(sp, t[0], t[1], t[2])).fold(f32::MAX, f32::min);
         let up = probe_backend
@@ -308,6 +317,21 @@ pub fn run() -> Result<(), String> {
         ("outside, past the entrance", [0.0, 2.3, 100.0]),
         ("outside, beside the north aisle", [60.0, 2.3, 0.0]),
     ];
+    // Legacy selection (coplanar merge only, no buried-face probe) for a before / after comparison.
+    let t_legacy = Instant::now();
+    let legacy_backend = CpuSimdComputeBackend::new(
+        ex.scene.clone(),
+        quasar_backends::cpu_simd::CpuSimdConfig { plane_merge_angle_deg: 0.0, plane_buried_distance: 0.0, ..audio_demo::tracer_config(SR) },
+    );
+    let legacy_planes = legacy_backend.reflection_planes();
+    println!(
+        "[check] legacy selection (no facet merging / buried probe): built in {:.0} ms, {} planes, {} planes in the nave vault zone (y > 36, normal.y < 0.97)",
+        t_legacy.elapsed().as_secs_f64() * 1e3,
+        legacy_planes.len(),
+        legacy_planes.iter().filter(|p| p.centroid[1] > 36.0 && p.normal[1].abs() < 0.97).count()
+    );
+    let new_planes = probe_backend.reflection_planes();
+    println!("[check] new selection: {} planes in the nave vault zone (y > 36, normal.y < 0.97)", new_planes.iter().filter(|p| p.centroid[1] > 36.0 && p.normal[1].abs() < 0.97).count());
     println!("[check] spatial updates (8 emitters x 1 listener), release build recommended:");
     let materials = engine.materials();
     for (label, pos) in positions {
@@ -319,6 +343,12 @@ pub fn run() -> Result<(), String> {
         let early: usize = results.iter().map(|r| r.early_reflections.len()).sum();
         let occluded = results.iter().filter(|r| r.direct_path.occluded).count();
         println!("[check]   {label:<32} {pos:?}: {rays:6} rays, query {q_ms:7.2} ms, {early:3} early paths, {occluded} occluded directs");
+        legacy_backend.reset_ray_counter();
+        let t = Instant::now();
+        let lres = legacy_backend.query_spatial(&queries(pos), materials);
+        let l_ms = t.elapsed().as_secs_f64() * 1e3;
+        let l_early: usize = lres.iter().map(|r| r.early_reflections.len()).sum();
+        println!("[check]   {:<32}   legacy selection: {:6} rays, query {l_ms:7.2} ms, {l_early:3} early paths", "", legacy_backend.rays_traced());
     }
     // Wall-clock of the real engine update (compute thread work) at the same positions.
     for (label, pos) in positions {

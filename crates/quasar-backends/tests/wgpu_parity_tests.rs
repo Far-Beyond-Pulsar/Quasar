@@ -297,3 +297,63 @@ fn full_reflection_lists_match_without_truncation() {
     }
     println!("full reflection lists: {:?}", cr.iter().map(|r| r.early_reflections.len()).collect::<Vec<_>>());
 }
+
+/// Hall with a faceted barrel vault (#152): merged facet groups (best-fit plane, bounce
+/// snapped onto the member triangle) must give the GPU and CPU backends the same paths.
+fn vault_scene() -> AcousticScene {
+    let (w, l, h, facets) = (20.0_f32, 30.0_f32, 8.0_f32, 64usize);
+    let (mut pos, mut idx) = (Vec::<[f32; 3]>::new(), Vec::<u32>::new());
+    let inside = [w / 2.0, 3.0, l / 2.0];
+    let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let n = [
+            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+        ];
+        let m = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let to = [inside[0] - m[0], inside[1] - m[1], inside[2] - m[2]];
+        let (b, c) = if n[0] * to[0] + n[1] * to[1] + n[2] * to[2] >= 0.0 { (b, c) } else { (c, b) };
+        let base = pos.len() as u32;
+        pos.extend([a, b, c]);
+        idx.extend([base, base + 1, base + 2]);
+    };
+    let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]| {
+        tri(a, b, c);
+        tri(a, c, d);
+    };
+    quad([0.0, 0.0, 0.0], [w, 0.0, 0.0], [w, 0.0, l], [0.0, 0.0, l]);
+    quad([0.0, 0.0, 0.0], [0.0, h, 0.0], [0.0, h, l], [0.0, 0.0, l]);
+    quad([w, 0.0, 0.0], [w, h, 0.0], [w, h, l], [w, 0.0, l]);
+    for z in [0.0, l] {
+        quad([0.0, 0.0, z], [w, 0.0, z], [w, h, z], [0.0, h, z]);
+    }
+    let r = w / 2.0;
+    let arc = |i: usize| {
+        let a = std::f32::consts::PI * i as f32 / facets as f32;
+        [r - r * a.cos(), h + r * a.sin()]
+    };
+    for i in 0..facets {
+        let (p, q) = (arc(i), arc(i + 1));
+        quad([p[0], p[1], 0.0], [q[0], q[1], 0.0], [q[0], q[1], l], [p[0], p[1], l]);
+    }
+    let mut scene = AcousticScene::new();
+    scene.add_mesh(AcousticMesh::new(1, pos, idx, 0));
+    scene
+}
+
+#[test]
+fn faceted_vault_matches_cpu_backend() {
+    let Some(g) = gpu(vault_scene(), WgpuComputeConfig::default()) else { return };
+    let c = cpu(vault_scene());
+    let qs: Vec<SpatialQuery> = [([10.0, 1.7, 5.0], [10.0, 1.7, 25.0]), ([4.0, 2.0, 8.0], [15.0, 1.7, 20.0]), ([16.0, 3.0, 12.0], [6.0, 1.7, 27.0])]
+        .iter()
+        .enumerate()
+        .map(|(i, (s, l))| SpatialQuery { source_position: *s, listener_position: *l, source_id: i as u32 })
+        .collect();
+    let gr = g.try_query_spatial(&qs, &Mats).expect("gpu query");
+    let cr = c.query_spatial(&qs, &Mats);
+    for (i, (a, b)) in gr.iter().zip(&cr).enumerate() {
+        assert_parity(&format!("vault query {i}"), a, b);
+    }
+    println!("vault reflections gpu/cpu: {:?} / {:?}", gr.iter().map(|r| r.early_reflections.len()).collect::<Vec<_>>(), cr.iter().map(|r| r.early_reflections.len()).collect::<Vec<_>>());
+}

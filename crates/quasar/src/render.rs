@@ -32,6 +32,7 @@ use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayBus, PatchBayNode, PatchEntry};
 use quasar_dsp::reflection_decoder::{ReflectionDecoder, TapTarget};
 use quasar_dsp::vbap::{normalized_lerp_gain, VbapPanner};
+use crate::output_stage::{ConvGarbage, ConvSwap, OutputConv};
 
 /// Maximum number of scene outputs (emitters). Capacity of the audio-side vectors, reserved at
 /// construction so structural edits never reallocate.
@@ -153,6 +154,8 @@ pub(crate) struct ListenerRender {
     pairs: Vec<Box<PairRender>>,
     /// Output safety stage (limiter, scrub, meters) of this listener's bus (#80).
     safety: OutputSafety,
+    /// Optional physical -> device layout conversion, run BEFORE the safety stage (#83, #149).
+    conv: OutputConv,
 }
 
 impl ListenerRender {
@@ -207,6 +210,7 @@ impl ListenerRender {
             early_trim: 1.0,
             pairs: Vec::with_capacity(MAX_SCENE_OUTPUTS),
             safety: OutputSafety::new(sample_rate, OutputSafetyConfig::default()),
+            conv: OutputConv::empty(),
         })
     }
 }
@@ -427,12 +431,19 @@ impl SceneRenderState {
         let mut target = [0.0_f32; MAX_AUDIO_CHANNELS];
         for l in 0..n_lis_proc {
             let lis = &mut *self.listeners[l];
-            let out = &mut listener_outputs[l];
+            // With a conversion configured the listener renders into its physical-layout scratch and
+            // `conv` maps it to the device buffer afterwards; otherwise straight into the caller's buffer.
+            let mut conv_scratch = lis.conv.begin(block);
+            let via_conv = conv_scratch.is_some();
+            let out: &mut AudioBuffer = match conv_scratch.as_deref_mut() {
+                Some(b) => b,
+                None => &mut listener_outputs[l],
+            };
             let basis = ListenerBasis::from_heading(lis.heading);
             out.clear();
             let n_speakers = out.channels() as usize;
             let n_o = n_out.min(lis.pairs.len());
-            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, rev_trim, rev_trim_prev, early_trim, lfe_slots, lfe_filters, lfe_hot, safety, .. } = lis;
+            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, rev_trim, rev_trim_prev, early_trim, lfe_slots, lfe_filters, lfe_hot, safety, conv, .. } = lis;
             let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
 
             for o in 0..n_o {
@@ -642,7 +653,15 @@ impl SceneRenderState {
             }
 
             // Output safety stage (#80): gain staging, NaN / inf scrub, look-ahead limiter, meters.
-            safety.process(out);
+            if via_conv {
+                if let Some(sb) = conv_scratch.take() {
+                    conv.finish(sb, &mut listener_outputs[l]);
+                }
+                // Limiter LAST: the ceiling must hold on the channels that are actually played.
+                safety.process(&mut listener_outputs[l]);
+            } else {
+                safety.process(out);
+            }
         }
 
         // 5. Advance all crossfaders by the block size (fades complete in ~fade_ms of real time).
@@ -677,6 +696,7 @@ pub(crate) enum Garbage {
     Listener(Box<ListenerRender>),
     Bus(PatchBayBus),
     Shell(Box<OutputAdd>),
+    Conv(ConvGarbage),
 }
 
 /// A configuration change for the audio thread, applied at the start of a block. Small and
@@ -696,11 +716,16 @@ pub(crate) enum Command {
     SetReverbTrim { listener: usize, gain: f32 },
     SetEarlyTrim { listener: usize, gain: f32 },
     SetPullRampSamples(u32),
+    SetConversion { listener: usize, swap: Box<ConvSwap> },
 }
 
 impl SceneRenderState {
     /// Apply one command. Allocation-free; retired boxes go to `sink`.
     pub(crate) fn apply(&mut self, cmd: Command, sink: &mut impl FnMut(Garbage)) {
+        // Settled conversion stages retired by the last blocks go back to the compute side.
+        for l in self.listeners.iter_mut() {
+            l.conv.flush_retired(&mut |g| sink(Garbage::Conv(g)));
+        }
         match cmd {
             Command::AddOutput(mut add) => {
                 self.add_output(&mut add);
@@ -726,6 +751,10 @@ impl SceneRenderState {
             Command::SetReverbTrim { listener, gain } => self.set_reverb_trim(listener, gain),
             Command::SetEarlyTrim { listener, gain } => self.set_early_trim(listener, gain),
             Command::SetPullRampSamples(n) => self.patch_bay.set_ramp_samples(n),
+            Command::SetConversion { listener, swap } => match self.listeners.get_mut(listener) {
+                Some(l) => l.conv.swap(swap, &mut |g| sink(Garbage::Conv(g))),
+                None => sink(Garbage::Conv(ConvGarbage::Swap(swap))),
+            },
         }
     }
 }
@@ -757,7 +786,7 @@ pub(crate) fn db_to_linear(db: f32) -> f32 {
 /// `Hrtf` listeners are rendered by the binaural path, never by this panner; the
 /// Stereo mapping only gives them a placeholder (2-slot) panner so the per-listener
 /// vectors stay uniform.
-fn physical_to_speaker_layout(layout: &PhysicalOutputLayout) -> SpeakerLayout {
+pub(crate) fn physical_to_speaker_layout(layout: &PhysicalOutputLayout) -> SpeakerLayout {
     match layout {
         PhysicalOutputLayout::Stereo => SpeakerLayout::Stereo,
         PhysicalOutputLayout::Surround51 => SpeakerLayout::Surround51,

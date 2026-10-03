@@ -557,6 +557,37 @@ impl BufferedStream {
         self.ring.read_frame.store(self.read_frame, Ordering::Release);
     }
 
+    /// Bulk [`sample_at`](Self::sample_at) for one channel: `dst.len()` frames from `start`, with a
+    /// single buffer snapshot (one `try_lock`) instead of one per sample. Same out-of-range rules
+    /// (zeros) as `sample_at`.
+    pub fn sample_block(&self, start: u64, channel: usize, dst: &mut [f32]) {
+        let Some(rd) = self.ring.try_snapshot() else {
+            dst.fill(0.0);
+            return;
+        };
+        let wf = self.ring.write_frame.load(Ordering::Acquire);
+        for (i, d) in dst.iter_mut().enumerate() {
+            let frame = start + i as u64;
+            let ok = if frame >= wf { frame - wf <= IO_CHUNK_FRAMES as u64 } else { wf - frame <= rd.cap as u64 };
+            *d = if ok {
+                f32::from_bits(rd.data[(frame as usize % rd.cap) * self.channels + channel].load(Ordering::Relaxed))
+            } else {
+                0.0
+            };
+        }
+    }
+
+    /// Cumulative number of frames the writer has made available (exclusive end of the readable
+    /// range, same domain as [`sample_at`](Self::sample_at)). One atomic load.
+    pub fn written_frames(&self) -> u64 {
+        self.ring.write_frame.load(Ordering::Acquire)
+    }
+
+    /// The read cursor: cumulative frames consumed so far via `advance_read` / `read_frames`.
+    pub fn read_cursor(&self) -> u64 {
+        self.read_frame
+    }
+
     pub fn channels(&self) -> usize { self.channels }
     pub fn sample_rate(&self) -> u32 { self.sample_rate }
     pub fn total_frames(&self) -> u64 { self.total_frames }

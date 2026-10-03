@@ -4,6 +4,7 @@ use quasar_core::backend::{
 };
 use quasar_core::bands::Band8;
 use quasar_core::distance::DistanceModel;
+use quasar_core::emitter_pattern::{EmitterShape, EmitterTrace};
 use quasar_core::error::SpatialAudioError;
 use quasar_core::rays::{Ray, RayHit, RayInteractionContext};
 use quasar_core::scene::AcousticScene;
@@ -35,6 +36,9 @@ pub struct CpuSimdComputeBackend {
     /// Total BVH rays traced since the last [`Self::reset_ray_counter`] (always counted,
     /// independent of the debug capture; one relaxed atomic add per ray).
     rays_traced: std::sync::atomic::AtomicU64,
+    /// Emitter table (#156) by query `source_id`: pattern, forward axis and shape. Ids without an
+    /// entry are omnidirectional with the historic aperture.
+    emitters: std::collections::HashMap<u32, EmitterTrace>,
 }
 
 /// Configuration for the CPU SIMD backend.
@@ -45,8 +49,9 @@ pub struct CpuSimdConfig {
     /// Maximum number of early-reflection paths returned per query, strongest
     /// first (default: 16; at most 64, the engine's crossfader capacity).
     pub max_reflections: usize,
-    /// Maximum number of distinct mirror planes considered by the image-source
-    /// tracer, largest area first (default: 32). Query cost grows as
+    /// Maximum number of mirror planes (merged coplanar / near-coplanar facet groups) considered
+    /// by the image-source tracer, most important first: area weighted by centrality, after
+    /// duplicate and buried faces are dropped (default: 32; see `build_planes`). Query cost grows as
     /// `P (P-1)^(order-1)`, see `trace_early_reflections`.
     pub max_reflection_planes: usize,
     /// Width (m) of the fade at the border of a reflecting surface: a specular
@@ -54,6 +59,14 @@ pub struct CpuSimdConfig {
     /// smoothly to zero at the edge, so paths appear / disappear continuously
     /// as the listener moves (default: 0.1; 0 = hard edge).
     pub reflection_edge_fade: f32,
+    /// Image-source paths whose FIRST leg leaves a patterned emitter (see
+    /// `IAcousticComputeBackend::set_emitters`) with a gain below this many dB in EVERY band are
+    /// pruned before their visibility rays are cast (default: -40; a path that far down cannot
+    /// reach the reflections that survive ranking). Surviving paths are ranked by their energy
+    /// WEIGHTED by the pattern, so a speaker's top reflections are the ones it actually radiates.
+    /// The returned gains are never changed (the engine applies the pattern once). Omnidirectional
+    /// emitters are unaffected.
+    pub emitter_pattern_prune_db: f32,
     /// Stochastic rays for late reverb estimation (default: 64).
     pub diffuse_rays_per_query: u32,
     /// Max distance for reflection tracing in world units (default: 50.0).
@@ -86,6 +99,19 @@ pub struct CpuSimdConfig {
     /// at most that loud relative to the direct leakage, so dropping them is inaudible next
     /// to the late field, and the tens of thousands of validation rays are saved.
     pub separated_reflection_max_transmission: f32,
+    /// Half-width (degrees) of the normal cone in which adjacent facets are merged into one
+    /// mirror-plane group (default 5.0; 0 = merge only exactly coplanar triangles). A faceted
+    /// curved surface (barrel vault, dome) becomes a few groups, each represented by its
+    /// area-weighted best-fit plane; see `build_planes`.
+    pub plane_merge_angle_deg: f32,
+    /// Largest distance (m) of any vertex of a merged facet from the group's seed plane
+    /// (default 0.25; 0 disables merging). Exactly parallel faces at different offsets are
+    /// never merged.
+    pub plane_merge_offset: f32,
+    /// A face with solid geometry within this distance (m, default 0.05) on BOTH sides of its
+    /// centroid is buried and takes no plane slot (0 disables the probe). Faces coincident with
+    /// an earlier face (same three vertices to 1 mm) are always dropped.
+    pub plane_buried_distance: f32,
 }
 
 impl Default for CpuSimdConfig {
@@ -95,6 +121,7 @@ impl Default for CpuSimdConfig {
             max_reflections: 16,
             max_reflection_planes: 32,
             reflection_edge_fade: 0.1,
+            emitter_pattern_prune_db: -40.0,
             diffuse_rays_per_query: 64,
             max_reflection_distance: 50.0,
             speed_of_sound: 343.0,
@@ -103,6 +130,9 @@ impl Default for CpuSimdConfig {
             sample_rate: 48_000.0,
             closed_room_shortcuts: true,
             separated_reflection_max_transmission: 0.0,
+            plane_merge_angle_deg: 5.0,
+            plane_merge_offset: 0.25,
+            plane_buried_distance: 0.05,
         }
     }
 }
@@ -533,7 +563,14 @@ impl BvhNode {
 /// Cache-friendly BVH storage: nodes and leaf triangles each occupy contiguous arrays.
 /// Child and triangle ranges are 32-bit offsets; no heap pointers are followed while tracing.
 struct FlatNode { aabb: Aabb, left: u32, right: u32, start: u32, len: u32 }
-struct FlatBvh { nodes: Vec<FlatNode>, triangles: Vec<Triangle> }
+pub(crate) struct FlatBvh { nodes: Vec<FlatNode>, triangles: Vec<Triangle> }
+
+/// Flat BVH over `triangles` (also the solid-geometry probe of the plane builder).
+pub(crate) fn build_flat_bvh(triangles: &[Triangle]) -> FlatBvh {
+    let mut tris = triangles.to_vec();
+    let tree = BvhNode::build(&mut tris);
+    FlatBvh::build(&tree)
+}
 
 impl FlatBvh {
     fn build(root: &BvhNode) -> Self {
@@ -560,7 +597,7 @@ impl FlatBvh {
         out
     }
 
-    fn intersect(&self, ray: &Ray) -> Option<RayHit> {
+    pub(crate) fn intersect(&self, ray: &Ray) -> Option<RayHit> {
         let mut stack = vec![0u32];
         let mut best = ray.max_distance;
         let mut closest = None;
@@ -695,6 +732,11 @@ pub(crate) struct ReflectPlane {
     /// Edges used by exactly one triangle of the plane: its outer border (and
     /// the border of any hole), the places the reflecting surface ends.
     pub(crate) boundary: Vec<([f32; 3], [f32; 3])>,
+    /// A merged group of nearly (not exactly) coplanar facets: `normal` / `offset` are the
+    /// area-weighted best fit and the bounce point is snapped onto the member triangle it hits.
+    pub(crate) fitted: bool,
+    /// Largest distance (m) of a member vertex from the mirror plane (0 for exact planes).
+    pub(crate) spread: f32,
 }
 
 impl ReflectPlane {
@@ -726,6 +768,8 @@ struct ImageSearch {
     nodes: usize,
     found: Vec<PathCandidate>,
     debug_paths: Vec<crate::debug_capture::DebugReflectionPath>,
+    /// The emitter, only when it has a radiation pattern (#156); `None` = omnidirectional.
+    pattern: Option<EmitterTrace>,
 }
 
 /// A validated path with the energy used to rank it.
@@ -742,19 +786,89 @@ fn point_segment_distance(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
     distance3(p, [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t])
 }
 
-/// Group `triangles` into deduplicated mirror planes, keep the `max_planes`
-/// largest (by total area; ties keep the lower index) and compute their borders.
-/// Deterministic; runs when the scene is (re)built, not per query.
-pub(crate) fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<ReflectPlane> {
-    use std::collections::HashMap;
+/// Vertex quantisation (1 mm) used to match shared vertices and duplicate faces.
+const PLANE_VERTEX_QUANT: f32 = 1e3;
+/// Start offset (m) of the buried-face probe rays, so a face never hits itself.
+const BURIED_PROBE_START: f32 = 1e-3;
 
-    let mut planes: Vec<ReflectPlane> = Vec::new();
-    // Grid of canonical normals (cell = 1/50) -> plane indices, so a triangle only
-    // compares against planes with a similar orientation (3^3 neighbouring cells).
+fn vertex_key(p: [f32; 3]) -> [i64; 3] {
+    [
+        (p[0] * PLANE_VERTEX_QUANT).round() as i64,
+        (p[1] * PLANE_VERTEX_QUANT).round() as i64,
+        (p[2] * PLANE_VERTEX_QUANT).round() as i64,
+    ]
+}
+
+fn triangle_area(t: &Triangle) -> f32 {
+    let c = cross3(sub3(t.b, t.a), sub3(t.c, t.a));
+    0.5 * dot3(c, c).sqrt()
+}
+
+/// Select the mirror planes of the image-source tracer from the scene triangles.
+///
+/// Runs when the scene is (re)built (never per query) and is deterministic, so the plane
+/// set is identical for every listener position and cannot flicker. Stages:
+///
+/// 1. **Duplicates.** A triangle with the same three vertices (1 mm quantisation, any order
+///    and winding) as an earlier one is dropped: coincident / double-sided duplicates must not
+///    count their area twice.
+/// 2. **Coplanar patches.** Triangles of one plane (normals within ~0.36 deg, offsets within
+///    [`PLANE_OFFSET_TOL`], opposite windings share a plane) form a patch.
+/// 3. **Buried patches** (only with `probe`, and `plane_buried_distance > 0`). A patch whose
+///    largest triangle has solid geometry within `plane_buried_distance` on BOTH sides of its
+///    centroid (probe rays along +n and -n starting 1 mm off the face) is dropped: it is a
+///    sliver / back face squeezed between other surfaces and cannot reflect into a room.
+/// 4. **Merging.** Patches that share a vertex, whose normals differ by more than the
+///    coplanar tolerance but by at most `plane_merge_angle_deg` from the group's seed (the
+///    largest patch of the group, grown breadth first) and whose vertices all lie within
+///    `plane_merge_offset` of the seed plane become ONE group: a faceted barrel vault is
+///    one or a few groups instead of dozens of tiny planes. The group's mirror plane is the
+///    area-weighted best fit (normal = weighted mean of the member normals, offset =
+///    weighted mean of the member centroids). Exactly parallel patches at different offsets
+///    are never merged (steps, pilasters and window recesses keep their own planes).
+/// 5. **Ranking.** `importance = area * 1 / (1 + (d / R)^2)` where `d` is the distance of the
+///    group's area centroid from the scene's bounding-box centre and `R` its half diagonal:
+///    large surfaces in the middle of the scene (where listeners and emitters are) outrank
+///    equally large surfaces at the periphery; the factor is in (0.5, 1] for surfaces inside
+///    the bounding box, so area stays the dominant term. Ties keep the lower triangle index.
+///    The best `max_reflection_planes` survive.
+///
+/// The reflection point of a merged group is validated against its member triangles (the
+/// bounce line along the group normal must hit one of them, see `locate_on_plane`), never
+/// against an infinite plane or a bounding polygon.
+pub(crate) fn build_planes(
+    triangles: &[Triangle],
+    cfg: &CpuSimdConfig,
+    probe: Option<&dyn Fn(&Ray) -> bool>,
+) -> Vec<ReflectPlane> {
+    use std::collections::{HashMap, HashSet};
+
+    let n_tris = triangles.len();
+    if n_tris == 0 || cfg.max_reflection_planes == 0 {
+        return Vec::new();
+    }
+
+    // 1. duplicates
+    let mut seen: HashSet<[[i64; 3]; 3]> = HashSet::with_capacity(n_tris);
+    let mut keep = vec![true; n_tris];
+    for (ti, t) in triangles.iter().enumerate() {
+        let mut k = [vertex_key(t.a), vertex_key(t.b), vertex_key(t.c)];
+        k.sort();
+        if !seen.insert(k) {
+            keep[ti] = false;
+        }
+    }
+    drop(seen);
+
+    // 2. coplanar patches. Grid of canonical normals (cell = 1/50) -> patch indices, so a
+    // triangle only compares against patches with a similar orientation (3^3 cells).
+    let mut patches: Vec<ReflectPlane> = Vec::new();
     let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
     let cell = |n: [f32; 3]| ((n[0] * 50.0).round() as i32, (n[1] * 50.0).round() as i32, (n[2] * 50.0).round() as i32);
-
     for (ti, t) in triangles.iter().enumerate() {
+        if !keep[ti] {
+            continue;
+        }
         let mut n = t.normal;
         let mut d = dot3(n, t.a);
         let mut axis = 0;
@@ -774,7 +888,7 @@ pub(crate) fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<Ref
                 for dz in -1..=1 {
                     if let Some(list) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
                         for &pi in list {
-                            let p = &planes[pi];
+                            let p = &patches[pi];
                             if dot3(p.normal, n) > PLANE_NORMAL_COS && (p.offset - d).abs() < PLANE_OFFSET_TOL {
                                 found = Some(pi);
                                 break 'search;
@@ -784,31 +898,246 @@ pub(crate) fn build_planes(triangles: &[Triangle], max_planes: usize) -> Vec<Ref
                 }
             }
         }
-        let area = 0.5 * dot3(cross3(sub3(t.b, t.a), sub3(t.c, t.a)), cross3(sub3(t.b, t.a), sub3(t.c, t.a))).sqrt();
+        let area = triangle_area(t);
         match found {
             Some(pi) => {
-                let p = &mut planes[pi];
+                let p = &mut patches[pi];
                 p.area += area;
                 p.aabb = p.aabb.union(&t.aabb());
                 p.tris.push(ti);
             }
             None => {
-                grid.entry((cx, cy, cz)).or_default().push(planes.len());
-                planes.push(ReflectPlane {
+                grid.entry((cx, cy, cz)).or_default().push(patches.len());
+                patches.push(ReflectPlane {
                     normal: n,
                     offset: d,
                     area,
                     aabb: t.aabb(),
                     tris: vec![ti],
                     boundary: Vec::new(),
+                    fitted: false,
+                    spread: 0.0,
                 });
             }
         }
     }
+    drop(grid);
 
-    // Largest first; the stable sort keeps scene order among equal areas.
-    planes.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal));
-    planes.truncate(max_planes);
+    // 3. buried patches
+    if let Some(probe) = probe {
+        let tol = cfg.plane_buried_distance;
+        if tol > 0.0 {
+            patches.retain(|p| {
+                let rep = p
+                    .tris
+                    .iter()
+                    .map(|&ti| (triangle_area(&triangles[ti]), ti))
+                    .fold((-1.0_f32, p.tris[0]), |best, x| if x.0 > best.0 { x } else { best })
+                    .1;
+                let t = &triangles[rep];
+                let c = t.centroid();
+                let n = t.normal;
+                let ray = |sign: f32| {
+                    let mut r = Ray::new(
+                        [c[0] + sign * n[0] * BURIED_PROBE_START, c[1] + sign * n[1] * BURIED_PROBE_START, c[2] + sign * n[2] * BURIED_PROBE_START],
+                        [sign * n[0], sign * n[1], sign * n[2]],
+                    );
+                    r.max_distance = tol;
+                    r
+                };
+                !(probe(&ray(1.0)) && probe(&ray(-1.0)))
+            });
+        }
+    }
+
+    // 4. merge tilted, adjacent patches into groups
+    let np = patches.len();
+    let merge_cos = cfg.plane_merge_angle_deg.to_radians().cos();
+    let mut order: Vec<usize> = (0..np).collect();
+    order.sort_by(|&a, &b| {
+        patches[b].area.partial_cmp(&patches[a].area).unwrap_or(std::cmp::Ordering::Equal).then(patches[a].tris[0].cmp(&patches[b].tris[0]))
+    });
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    if cfg.plane_merge_angle_deg > 0.0 && cfg.plane_merge_offset > 0.0 && np > 1 {
+        // Patch adjacency: patches sharing a (quantised) vertex.
+        let mut verts: Vec<([i64; 3], u32)> = Vec::new();
+        for (pi, p) in patches.iter().enumerate() {
+            for &ti in &p.tris {
+                let t = &triangles[ti];
+                for v in [t.a, t.b, t.c] {
+                    verts.push((vertex_key(v), pi as u32));
+                }
+            }
+        }
+        verts.sort_unstable();
+        verts.dedup();
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); np];
+        let mut i = 0;
+        while i < verts.len() {
+            let mut j = i + 1;
+            while j < verts.len() && verts[j].0 == verts[i].0 {
+                j += 1;
+            }
+            let run = &verts[i..j];
+            if run.len() > 1 {
+                if run.len() <= 8 {
+                    for x in 0..run.len() {
+                        for y in 0..run.len() {
+                            if x != y {
+                                adj[run[x].1 as usize].push(run[y].1);
+                            }
+                        }
+                    }
+                } else {
+                    for w in run.windows(2) {
+                        adj[w[0].1 as usize].push(w[1].1);
+                        adj[w[1].1 as usize].push(w[0].1);
+                    }
+                }
+            }
+            i = j;
+        }
+        for a in adj.iter_mut() {
+            a.sort_unstable();
+            a.dedup();
+        }
+        drop(verts);
+
+        let mut assigned = vec![false; np];
+        for &seed in &order {
+            if assigned[seed] {
+                continue;
+            }
+            assigned[seed] = true;
+            let (sn, so) = (patches[seed].normal, patches[seed].offset);
+            let mut group = vec![seed];
+            let mut head = 0;
+            while head < group.len() {
+                let p = group[head];
+                head += 1;
+                for &q in &adj[p] {
+                    let q = q as usize;
+                    if assigned[q] {
+                        continue;
+                    }
+                    let c = dot3(sn, patches[q].normal).abs();
+                    // tilted (not coplanar: those are one patch already) but inside the cone
+                    if !(c >= merge_cos && c <= PLANE_NORMAL_COS) {
+                        continue;
+                    }
+                    let within = patches[q].tris.iter().all(|&ti| {
+                        let t = &triangles[ti];
+                        [t.a, t.b, t.c].iter().all(|&v| (dot3(sn, v) - so).abs() <= cfg.plane_merge_offset)
+                    });
+                    if within {
+                        assigned[q] = true;
+                        group.push(q);
+                    }
+                }
+            }
+            groups.push(group);
+        }
+    } else {
+        groups = order.iter().map(|&p| vec![p]).collect();
+    }
+
+    // Build one ReflectPlane per group (best-fit plane for merged groups).
+    let mut planes: Vec<ReflectPlane> = Vec::with_capacity(groups.len());
+    let mut slots: Vec<Option<ReflectPlane>> = patches.into_iter().map(Some).collect();
+    for g in &groups {
+        if g.len() == 1 {
+            planes.push(slots[g[0]].take().expect("patch used once"));
+            continue;
+        }
+        let seed_n = slots[g[0]].as_ref().expect("patch").normal;
+        let mut nsum = [0.0_f32; 3];
+        let mut tris: Vec<usize> = Vec::new();
+        let mut area = 0.0_f32;
+        let mut aabb: Option<Aabb> = None;
+        for &pi in g {
+            let p = slots[pi].take().expect("patch used once");
+            let s = if dot3(seed_n, p.normal) >= 0.0 { 1.0 } else { -1.0 };
+            for k in 0..3 {
+                nsum[k] += s * p.area * p.normal[k];
+            }
+            area += p.area;
+            aabb = Some(match aabb {
+                Some(a) => a.union(&p.aabb),
+                None => p.aabb,
+            });
+            tris.extend(p.tris);
+        }
+        tris.sort_unstable();
+        let mut n = normalize3(nsum);
+        let mut axis = 0;
+        for i in 1..3 {
+            if n[i].abs() > n[axis].abs() {
+                axis = i;
+            }
+        }
+        if n[axis] < 0.0 {
+            n = [-n[0], -n[1], -n[2]];
+        }
+        let (mut offset, mut wsum) = (0.0_f32, 0.0_f32);
+        for &ti in &tris {
+            let t = &triangles[ti];
+            let a = triangle_area(t);
+            offset += a * dot3(n, t.centroid());
+            wsum += a;
+        }
+        offset /= wsum.max(1e-12);
+        let mut spread = 0.0_f32;
+        for &ti in &tris {
+            let t = &triangles[ti];
+            for v in [t.a, t.b, t.c] {
+                spread = spread.max((dot3(n, v) - offset).abs());
+            }
+        }
+        planes.push(ReflectPlane {
+            normal: n,
+            offset,
+            area,
+            aabb: aabb.expect("non-empty group"),
+            tris,
+            boundary: Vec::new(),
+            fitted: true,
+            spread,
+        });
+    }
+
+    // 5. rank by importance (area x mild centrality), best `max_reflection_planes` survive.
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for t in triangles {
+        for v in [t.a, t.b, t.c] {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+    }
+    let centre = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+    let half_diag = (0.5 * distance3(lo, hi)).max(1e-3);
+    let importance = |p: &ReflectPlane| -> f32 {
+        let mut c = [0.0_f32; 3];
+        let mut w = 0.0_f32;
+        for &ti in &p.tris {
+            let t = &triangles[ti];
+            let a = triangle_area(t);
+            let tc = t.centroid();
+            for k in 0..3 {
+                c[k] += a * tc[k];
+            }
+            w += a;
+        }
+        let d = distance3([c[0] / w.max(1e-12), c[1] / w.max(1e-12), c[2] / w.max(1e-12)], centre) / half_diag;
+        p.area / (1.0 + d * d)
+    };
+    let mut ranked: Vec<(f32, ReflectPlane)> = planes.into_iter().map(|p| (importance(&p), p)).collect();
+    // Stable sort on the (area-ordered, deterministic) group order keeps ties reproducible.
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.tris[0].cmp(&b.1.tris[0])));
+    ranked.truncate(cfg.max_reflection_planes);
+    let mut planes: Vec<ReflectPlane> = ranked.into_iter().map(|r| r.1).collect();
 
     // Borders: edges referenced by exactly one triangle of the plane.
     let key = |p: [f32; 3]| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
@@ -1142,6 +1471,7 @@ impl CpuSimdComputeBackend {
             distance_model: DistanceModel::default(),
             debug_capture: Default::default(),
             rays_traced: std::sync::atomic::AtomicU64::new(0),
+            emitters: std::collections::HashMap::new(),
         };
         backend.build_bvh();
         backend
@@ -1151,7 +1481,6 @@ impl CpuSimdComputeBackend {
     /// early-reflection tracer) from the scene geometry.
     pub fn build_bvh(&mut self) {
         self.triangles = Self::triangles_from_scene(&self.scene);
-        self.planes = build_planes(&self.triangles, self.config.max_reflection_planes);
         self.room = RoomStats::build(&self.triangles);
         if !self.triangles.is_empty() && !self.room.closed && self.room_warnings == 0 {
             self.room_warnings = 1;
@@ -1162,12 +1491,14 @@ impl CpuSimdComputeBackend {
             );
         }
         if self.triangles.is_empty() {
+            self.planes = Vec::new();
             self.bvh = None;
             return;
         }
-        let mut triangles = self.triangles.clone();
-        let tree = BvhNode::build(&mut triangles);
-        self.bvh = Some(FlatBvh::build(&tree));
+        let bvh = build_flat_bvh(&self.triangles);
+        let probe = |ray: &Ray| bvh.intersect(ray).is_some();
+        self.planes = build_planes(&self.triangles, &self.config, Some(&probe));
+        self.bvh = Some(bvh);
     }
 
     /// Whether the current scene is a closed, consistently wound surface (exact room
@@ -1280,10 +1611,39 @@ impl CpuSimdComputeBackend {
         ShellInfo { source: s, listener: l, separated, skip_reflections }
     }
 
-    /// Number of distinct mirror planes the early-reflection tracer considers
-    /// (coplanar triangles merged, capped at `max_reflection_planes`).
+    /// Number of mirror planes (merged facet groups) the early-reflection tracer considers
+    /// (capped at `max_reflection_planes`, see [`CpuSimdConfig::max_reflection_planes`]).
     pub fn reflection_plane_count(&self) -> usize {
         self.planes.len()
+    }
+
+    /// The selected mirror planes, most important first (diagnostics / headless reports).
+    pub fn reflection_planes(&self) -> Vec<ReflectionPlaneInfo> {
+        self.planes
+            .iter()
+            .map(|p| {
+                let (mut c, mut w) = ([0.0_f32; 3], 0.0_f32);
+                for &ti in &p.tris {
+                    let t = &self.triangles[ti];
+                    let a = triangle_area(t);
+                    let tc = t.centroid();
+                    for k in 0..3 {
+                        c[k] += a * tc[k];
+                    }
+                    w += a;
+                }
+                let w = w.max(1e-12);
+                ReflectionPlaneInfo {
+                    normal: p.normal,
+                    offset: p.offset,
+                    area: p.area,
+                    centroid: [c[0] / w, c[1] / w, c[2] / w],
+                    triangles: p.tris.len(),
+                    merged: p.fitted,
+                    spread: p.spread,
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn triangles_from_scene(scene: &AcousticScene) -> Vec<Triangle> {
@@ -1347,10 +1707,11 @@ impl CpuSimdComputeBackend {
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
         separated: bool,
+        emitter: Option<&EmitterTrace>,
     ) -> DirectPathResult {
         let dist = distance3(*source, *listener);
 
-        let occ = self.compute_occlusion(source, listener, materials, separated);
+        let occ = self.compute_occlusion(source, listener, materials, separated, emitter);
 
         let atten = Band8::splat(self.distance_model.gain(dist));
         let air = quasar_core::air::air_absorption_gain(
@@ -1678,6 +2039,7 @@ impl CpuSimdComputeBackend {
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
         separated: bool,
+        emitter: Option<&EmitterTrace>,
     ) -> OcclusionResult {
         let clear = OcclusionResult { bands: Band8::splat(1.0), occluded: false };
         let dist = distance3(*source, *listener);
@@ -1688,6 +2050,10 @@ impl CpuSimdComputeBackend {
         // Basis perpendicular to the line of sight.
         let axis = normalize3(sub3(*source, *listener));
         let (u, w) = probe_basis(axis);
+        // Aperture (#156): a non-default emitter shape places the probes itself; `Default` (and
+        // no emitter at all) keeps the historic 0.35 m golden-angle disc below, bit for bit.
+        let shape: Option<&EmitterShape> = emitter.map(|e| &e.shape).filter(|s| **s != EmitterShape::Default);
+        let view = [-axis[0], -axis[1], -axis[2]]; // emitter -> listener
 
         let probe_kind = self.debug_capture.scoped(crate::debug_capture::DebugRayKind::OcclusionProbe);
         let mut visible = 0usize;
@@ -1700,6 +2066,9 @@ impl CpuSimdComputeBackend {
         for k in 0..OCCLUSION_RAYS {
             let target = if k == 0 {
                 *source
+            } else if let Some(shape) = shape {
+                let o = shape.probe_offset(k - 1, OCCLUSION_RAYS - 1, u, w, view);
+                [source[0] + o[0], source[1] + o[1], source[2] + o[2]]
             } else {
                 let i = (k - 1) as f32;
                 let n = (OCCLUSION_RAYS - 1) as f32;
@@ -1806,6 +2175,7 @@ impl CpuSimdComputeBackend {
         listener: &[f32; 3],
         materials: &dyn MaterialProvider,
         separated: bool,
+        emitter: Option<&EmitterTrace>,
     ) -> Vec<EarlyReflection> {
         let order = (self.config.max_reflection_order as usize).min(MAX_IMAGE_ORDER);
         if order == 0 || self.planes.is_empty() || self.bvh.is_none() {
@@ -1837,6 +2207,7 @@ impl CpuSimdComputeBackend {
             nodes: 0,
             found: Vec::new(),
             debug_paths: Vec::new(),
+            pattern: emitter.filter(|e| e.pattern.is_some()).cloned(),
         };
         st.images[0] = *source;
         self.expand_images(&mut st, 0, materials);
@@ -1919,14 +2290,34 @@ impl CpuSimdComputeBackend {
                 prev[2] + (target[2] - prev[2]) * t,
             ];
             let located = self.locate_on_plane(plane, b);
+            // A merged facet group snaps the bounce onto the member triangle it hits, so the
+            // path touches the real surface (exact for flat planes: no change).
+            let b = located.map_or(b, |l| l.2);
             pts[k - 1] = b;
-            let Some((tri, w)) = located else {
+            let Some((tri, w, _)) = located else {
                 self.note_rejected(st, &pts[k - 1..n], crate::debug_capture::RejectReason::OutsideSurface);
                 return None;
             };
             tri_of[k - 1] = tri;
             edge_w *= w;
             prev = b;
+        }
+
+        // Emitter pattern (#156): the path leaves the emitter toward B_1 (`pts[0]`). A direction
+        // the pattern radiates >= `emitter_pattern_prune_db` below in every band is pruned before
+        // any visibility ray is cast; the others are ranked by their energy weighted by the
+        // pattern (mean square over the bands) so the cap keeps the reflections the speaker
+        // really excites. The returned gain is NOT scaled: the engine applies the pattern.
+        let mut pattern_power = 1.0_f32;
+        if let Some(e) = &st.pattern {
+            let dir = sub3(pts[0], st.source);
+            let g = e.band_gains(dir);
+            let prune = 10.0_f32.powf(self.config.emitter_pattern_prune_db.min(0.0) / 20.0);
+            if g.0.iter().cloned().fold(0.0_f32, f32::max) < prune {
+                self.note_rejected(st, &pts[..n], crate::debug_capture::RejectReason::BelowEnergy);
+                return None;
+            }
+            pattern_power = g.0.iter().map(|v| v * v).sum::<f32>() / 8.0;
         }
 
         // Visibility of every segment L -> B_n -> .. -> B_1 -> S.
@@ -1966,7 +2357,7 @@ impl CpuSimdComputeBackend {
             return None;
         };
         candidate.refl.gain = candidate.refl.gain.mul(&blocker_gain);
-        candidate.energy = candidate.refl.gain.0.iter().map(|g| g * g).sum();
+        candidate.energy = candidate.refl.gain.0.iter().map(|g| g * g).sum::<f32>() * pattern_power;
         if !(candidate.energy > 1e-14) {
             use crate::debug_capture::RejectReason;
             let blocker_energy: f32 = blocker_gain.0.iter().map(|g| g * g).sum();
@@ -1992,21 +2383,40 @@ impl CpuSimdComputeBackend {
 
     /// Triangle of `plane` containing the in-plane point `p` plus the edge window
     /// (1 inside, smoothstep to 0 at the surface border over `reflection_edge_fade`).
-    fn locate_on_plane(&self, plane: &ReflectPlane, p: [f32; 3]) -> Option<(usize, f32)> {
+    fn locate_on_plane(&self, plane: &ReflectPlane, p: [f32; 3]) -> Option<(usize, f32, [f32; 3])> {
         if !plane.contains_in_box(p) {
             return None;
         }
-        let tri = plane.tris.iter().copied().find(|&ti| self.triangles[ti].contains_point(p))?;
+        let (tri, p) = if plane.fitted {
+            // Merged facets are not exactly in the mirror plane: the bounce line (along the
+            // group normal through `p`) must hit one MEMBER triangle, and the bounce point is
+            // that hit (so the path touches the real surface). The member footprints tile the
+            // plane, so there are no gaps between facets.
+            let reach = plane.spread + 2.0 * PLANE_BOX_PAD;
+            let ray = Ray { origin: p, direction: plane.normal, min_distance: -reach, max_distance: reach };
+            let mut best: Option<(usize, f32)> = None;
+            for &ti in &plane.tris {
+                if let Some(t) = self.triangles[ti].intersect_max(&ray, reach) {
+                    if best.map_or(true, |b| t.abs() < b.1.abs()) {
+                        best = Some((ti, t));
+                    }
+                }
+            }
+            let (ti, t) = best?;
+            (ti, [p[0] + plane.normal[0] * t, p[1] + plane.normal[1] * t, p[2] + plane.normal[2] * t])
+        } else {
+            (plane.tris.iter().copied().find(|&ti| self.triangles[ti].contains_point(p))?, p)
+        };
         let fade = self.config.reflection_edge_fade;
         if !(fade > 0.0) {
-            return Some((tri, 1.0));
+            return Some((tri, 1.0, p));
         }
         let mut dist = f32::INFINITY;
         for (a, b) in &plane.boundary {
             dist = dist.min(point_segment_distance(p, *a, *b));
         }
         let s = (dist / fade).clamp(0.0, 1.0);
-        Some((tri, s * s * (3.0 - 2.0 * s)))
+        Some((tri, s * s * (3.0 - 2.0 * s), p))
     }
 
     /// Statistical late-field estimate (diffuse-field theory), from the room statistics
@@ -2129,8 +2539,9 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
                     self.debug_capture.begin_query(q.source_id, index as u32);
                 }
                 let shell = self.shell_info(q.source_position, q.listener_position, materials);
-                let direct = self.compute_direct_path(&q.source_position, &q.listener_position, materials, shell.separated);
-                let early = self.trace_early_reflections(&q.source_position, &q.listener_position, materials, shell.skip_reflections);
+                let emitter = self.emitters.get(&q.source_id);
+                let direct = self.compute_direct_path(&q.source_position, &q.listener_position, materials, shell.separated, emitter);
+                let early = self.trace_early_reflections(&q.source_position, &q.listener_position, materials, shell.skip_reflections, emitter);
                 let late = self.estimate_late_reverb(&q.source_position, &q.listener_position, materials);
                 if capturing {
                     let source_outside = shell.source == RoomSide::Outside;
@@ -2170,6 +2581,10 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
             self.config.temperature_celsius = temperature_celsius;
             self.config.humidity_percent = humidity_percent;
         }
+    }
+
+    fn set_emitters(&mut self, emitters: &[(u32, EmitterTrace)]) {
+        self.emitters = emitters.iter().cloned().collect();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -2215,4 +2630,23 @@ mod two_edge_diffraction_tests {
             assert!((got.0[band] - expected).abs() <= 1.0e-6, "band {band}: {} vs {expected}", got.0[band]);
         }
     }
+}
+
+/// One selected mirror plane, see [`CpuSimdComputeBackend::reflection_planes`].
+#[derive(Clone, Debug)]
+pub struct ReflectionPlaneInfo {
+    /// Unit normal (canonical sign: the largest component is positive).
+    pub normal: [f32; 3],
+    /// `normal . p` for a point `p` of the plane.
+    pub offset: f32,
+    /// Total area (m^2) of the member triangles.
+    pub area: f32,
+    /// Area-weighted centroid of the member triangles.
+    pub centroid: [f32; 3],
+    /// Number of member triangles.
+    pub triangles: usize,
+    /// True for a group of merged, nearly coplanar facets (best-fit plane).
+    pub merged: bool,
+    /// Largest distance (m) of a member vertex from the plane (0 for an exact plane).
+    pub spread: f32,
 }

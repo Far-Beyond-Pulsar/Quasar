@@ -39,6 +39,7 @@ fn registry_round_trip() {
         directivity: 0.0,
         pulls: vec![ChannelPull::new(src_a, 0, -3.0)],
         movability: Movability::Static,
+        ..Default::default()
     });
     assert_eq!(out.0, 0);
 
@@ -128,6 +129,7 @@ fn unload_middle_source_remaps_surviving_pulls() {
             ChannelPull::new(src_c, 0, 0.0),
         ],
         movability: Movability::Static,
+        ..Default::default()
     });
 
     // One stereo listener.

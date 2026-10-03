@@ -69,8 +69,8 @@ struct BvhNode {
 
 struct Plane {
     no: vec4<f32>,       // xyz = canonical unit normal, w = offset (n . p)
-    bmin: vec4<f32>,
-    bmax: vec4<f32>,
+    bmin: vec4<f32>,     // w = spread (m) of a merged facet group
+    bmax: vec4<f32>,     // w = 1 for a merged (fitted) group, else 0
     ranges: vec4<u32>,   // x: first plane_tris entry, y: count, z: first edge, w: count
 }
 
@@ -394,28 +394,80 @@ fn point_segment_distance(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
 struct Located {
     tri: u32,
     w: f32,
+    p: vec3<f32>, // bounce point (snapped onto the member triangle for merged groups)
 }
 
-fn locate_on_plane(pi: u32, p: vec3<f32>) -> Located {
+// Two-sided line / triangle test within |t| <= reach (same edge tolerance as tri_hit):
+// x = 1 on a hit, y = signed distance along d.
+fn tri_line_hit(i: u32, o: vec3<f32>, d: vec3<f32>, reach: f32) -> vec2<f32> {
+    let t = tris[i];
+    let a = t.a.xyz;
+    let e1 = t.b.xyz - a;
+    let e2 = t.c.xyz - a;
+    let h = cross(d, e2);
+    let det = dot(e1, h);
+    let scale = sqrt(dot(e1, e1) * dot(e2, e2));
+    if !(abs(det) > 1e-9 * scale) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let inv_det = 1.0 / det;
+    let s = o - a;
+    let u = dot(s, h) * inv_det;
+    let eps = params.limits2.x;
+    if u < -eps || u > 1.0 + eps {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let q = cross(s, e1);
+    let v = dot(d, q) * inv_det;
+    if v < -eps || u + v > 1.0 + eps {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let hit_t = dot(e2, q) * inv_det;
+    if !(hit_t >= -reach && hit_t <= reach) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    return vec2<f32>(1.0, hit_t);
+}
+
+fn locate_on_plane(pi: u32, p0: vec3<f32>) -> Located {
     let pl = planes[pi];
     let pad = params.limits1.w;
-    if any(p < pl.bmin.xyz - vec3<f32>(pad)) || any(p > pl.bmax.xyz + vec3<f32>(pad)) {
-        return Located(NONE, 0.0);
+    if any(p0 < pl.bmin.xyz - vec3<f32>(pad)) || any(p0 > pl.bmax.xyz + vec3<f32>(pad)) {
+        return Located(NONE, 0.0, p0);
     }
     var found = NONE;
-    for (var i = 0u; i < pl.ranges.y; i++) {
-        let ti = plane_tris[pl.ranges.x + i];
-        if tri_contains(ti, p) {
-            found = ti;
-            break;
+    var p = p0;
+    if pl.bmax.w > 0.5 {
+        // Merged facet group: the bounce line along the group normal must hit a MEMBER
+        // triangle (the hit closest to the fitted plane wins); the bounce point is that hit.
+        let reach = pl.bmin.w + 2.0 * pad;
+        var best_t = 3.0e38;
+        for (var i = 0u; i < pl.ranges.y; i++) {
+            let ti = plane_tris[pl.ranges.x + i];
+            let r = tri_line_hit(ti, p0, pl.no.xyz, reach);
+            if r.x > 0.5 && abs(r.y) < abs(best_t) {
+                best_t = r.y;
+                found = ti;
+            }
+        }
+        if found != NONE {
+            p = p0 + pl.no.xyz * best_t;
+        }
+    } else {
+        for (var i = 0u; i < pl.ranges.y; i++) {
+            let ti = plane_tris[pl.ranges.x + i];
+            if tri_contains(ti, p0) {
+                found = ti;
+                break;
+            }
         }
     }
     if found == NONE {
-        return Located(NONE, 0.0);
+        return Located(NONE, 0.0, p0);
     }
     let fade = params.limits1.y;
     if !(fade > 0.0) {
-        return Located(found, 1.0);
+        return Located(found, 1.0, p);
     }
     var dist = 3.0e38;
     for (var e = 0u; e < pl.ranges.w; e++) {
@@ -423,7 +475,7 @@ fn locate_on_plane(pi: u32, p: vec3<f32>) -> Located {
         dist = min(dist, point_segment_distance(p, ed.a.xyz, ed.b.xyz));
     }
     let s = clamp(dist / fade, 0.0, 1.0);
-    return Located(found, s * s * (3.0 - 2.0 * s));
+    return Located(found, s * s * (3.0 - 2.0 * s), p);
 }
 
 // Validate the plane sequence p_seq[0..n] (images p_img[0..=n]); append the path to
@@ -450,10 +502,10 @@ fn validate_path(q: u32, n: u32, src: vec3<f32>, lis: vec3<f32>) {
         if loc.tri == NONE {
             return;
         }
-        p_pts[k - 1u] = b;
+        p_pts[k - 1u] = loc.p;
         p_tri[k - 1u] = loc.tri;
         edge_w *= loc.w;
-        prev = b;
+        prev = loc.p;
         k -= 1u;
     }
 

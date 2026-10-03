@@ -60,6 +60,11 @@ pub struct SceneOutputConfig {
     pub pulls: Vec<ChannelPull>,
     /// How the output's position may change over time.
     pub movability: Movability,
+    /// Emitter model (#156): explicit radiation pattern (spherical / directional speaker types)
+    /// and physical source size. The default (`None` pattern, default shape) keeps the legacy
+    /// behaviour: a cardioid-family pattern from `directivity` when `orientation` is set, else
+    /// omnidirectional, and the historic 0.35 m occlusion aperture.
+    pub emitter: crate::emitter_pattern::EmitterModel,
 }
 
 /// Physical speaker layout of a listener's output device.
@@ -102,6 +107,7 @@ impl Default for SceneOutputConfig {
             directivity: 0.0,
             pulls: Vec::new(),
             movability: Movability::Static,
+            emitter: Default::default(),
         }
     }
 }
@@ -138,6 +144,7 @@ impl SceneOutputConfig {
             directivity: 0.0,
             pulls: Vec::new(),
             movability,
+            emitter: Default::default(),
         }
     }
 }

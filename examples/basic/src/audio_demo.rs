@@ -81,8 +81,34 @@ pub const CHANNEL_MAP: [u32; NUM_SPEAKERS] = [0, 1, 2, 5, 3, 4, 6, 7];
 // direct_vs_room_levels -- --nocapture`; the large cathedral has a different reverberation, the
 // relative stage layout (hence the direct-sound distances) is unchanged. `-` / `=` and `;` / `'`
 // change the trims live.
-/// Speaker directivity (0 = omni, 1 = cardioid; 0.7 is a typical PA horn: rear about -10 dB at 1 kHz).
+/// Speaker directivity (0 = omni, 1 = cardioid; 0.7 is a sub-cardioid: rear about -10 dB at 1 kHz,
+/// much wider than a real PA horn). The default speaker type; see [`demo_speaker_pattern`] to try
+/// others.
 pub const DEMO_DIRECTIVITY: f32 = 0.7;
+
+/// Speaker type override from the environment (#156): `QUASAR_SPEAKER_PATTERN` =
+/// `omni` (spherical speaker), `cardioid` (the default 0.7 cardioid family: unchanged), `super`,
+/// `hyper` (first-order patterns with a rear lobe), `cone` (60 / 120 degree sound cone, -20 dB
+/// outside) or `horn` (a 90 x 50 degree constant-directivity PA horn, -30 dB rear floor). `None`
+/// keeps the default cardioid behaviour bit for bit. The speakers are still aimed at the audience.
+pub fn demo_speaker_pattern() -> Option<quasar_core::emitter_pattern::EmitterPattern> {
+    use quasar_core::emitter_pattern::EmitterPattern;
+    let kind = std::env::var("QUASAR_SPEAKER_PATTERN").ok()?.to_ascii_lowercase();
+    let pattern = match kind.as_str() {
+        "omni" | "sphere" | "spherical" => EmitterPattern::Omni,
+        "super" | "supercardioid" => EmitterPattern::Supercardioid,
+        "hyper" | "hypercardioid" => EmitterPattern::Hypercardioid,
+        "cone" => EmitterPattern::SoundCone { inner_deg: 60.0, outer_deg: 120.0, outer_gain_db: -20.0 },
+        "horn" => EmitterPattern::horn(90.0, 50.0),
+        "cardioid" | "" => return None,
+        other => {
+            eprintln!("[quasar] unknown QUASAR_SPEAKER_PATTERN '{other}' (omni|cardioid|super|hyper|cone|horn): using cardioid");
+            return None;
+        }
+    };
+    eprintln!("[quasar] speaker pattern: {pattern:?}");
+    Some(pattern)
+}
 /// Initial reverb-bus trim in dB (0 = physical level).
 pub const DEMO_REVERB_DB: f32 = -5.0;
 /// Initial early-reflection trim in dB (0 = physical level).
@@ -250,6 +276,7 @@ pub fn build_engine(
 
     // One scene output per speaker in device-channel order; CHANNEL_MAP routes the right WAV channel.
     let mut outputs = [SceneOutputId(0); NUM_SPEAKERS];
+    let speaker_pattern = demo_speaker_pattern();
     for (dev_ch, &pos) in speakers.iter().enumerate() {
         let out_id = engine.add_scene_output(SceneOutputConfig::new(
             pos.to_array(),
@@ -259,6 +286,9 @@ pub fn build_engine(
         engine.connect_pull(out_id, ChannelPull::new(source_id, wav_ch, 0.0));
         let to_audience = (glam::Vec3::from_array(audience) - pos).normalize();
         engine.set_scene_output_directivity(out_id, Some(to_audience.to_array()), DEMO_DIRECTIVITY);
+        if let Some(p) = &speaker_pattern {
+            engine.set_scene_output_pattern(out_id, Some(p.clone())); // #156: replaces the cardioid
+        }
         outputs[dev_ch] = out_id;
     }
     // The Sub/LFE output is also sent to the listener's LFE channel through the 120 Hz LFE low-pass.
@@ -316,10 +346,11 @@ const WAV_LABEL: &str = "embedded:8_Channel_ID.wav";
 /// Thin wrapper around `BufferedStream` for the audio callback. All disk I/O happens on a
 /// background thread; the callback never blocks.
 struct StreamingPlayback {
-    stream: quasar_audio::streaming_source::BufferedStream,
+    /// File-rate ring -> device-rate planar blocks through the polyphase resampler (#76). All
+    /// buffers are preallocated; drift control stays off because a file source has no clock of
+    /// its own (the I/O thread refills the ring as fast as it is drained).
+    source: quasar_audio::source_resampler::ResampledSource<quasar_audio::streaming_source::BufferedStream>,
     channels: usize,
-    read_pos: f64,
-    rate_ratio: f64,
 }
 
 impl StreamingPlayback {
@@ -347,12 +378,9 @@ impl StreamingPlayback {
             path, channels, sample_rate, total_frames, peak,
         );
 
-        Self { stream, channels, read_pos: 0.0, rate_ratio: sample_rate as f64 / output_sample_rate as f64 }
-    }
-
-    /// Read one sample from the ring buffer (non-blocking).
-    fn source_sample(&self, frame: u64, ch: usize) -> f32 {
-        self.stream.sample_at(frame, ch)
+        let source = quasar_audio::source_resampler::ResampledSource::new(stream, output_sample_rate as f64)
+            .expect("resampled source");
+        Self { source, channels }
     }
 }
 
@@ -466,6 +494,21 @@ pub fn setup_audio_engine(world: &pulsar_scenedb::World) -> AudioEngine {
     let levels_cb = levels.clone();
     let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
+    // Block buffers live in the closure: the callback builds nothing per block.
+    let mut src = AudioBuffer::new(playback.channels as u16, DEFAULT_BLOCK_SIZE as u16);
+    let mut out = AudioBuffer::new(out_ch_cb as u16, DEFAULT_BLOCK_SIZE as u16);
+    // Device channel order (#149): the engine renders WASAPI / SMPTE order; remap only when the
+    // platform's order for this channel count differs (ALSA 5.1 / 7.1, CoreAudio 7.1). The tables are
+    // documented defaults, not queried from the device; counts without a table stay untouched.
+    let remap = quasar_audio::quasar_dsp::channel_order::ChannelRemap::new(
+        quasar_audio::quasar_dsp::channel_order::DeviceChannelOrder::for_current_platform(),
+        out_ch_cb,
+    )
+    .ok()
+    .filter(|r| !r.is_identity());
+    if let Some(r) = &remap {
+        eprintln!("[quasar] remapping {} output channels to the platform channel order", r.channels());
+    }
 
     let stream = device
         .build_output_stream(
@@ -478,39 +521,39 @@ pub fn setup_audio_engine(world: &pulsar_scenedb::World) -> AudioEngine {
                 }
 
                 let nch = playback.channels;
-                let ratio = playback.rate_ratio;
                 let mut remain = total_frames;
                 let mut offset = 0;
 
                 while remain > 0 {
                     let block = (DEFAULT_BLOCK_SIZE).min(remain);
 
-                    let mut src = AudioBuffer::new(nch as u16, block as u16);
+                    // Device-rate planar block from the polyphase resampler (zero-filled on underrun).
+                    playback.source.render_block(block);
+                    src.set_samples(block as u16);
                     for k in 0..nch.min(NUM_SPEAKERS) {
-                        let ch = src.channel_mut(k as u16);
-                        for i in 0..block {
-                            let pos = playback.read_pos + i as f64 * ratio;
-                            let fa = pos.floor() as u64;
-                            let fb = fa + 1;
-                            let frac = (pos - fa as f64) as f32;
-                            ch[i] = playback.source_sample(fa, k)
-                                + (playback.source_sample(fb, k) - playback.source_sample(fa, k)) * frac;
-                        }
+                        src.channel_mut(k as u16).copy_from_slice(playback.source.block(k, block));
                     }
                     for k in 0..nch.min(NUM_SPEAKERS) {
                         let ch = src.channel(k as u16);
                         let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
                         levels_cb[k].store((sum_sq / block as f32).sqrt().to_bits(), AtomicOrdering::Relaxed);
                     }
-                    let source_frames = (block as f64 * ratio).ceil() as u64;
-                    playback.stream.advance_read(source_frames);
-                    playback.read_pos += block as f64 * ratio;
 
-                    let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
+                    out.set_samples(block as u16);
+                    out.clear();
                     renderer.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
 
                     for i in 0..block {
                         let dst = offset + i;
+                        if let Some(r) = &remap {
+                            let mut frame = [0.0_f32; 32];
+                            let n = out_ch_cb.min(32).min(out.channels() as usize);
+                            for c in 0..n {
+                                frame[c] = out.channel(c as u16)[i];
+                            }
+                            r.apply_frame(&frame[..n], &mut data[dst * out_ch_cb..dst * out_ch_cb + n]);
+                            continue;
+                        }
                         for c in 0..out_ch_cb.min(out.channels() as usize) {
                             data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
                         }

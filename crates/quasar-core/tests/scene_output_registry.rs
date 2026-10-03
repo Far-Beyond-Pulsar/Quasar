@@ -89,6 +89,7 @@ fn scene_output_config_round_trip_fields() {
         directivity: 0.75,
         pulls: vec![ChannelPull::new(SourceId(1), 0, -3.0)],
         movability: Movability::Streaming,
+        ..Default::default()
     };
     assert_eq!(cfg.orientation, Some([0.0, 0.0, -1.0]));
     assert_eq!(cfg.pulls.len(), 1);

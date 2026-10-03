@@ -7,9 +7,11 @@ pub use quasar_backends;
 #[cfg(feature = "streaming")]
 pub mod streaming_source;
 
+mod output_stage;
 mod render;
 mod renderer;
 pub mod resampler;
+pub mod source_resampler;
 pub use render::{LFE_CUTOFF_HZ, MAX_LISTENERS, MAX_PROPAGATION_DELAY_SECS, MAX_SCENE_OUTPUTS};
 pub use renderer::AudioRenderer;
 use render::{
@@ -31,9 +33,8 @@ use std::time::Instant;
 
 use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery, SPEED_OF_SOUND};
 use quasar_core::bands::Band8;
-use quasar_core::source_directivity::{
-    diffuse_send_gain, emission_cos, first_order_bounce_point, pattern_band_gains,
-};
+use quasar_core::emitter_pattern::{EmitterModel, EmitterPattern, EmitterShape, EmitterTrace};
+use quasar_core::source_directivity::{diffuse_send_gain, first_order_bounce_point};
 use quasar_core::distance::DistanceModel;
 use quasar_core::error::SpatialAudioError;
 use quasar_core::hybrid::{HybridProbeSampler, HybridSamplingStrategy};
@@ -154,6 +155,10 @@ pub struct SpatialAudioEngine {
     pair_params: Vec<Vec<Arc<ParameterTripleBuffer>>>,
     /// Last resolved source/listener poses, used to skip unchanged pairs (#128).
     last_pair_poses: Vec<Vec<Option<([f32; 3], [f32; 3], [f32; 3])>>>,
+    /// The emitter models (#156) must be pushed to the backend before the next resolve.
+    emitters_dirty: bool,
+    /// `(outputs, listeners)` the backend's emitter table was last built for.
+    emitter_sync_shape: (usize, usize),
 
     // ── P1 content model (data model that later phases render) ────────────
     /// Loaded multi-channel sources, indexed by `SourceId`.
@@ -248,6 +253,8 @@ impl SpatialAudioEngine {
             shared,
             pair_params: Vec::new(),
             last_pair_poses: Vec::new(),
+            emitters_dirty: true,
+            emitter_sync_shape: (usize::MAX, usize::MAX),
             sources: Vec::new(),
             scene_outputs: Vec::new(),
             listeners: Vec::new(),
@@ -271,6 +278,38 @@ impl SpatialAudioEngine {
         self.hybrid_sampler.set_sample_rate(self.sample_rate);
         self.hybrid_sampler.set_realtime_backend(backend);
         self.last_pair_poses.clear();
+        self.emitters_dirty = true;
+    }
+
+    /// Push the emitter table (#156) to the backend when it changed: one entry per pair id
+    /// (`listener * n_out + output`, the `source_id` of the queries) for every emitter that has a
+    /// non-omnidirectional pattern or a non-default shape. Rebuilt when an emitter changed, when
+    /// a backend was installed, or when the number of outputs / listeners changed.
+    fn sync_emitters_to_backend(&mut self, n_out: usize, n_lis: usize) {
+        if !self.emitters_dirty && self.emitter_sync_shape == (n_out, n_lis) {
+            return;
+        }
+        self.emitters_dirty = false;
+        self.emitter_sync_shape = (n_out, n_lis);
+        let mut table: Vec<(u32, EmitterTrace)> = Vec::new();
+        for o in 0..n_out {
+            let cfg = &self.scene_outputs[o];
+            let pattern = if cfg.orientation.is_some() { resolved_emitter_pattern(cfg) } else { None };
+            if pattern.is_none() && cfg.emitter.shape == EmitterShape::Default {
+                continue; // omnidirectional, historic aperture: the backend default
+            }
+            let trace = EmitterTrace {
+                pattern,
+                forward: cfg.orientation.unwrap_or([0.0, 0.0, -1.0]),
+                shape: cfg.emitter.shape.clone(),
+            };
+            for l in 0..n_lis {
+                table.push(((l * n_out + o) as u32, trace.clone()));
+            }
+        }
+        if let Some(backend) = self.hybrid_sampler.realtime_backend_mut() {
+            backend.set_emitters(&table);
+        }
     }
 
     /// Set baked probe grid data.
@@ -456,12 +495,15 @@ impl SpatialAudioEngine {
         if self.last_pair_poses.len() != n_lis || self.last_pair_poses.iter().any(|r| r.len() != n_out) {
             self.last_pair_poses = vec![vec![None; n_out]; n_lis];
         }
+        self.sync_emitters_to_backend(n_out, n_lis);
 
+        // Phase 1: every pair whose pose changed since its last publish.
+        let mut pending: Vec<(usize, usize, SpatialQuery, ([f32; 3], [f32; 3], _))> = Vec::new();
         for l in 0..n_lis {
             for o in 0..n_out {
-                let Some(params) = self.pair_params.get(l).and_then(|p| p.get(o)) else {
+                if self.pair_params.get(l).and_then(|p| p.get(o)).is_none() {
                     continue;
-                };
+                }
                 let idx = (l * n_out + o) as u32;
                 let query = SpatialQuery {
                     source_position: self.scene_outputs[o].position,
@@ -470,7 +512,27 @@ impl SpatialAudioEngine {
                 };
                 let pose = (query.source_position, query.listener_position, self.listeners[l].heading);
                 if self.last_pair_poses[l][o] == Some(pose) { continue; }
-                if let Ok(mut res) = self.hybrid_sampler.resolve(&query, &self.material_registry) {
+                pending.push((l, o, query, pose));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        // Phase 2: ONE batched resolve for all of them (#151): a single `query_spatial`
+        // (rayon fan-out on the CPU backend, one dispatch on the GPU backend) instead of one
+        // backend call per pair.
+        let queries: Vec<SpatialQuery> = pending.iter().map(|p| p.2.clone()).collect();
+        let results = self.hybrid_sampler.resolve_batch(&queries, &self.material_registry);
+        drop(queries);
+
+        // Phase 3: publish each result exactly as the per-pair path did.
+        for ((l, o, query, pose), result) in pending.into_iter().zip(results) {
+            {
+                let Some(params) = self.pair_params.get(l).and_then(|p| p.get(o)) else {
+                    continue;
+                };
+                if let Ok(mut res) = result {
                     if let Some(Some(ov)) = self.distance_overrides.get(o) {
                         let global = self.hybrid_sampler.distance_model().gain(res.direct_path.distance);
                         if global > 1e-9 {
@@ -483,10 +545,16 @@ impl SpatialAudioEngine {
                     // below is then exactly 1.0 / 0 dB and the coefficients are unchanged.
                     let out_cfg = &self.scene_outputs[o];
                     let (e_pos, l_pos) = (query.source_position, query.listener_position);
-                    let pattern_on = out_cfg.orientation.is_some() && out_cfg.directivity > 0.0;
+                    // Pattern (#156): an explicit `emitter.pattern` (omni / cardioid family /
+                    // super- and hypercardioid / sound cone / horn), else the legacy cardioid
+                    // family from `directivity`. Needs an orientation, as before.
+                    let resolved = resolved_emitter_pattern(out_cfg);
+                    let pattern_on = out_cfg.orientation.is_some() && resolved.is_some();
                     let pattern_at = |target: Option<[f32; 3]>| -> Band8 {
-                        match target.and_then(|t| emission_cos(out_cfg.orientation, e_pos, t)) {
-                            Some(c) if pattern_on => pattern_band_gains(out_cfg.directivity, c),
+                        match (&resolved, out_cfg.orientation, target) {
+                            (Some(p), Some(fwd), Some(t)) if pattern_on => {
+                                p.band_gains(fwd, [t[0] - e_pos[0], t[1] - e_pos[1], t[2] - e_pos[2]])
+                            }
                             _ => Band8::splat(1.0),
                         }
                     };
@@ -500,7 +568,12 @@ impl SpatialAudioEngine {
                     };
                     // Reverb send: the late field follows the emitter's total radiated power.
                     let diffuse_db = if pattern_on {
-                        20.0 * diffuse_send_gain(out_cfg.directivity).max(1e-6).log10()
+                        let g = if out_cfg.emitter.pattern.is_some() {
+                            out_cfg.emitter.diffuse_gain // cached at EmitterModel::new
+                        } else {
+                            diffuse_send_gain(out_cfg.directivity)
+                        };
+                        20.0 * g.max(1e-6).log10()
                     } else {
                         0.0
                     };
@@ -864,6 +937,46 @@ impl SpatialAudioEngine {
         self.scene_outputs[idx].orientation = orientation;
         self.scene_outputs[idx].directivity = if directivity.is_finite() { directivity.clamp(0.0, 1.0) } else { 0.0 };
         self.last_pair_poses.clear();
+        self.emitters_dirty = true;
+    }
+
+    /// Set a scene output's radiation pattern (#156): spherical (`Omni`) or directional speaker.
+    ///
+    /// `pattern`: `None` returns to the legacy behaviour (cardioid family from the `directivity`
+    /// of [`set_scene_output_directivity`]); `Some(Omni)` is an explicit spherical speaker;
+    /// `Some(Horn { .. })` etc. are the directional types of [`quasar_core::emitter_pattern`].
+    /// The pattern needs an orientation (set it with [`set_scene_output_directivity`], whose
+    /// `directivity` is then ignored while a pattern is set); without one the emitter stays
+    /// omnidirectional. Evaluated per (listener, emitter) pair for the direct path, each early
+    /// reflection (toward its own first bounce point) and the reverb send (diffuse-field
+    /// average, cached here), and passed to the backend so it can rank and prune image-source
+    /// paths by the pattern.
+    ///
+    /// Compute-side only: takes effect at the next [`update_scene_spatial`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn set_scene_output_pattern(&mut self, id: SceneOutputId, pattern: Option<EmitterPattern>) {
+        let idx = self.scene_output_index(id);
+        let shape = self.scene_outputs[idx].emitter.shape.clone();
+        self.scene_outputs[idx].emitter = EmitterModel::new(pattern, shape);
+        self.last_pair_poses.clear();
+        self.emitters_dirty = true;
+    }
+
+    /// Set a scene output's physical aperture (#156): how the soft-occlusion probes are spread
+    /// over the source (`Point`, `Sphere`, `Disc`, `Line`; `Default` = the historic 0.35 m disc).
+    /// Compute-side only, applied at the next [`update_scene_spatial`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn set_scene_output_shape(&mut self, id: SceneOutputId, shape: EmitterShape) {
+        let idx = self.scene_output_index(id);
+        self.scene_outputs[idx].emitter.shape = shape;
+        self.last_pair_poses.clear();
+        self.emitters_dirty = true;
     }
 
     /// Set a scene output's LFE send (linear gain, `>= 0`; default 0 = none).
@@ -1197,12 +1310,71 @@ impl SpatialAudioEngine {
     }
 }
 
+impl SpatialAudioEngine {
+    /// Convert a listener's render to a different DEVICE layout as the last channel stage
+    /// (#83, #149): the listener is still rendered in its physical layout (say 7.1), then mapped
+    /// by the ITU-R BS.775-3 downmix matrix of `quasar_dsp::channel_matrix` (7.1 -> 5.1, 5.1 ->
+    /// stereo, 7.1 -> stereo, quad -> stereo, identity for the same layout) and only THEN
+    /// limited: the output safety stage runs on the device channels, so its ceiling holds on what
+    /// is actually played. The buffer passed to `process_audio_scene` for this listener must have
+    /// the DEVICE channel count.
+    ///
+    /// `None` removes the conversion. Conversions the matrix module does not define (upmix,
+    /// custom layouts) return an error here, nothing is changed and no channel is ever silently
+    /// dropped. Sent through the lock-free command queue; a change cross-fades the old and the new
+    /// mapping over 10 ms (no click) and allocates only on this thread. Without a call the
+    /// output is bit-identical to an engine without this stage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_listener_output_layout(
+        &mut self,
+        id: ListenerId,
+        device: Option<PhysicalOutputLayout>,
+    ) -> Result<(), quasar_dsp::channel_matrix::MatrixError> {
+        use quasar_dsp::channel_matrix::{downmix_gains, layout_channel_count, DEFAULT_MATRIX_RAMP_MS};
+        let idx = self.listener_index(id);
+        let from = render::physical_to_speaker_layout(&self.listeners[idx].physical_layout);
+        let n_phys = layout_channel_count(&from);
+        let sr = self.sample_rate;
+        let new = match device {
+            None => None,
+            Some(d) => {
+                let to = render::physical_to_speaker_layout(&d);
+                let gains = downmix_gains(&from, &to)?;
+                let n_dev = layout_channel_count(&to);
+                let identity = n_dev == n_phys
+                    && (0..n_phys * n_phys).all(|i| gains[i] == if i % (n_phys + 1) == 0 { 1.0 } else { 0.0 });
+                Some(output_stage::ConvStage::new(gains, n_phys, n_dev, sr, DEFAULT_MATRIX_RAMP_MS, identity)?)
+            }
+        };
+        let ident: Vec<f32> = (0..n_phys * n_phys).map(|i| if i % (n_phys + 1) == 0 { 1.0 } else { 0.0 }).collect();
+        let spare = output_stage::ConvStage::new(ident, n_phys, n_phys, sr, DEFAULT_MATRIX_RAMP_MS, true)?;
+        let scratch = Box::new(AudioBuffer::new(n_phys as u16, DEFAULT_BLOCK_SIZE as u16));
+        self.send(Command::SetConversion { listener: idx, swap: output_stage::ConvSwap::new(new, spare, scratch) });
+        Ok(())
+    }
+}
+
 /// Patch-bay entry of a pull (API surface is dB; DSP is linear).
 fn patch_entry(pull: &ChannelPull) -> PatchEntry {
     PatchEntry {
         source_idx: pull.source_id.0 as usize,
         channel: pull.channel as usize,
         gain_linear: db_to_linear(pull.gain_db),
+    }
+}
+
+/// The emitter's effective radiation pattern (#156): the explicit `emitter.pattern` (an omni
+/// pattern resolves to `None`), else the legacy cardioid family from `directivity`, else `None`
+/// (omnidirectional). `None` means every pattern factor is exactly 1.
+fn resolved_emitter_pattern(cfg: &SceneOutputConfig) -> Option<EmitterPattern> {
+    match &cfg.emitter.pattern {
+        Some(p) if p.is_omni() => None,
+        Some(p) => Some(p.clone()),
+        None if cfg.directivity > 0.0 => Some(EmitterPattern::CardioidFamily { directivity: cfg.directivity }),
+        None => None,
     }
 }
 
