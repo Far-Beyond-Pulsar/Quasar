@@ -6,10 +6,25 @@ use crate::v3_demo_common::{make_material, spawn_material, spawn_mesh, spawn_obj
 use glam::{Mat4, Vec3};
 use helio::MeshUpload;
 use pulsar_scenedb::World;
+use crate::acoustic_geometry::{AcousticClass, AcousticSurface};
 
 const HALF_LENGTH: f32 = 72.0;
 const HALF_WIDTH: f32 = 22.5;
 const BAY: f32 = 8.0;
+
+/// Acoustic class of each opaque material, in the order of `properties` in `populate`:
+/// stone, carved stone, basalt, paving, oak, bronze, wax, flame, altar.
+const ACOUSTIC_CLASSES: [AcousticClass; 9] = [
+    AcousticClass::Stone,
+    AcousticClass::CarvedStone,
+    AcousticClass::Basalt,
+    AcousticClass::Paving,
+    AcousticClass::Oak,
+    AcousticClass::Bronze,
+    AcousticClass::Wax,
+    AcousticClass::Flame,
+    AcousticClass::AltarStone,
+];
 
 pub fn populate(world: &mut World) {
     // Stone, carved stone, basalt, paving, oak, bronze, wax, flame, altar.
@@ -294,6 +309,8 @@ pub fn populate(world: &mut World) {
             }
             _ => {}
         }
+        // Acoustic class of this surface (read back by `acoustic_geometry`).
+        world.insert(material, AcousticSurface(ACOUSTIC_CLASSES[index]));
         let mesh = spawn_mesh(world,
             MeshUpload { vertices: mesh.vertices, indices: mesh.indices });
         spawn_object(world, mesh, material, Mat4::IDENTITY, 160.)
@@ -313,6 +330,7 @@ pub fn populate(world: &mut World) {
             [1.0; 3]
         } else { colour.map(|c| 0.04 + 0.76 * c) };
         world.insert(material, helio_pass_hlfs::RayTransmission(transmission));
+        world.insert(material, AcousticSurface(AcousticClass::StainedGlass));
         let mesh = spawn_mesh(world,
             MeshUpload { vertices: mesh.vertices, indices: mesh.indices });
         spawn_object(world, mesh, material, Mat4::IDENTITY, 160.)

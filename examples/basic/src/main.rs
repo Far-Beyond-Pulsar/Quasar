@@ -20,6 +20,7 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
+mod acoustic_geometry;
 mod architectural_materials;
 mod hlfs_capture;
 mod architectural_mesh;
