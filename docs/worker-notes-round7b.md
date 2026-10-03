@@ -12,3 +12,14 @@
 - `ChannelMatrix` additions: `process_add`, `fade_to_zero`, `is_settled`, `is_silent`.
 - `crates/quasar-dsp/src/channel_order.rs` (new): `DeviceChannelOrder`, `ChannelRemap` (WASAPI identity; ALSA FL FR RL RR C LFE (SL SR); CoreAudio 7.1 side/rear swap). ALSA/CoreAudio tables are assumptions (see module docs), unverified on hardware. Applied in the example's cpal callback only when not identity.
 - Tests: `crates/quasar/tests/output_conversion_tests.rs` (9), 4 unit tests in channel_order.rs.
+
+## #85 bass management: DONE
+- `crates/quasar-dsp/src/bass_management.rs` (new): `BassManager` (LR4 = 2 cascaded RBJ biquads Q=1/sqrt2, f64-computed coefficients), `BassManagementConfig`, `BassError`; biquad.rs got additive `set_highpass_q`, `set_lowpass_q_f64`. Engine: `set_listener_bass_management(id, Option<cfg>) -> Result<_, BassError>`; `Command::SetBass/SetBassEnabled`, `Garbage::Bass`; stage runs on the physical feeds BEFORE conversion and limiter.
+- Measured: coherent sum flat within 0.0103 dB (13 freqs, 20 Hz..15 kHz, unit test) and within 0.032 dB at engine level; branches -6.02 dB at fc, power sum -3.01 dB at fc (inherent to LR4; documented).
+- Tests: 7 unit + 5 engine (`bass_management_tests.rs`).
+
+## #84 speaker calibration: DONE
+- `crates/quasar-dsp/src/speaker_calibration.rs` (new): `SpeakerCalibration` (Hermite delay -> optional HP -> 3 EQ bands -> gain; changes cross-fade 50 ms: no pitch bend), `CalibrationConfig::from_distances` (farthest = reference, delay (dmax-d)/c, gain 20log10(d/dmax)), errors. biquad.rs: additive `set_low_shelf`.
+- Engine: `set_listener_calibration(id, Option<cfg>)`, `set_listener_speaker_distances(id, &[f32])`; runs after bass management, before conversion + limiter. `Command::SetCalibration`, `Garbage::Calib`, `CalibSwap` in render.rs.
+- Measured: arrival spread 0.0000 samples, level spread 0.0000 dB (construction-exact; verified by running the DSP on impulses), EQ bell 5.995 dB (+6), low shelf -3.994 (-4), high shelf 3.002 (+3); engine delayed-FL error 7.9e-7 vs 48-sample delayed reference x 0.8536.
+- Tests: 6 unit + 6 engine (`speaker_calibration_tests.rs`).

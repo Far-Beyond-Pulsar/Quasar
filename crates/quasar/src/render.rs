@@ -21,6 +21,8 @@ use quasar_core::bands::Band8;
 use quasar_core::param_exchange::{ParameterTripleBuffer, SpatialCoefficients};
 use quasar_core::scene_output::{ListenerConfig, PhysicalOutputLayout};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE, MAX_AUDIO_CHANNELS};
+use quasar_dsp::bass_management::BassManager;
+use quasar_dsp::speaker_calibration::{CalibrationConfig, SpeakerCalibration};
 use quasar_dsp::binaural::{BinauralConfig, BinauralRenderer, ParametricBinauralRenderer};
 use quasar_dsp::biquad::BiquadFilter;
 use quasar_dsp::crossfader::{EqualPowerCrossfader, MAX_CROSSFADE_REFLECTIONS};
@@ -156,6 +158,11 @@ pub(crate) struct ListenerRender {
     safety: OutputSafety,
     /// Optional physical -> device layout conversion, run BEFORE the safety stage (#83, #149).
     conv: OutputConv,
+    /// Optional bass management (LR4 crossover, small-speaker bass to the LFE), run on the
+    /// physical-layout speaker feeds before the conversion and the limiter (#85).
+    bass: Option<Box<BassManager>>,
+    /// Optional per-speaker calibration (delay, trim, EQ), after the bass management (#84).
+    calib: Option<Box<SpeakerCalibration>>,
 }
 
 impl ListenerRender {
@@ -211,6 +218,8 @@ impl ListenerRender {
             pairs: Vec::with_capacity(MAX_SCENE_OUTPUTS),
             safety: OutputSafety::new(sample_rate, OutputSafetyConfig::default()),
             conv: OutputConv::empty(),
+            bass: None,
+            calib: None,
         })
     }
 }
@@ -443,7 +452,7 @@ impl SceneRenderState {
             out.clear();
             let n_speakers = out.channels() as usize;
             let n_o = n_out.min(lis.pairs.len());
-            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, rev_trim, rev_trim_prev, early_trim, lfe_slots, lfe_filters, lfe_hot, safety, conv, .. } = lis;
+            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, rev_trim, rev_trim_prev, early_trim, lfe_slots, lfe_filters, lfe_hot, safety, conv, bass, calib, .. } = lis;
             let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
 
             for o in 0..n_o {
@@ -653,6 +662,12 @@ impl SceneRenderState {
             }
 
             // Output safety stage (#80): gain staging, NaN / inf scrub, look-ahead limiter, meters.
+            if let Some(b) = bass.as_mut() {
+                b.process(out);
+            }
+            if let Some(c) = calib.as_mut() {
+                c.process(out);
+            }
             if via_conv {
                 if let Some(sb) = conv_scratch.take() {
                     conv.finish(sb, &mut listener_outputs[l]);
@@ -697,6 +712,15 @@ pub(crate) enum Garbage {
     Bus(PatchBayBus),
     Shell(Box<OutputAdd>),
     Conv(ConvGarbage),
+    Bass(Box<BassManager>),
+    Calib(Box<CalibSwap>),
+}
+
+/// Payload of [`Command::SetCalibration`]: the stage to install when the listener has none (the
+/// shell returns as garbage with whatever was not used) and the configuration to apply.
+pub(crate) struct CalibSwap {
+    pub(crate) stage: Option<Box<SpeakerCalibration>>,
+    pub(crate) cfg: CalibrationConfig,
 }
 
 /// A configuration change for the audio thread, applied at the start of a block. Small and
@@ -717,6 +741,9 @@ pub(crate) enum Command {
     SetEarlyTrim { listener: usize, gain: f32 },
     SetPullRampSamples(u32),
     SetConversion { listener: usize, swap: Box<ConvSwap> },
+    SetBass { listener: usize, mgr: Box<BassManager> },
+    SetBassEnabled { listener: usize, on: bool },
+    SetCalibration { listener: usize, swap: Box<CalibSwap> },
 }
 
 impl SceneRenderState {
@@ -751,6 +778,32 @@ impl SceneRenderState {
             Command::SetReverbTrim { listener, gain } => self.set_reverb_trim(listener, gain),
             Command::SetEarlyTrim { listener, gain } => self.set_early_trim(listener, gain),
             Command::SetPullRampSamples(n) => self.patch_bay.set_ramp_samples(n),
+            Command::SetBass { listener, mut mgr } => match self.listeners.get_mut(listener) {
+                Some(l) => {
+                    if let Some(old) = l.bass.take() {
+                        mgr.adopt_state(&old);
+                        sink(Garbage::Bass(old));
+                    }
+                    l.bass = Some(mgr);
+                }
+                None => sink(Garbage::Bass(mgr)),
+            },
+            Command::SetCalibration { listener, mut swap } => {
+                if let Some(l) = self.listeners.get_mut(listener) {
+                    if l.calib.is_none() {
+                        l.calib = swap.stage.take();
+                    }
+                    if let Some(c) = l.calib.as_mut() {
+                        c.set_config(&swap.cfg).ok();
+                    }
+                }
+                sink(Garbage::Calib(swap));
+            }
+            Command::SetBassEnabled { listener, on } => {
+                if let Some(b) = self.listeners.get_mut(listener).and_then(|l| l.bass.as_mut()) {
+                    b.set_enabled(on);
+                }
+            }
             Command::SetConversion { listener, swap } => match self.listeners.get_mut(listener) {
                 Some(l) => l.conv.swap(swap, &mut |g| sink(Garbage::Conv(g))),
                 None => sink(Garbage::Conv(ConvGarbage::Swap(swap))),

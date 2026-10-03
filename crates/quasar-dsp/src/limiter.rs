@@ -36,6 +36,30 @@
 //! * **Metering.** [`OutputMeter`] holds lock-free atomics (peak, current gain reduction,
 //!   limited-sample count, hard-clip count, non-finite count) readable from any thread.
 //!
+//! # True-peak mode and dither (#147, both OFF by default)
+//!
+//! * **`true_peak`.** Sample peaks understate what a DAC reconstructs: two equal samples either side
+//!   of a zero crossing can reconstruct to up to `1/sin(pi/4)` = +3 dB at a quarter of the sample
+//!   rate (worse for crafted material). With `true_peak = true` the limiter measures the peak of the
+//!   4x oversampled signal. Detector: polyphase windowed-sinc interpolator, 48 taps (12 per phase),
+//!   Kaiser window (beta 7.5), cut-off at the input Nyquist, every phase normalised to unit DC
+//!   gain; phase 0 is the identity, so the sample peak is included. This is NOT the 48-tap
+//!   BS.1770-4 Annex 2 coefficient set (its numbers are not reproduced here); it is a filter of the
+//!   same size and type designed in this file, validated in `tests/true_peak_tests.rs` against a
+//!   brute-force 16x oversampling with a 1024-tap Kaiser-windowed sinc. It reads 6 samples of
+//!   future (the filter is centred 6 input samples back), so the audio is delayed by 6 samples more
+//!   than the look-ahead, and the look-ahead is raised to at least `TP_MIN_LOOKAHEAD` (24) samples
+//!   so the gain has already settled over the whole kernel when a peak arrives:
+//!   [`OutputSafetyConfig::latency_samples`] / [`OutputSafety::latency_samples`] report the sum
+//!   exactly. The sample-peak mode stays the default because it has zero latency and the existing
+//!   bit-exact behaviour; recommended for deliverable-grade output: `true_peak = true`,
+//!   `lookahead_ms = 1.0`, `ceiling_db = -1.0` (about 54 samples = 1.1 ms at 48 kHz).
+//! * **`dither_bits`.** `0` = off. Otherwise TPDF dither (sum of two independent uniform variables,
+//!   triangular in `-1 ..= +1` LSB, variance `LSB^2 / 6`) is added to every output sample, where
+//!   `LSB = 2^-(bits-1)` for a full scale of +-1. The stage does not quantise (the device does);
+//!   dither is added last, so the output peak can exceed the ceiling by at most one LSB. The PRNG
+//!   is a per-channel xorshift32 seeded from `dither_seed`: deterministic and allocation-free.
+//!
 //! Memory is allocated in [`OutputSafety::new`] (all [`MAX_AUDIO_CHANNELS`] channels x
 //! [`MAX_LOOKAHEAD_SAMPLES`]); `process` never allocates.
 
@@ -46,6 +70,15 @@ use crate::audio_buffer::{AudioBuffer, MAX_AUDIO_CHANNELS};
 
 /// Largest supported look-ahead (samples); `lookahead_ms` is clamped to it.
 pub const MAX_LOOKAHEAD_SAMPLES: usize = 512;
+
+/// Taps per phase of the 4x true-peak interpolator (48 taps in total).
+pub const TP_TAPS_PER_PHASE: usize = 12;
+/// Extra delay (input samples) of the true-peak detector: the interpolator is centred this far back.
+pub const TP_DELAY_SAMPLES: usize = TP_TAPS_PER_PHASE / 2;
+/// Smallest look-ahead (samples) used in true-peak mode.
+pub const TP_MIN_LOOKAHEAD: usize = 24;
+/// Ring length of the per-channel audio delay.
+const DELAY_CAP: usize = MAX_LOOKAHEAD_SAMPLES + TP_DELAY_SAMPLES;
 
 /// Configuration of the output safety stage.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,6 +94,13 @@ pub struct OutputSafetyConfig {
     pub lookahead_ms: f32,
     /// Release time constant in milliseconds. Default 80.
     pub release_ms: f32,
+    /// Measure the 4x oversampled TRUE peak instead of the sample peak (adds latency, see the
+    /// module docs). Default false.
+    pub true_peak: bool,
+    /// TPDF dither at this target bit depth (8 ..= 32); 0 = off (default).
+    pub dither_bits: u8,
+    /// Seed of the dither PRNG.
+    pub dither_seed: u32,
 }
 
 impl Default for OutputSafetyConfig {
@@ -71,6 +111,9 @@ impl Default for OutputSafetyConfig {
             ceiling_db: -1.0,
             lookahead_ms: 0.0,
             release_ms: 80.0,
+            true_peak: false,
+            dither_bits: 0,
+            dither_seed: 0x5EED_1234,
         }
     }
 }
@@ -81,13 +124,22 @@ impl OutputSafetyConfig {
         if !self.enabled || !self.lookahead_ms.is_finite() || !sample_rate.is_finite() {
             return 0;
         }
-        ((self.lookahead_ms.max(0.0) * 0.001 * sample_rate).round() as usize).min(MAX_LOOKAHEAD_SAMPLES)
+        let n = ((self.lookahead_ms.max(0.0) * 0.001 * sample_rate).round() as usize).min(MAX_LOOKAHEAD_SAMPLES);
+        if self.true_peak {
+            n.max(TP_MIN_LOOKAHEAD)
+        } else {
+            n
+        }
     }
 
     /// Latency this configuration adds to the output, in samples at `sample_rate`: exactly the
-    /// look-ahead.
+    /// look-ahead, plus [`TP_DELAY_SAMPLES`] of detector delay in true-peak mode.
     pub fn latency_samples(&self, sample_rate: f32) -> usize {
-        self.lookahead_samples(sample_rate)
+        if self.enabled && self.true_peak {
+            self.lookahead_samples(sample_rate) + TP_DELAY_SAMPLES
+        } else {
+            self.lookahead_samples(sample_rate)
+        }
     }
 }
 
@@ -196,6 +248,16 @@ pub struct OutputSafety {
     /// gap decays all the way to exactly 0, where a recursion on the gain itself would stall a
     /// few ulps below 1.0.
     gap: f32,
+    /// True-peak detector (see the module docs): 4 phases x 12 taps, per-channel history (newest
+    /// first) and the number of extra delay samples it adds (0 when off).
+    tp_on: bool,
+    tp_coef: [[f32; TP_TAPS_PER_PHASE]; 4],
+    tp_hist: Vec<f32>,
+    tp_delay: usize,
+    /// Per-channel xorshift32 dither state, the amplitude of one LSB (0 = off).
+    dither_state: [u32; MAX_AUDIO_CHANNELS],
+    dither_lsb: f32,
+    dither_seed_cur: Option<u32>,
 }
 
 const DQ_CAP: usize = MAX_LOOKAHEAD_SAMPLES + 2;
@@ -212,7 +274,7 @@ impl OutputSafety {
             ceiling: 0.891_25,
             n: 0,
             release_coef: 0.0,
-            delay: vec![0.0; MAX_AUDIO_CHANNELS * MAX_LOOKAHEAD_SAMPLES],
+            delay: vec![0.0; MAX_AUDIO_CHANNELS * DELAY_CAP],
             delay_pos: 0,
             dq_idx: vec![0; DQ_CAP],
             dq_val: vec![1.0; DQ_CAP],
@@ -223,6 +285,13 @@ impl OutputSafety {
             ma_pos: 0,
             t: 0,
             gap: 0.0,
+            tp_on: false,
+            tp_coef: true_peak_kernel(),
+            tp_hist: vec![0.0; MAX_AUDIO_CHANNELS * TP_TAPS_PER_PHASE],
+            tp_delay: 0,
+            dither_state: [1; MAX_AUDIO_CHANNELS],
+            dither_lsb: 0.0,
+            dither_seed_cur: None,
         };
         s.set_config(cfg);
         s
@@ -243,9 +312,9 @@ impl OutputSafety {
         self.cfg
     }
 
-    /// Latency (samples) this stage adds: the look-ahead.
+    /// Latency (samples) this stage adds: the look-ahead (plus the detector delay in true-peak mode).
     pub fn latency_samples(&self) -> usize {
-        self.n
+        self.n + self.tp_delay
     }
 
     /// Reconfigure in place (no allocation). The limiter state is reset if the look-ahead
@@ -260,9 +329,21 @@ impl OutputSafety {
             ..cfg
         };
         let n = cfg.lookahead_samples(self.sample_rate);
-        let changed = n != self.n;
+        let tp_on = cfg.enabled && cfg.true_peak;
+        let tp_delay = if tp_on { TP_DELAY_SAMPLES } else { 0 };
+        let changed = n != self.n || tp_delay != self.tp_delay;
         self.cfg = cfg;
         self.n = n;
+        self.tp_on = tp_on;
+        self.tp_delay = tp_delay;
+        self.dither_lsb = if cfg.dither_bits >= 8 && cfg.dither_bits <= 32 { 2.0_f32.powi(1 - cfg.dither_bits as i32) } else { 0.0 };
+        if self.dither_lsb > 0.0 && self.dither_seed_cur != Some(cfg.dither_seed) {
+            self.dither_seed_cur = Some(cfg.dither_seed);
+            for (c, st) in self.dither_state.iter_mut().enumerate() {
+                let s = cfg.dither_seed ^ (c as u32 + 1).wrapping_mul(0x9E37_79B9);
+                *st = if s == 0 { 0x1234_5678 } else { s };
+            }
+        }
         self.pre_gain = 10f32.powf(cfg.headroom_db / 20.0);
         self.ceiling = 10f32.powf(cfg.ceiling_db / 20.0);
         // One-pole release: the gap to unity shrinks by this fraction per sample.
@@ -283,6 +364,7 @@ impl OutputSafety {
         self.ma_pos = 0;
         self.t = 0;
         self.gap = 0.0;
+        self.tp_hist.fill(0.0);
     }
 
     /// Process `buf` in place (all its channels, linked). Never allocates, locks or panics.
@@ -311,9 +393,20 @@ impl OutputSafety {
                     nonfinite += 1;
                 }
                 buf.channel_mut(c as u16)[i] = x;
-                peak = peak.max(x.abs());
+                if self.tp_on {
+                    peak = peak.max(true_peak_step(&self.tp_coef, &mut self.tp_hist[c * TP_TAPS_PER_PHASE..(c + 1) * TP_TAPS_PER_PHASE], x));
+                } else {
+                    peak = peak.max(x.abs());
+                }
             }
             if !enabled {
+                if self.dither_lsb > 0.0 {
+                    for c in 0..channels {
+                        let v = buf.channel(c as u16)[i] + tpdf(&mut self.dither_state[c], self.dither_lsb);
+                        buf.channel_mut(c as u16)[i] = v;
+                        peak = peak.max(v.abs());
+                    }
+                }
                 block_peak = block_peak.max(peak);
                 continue;
             }
@@ -347,12 +440,13 @@ impl OutputSafety {
 
             // 3. Delay line (look-ahead) and apply.
             let mut out_peak = 0.0_f32;
+            let dl = n + self.tp_delay;
             for c in 0..channels {
                 let x = buf.channel(c as u16)[i];
-                let y = if n == 0 {
+                let y = if dl == 0 {
                     x
                 } else {
-                    let slot = &mut self.delay[c * MAX_LOOKAHEAD_SAMPLES + self.delay_pos];
+                    let slot = &mut self.delay[c * DELAY_CAP + self.delay_pos];
                     let y = *slot;
                     *slot = x;
                     y
@@ -365,11 +459,14 @@ impl OutputSafety {
                     }
                     o = o.clamp(-ceiling, ceiling);
                 }
+                if self.dither_lsb > 0.0 {
+                    o += tpdf(&mut self.dither_state[c], self.dither_lsb);
+                }
                 buf.channel_mut(c as u16)[i] = o;
                 out_peak = out_peak.max(o.abs());
             }
-            if n > 0 {
-                self.delay_pos = if self.delay_pos + 1 == n { 0 } else { self.delay_pos + 1 };
+            if dl > 0 {
+                self.delay_pos = if self.delay_pos + 1 == dl { 0 } else { self.delay_pos + 1 };
             }
             block_peak = block_peak.max(out_peak);
         }
@@ -415,6 +512,79 @@ impl OutputSafety {
         }
         self.dq_val[self.dq_head]
     }
+}
+
+/// The 4x polyphase true-peak kernel: `coef[p][j]` multiplies the sample `j` samples before the
+/// newest one and produces the interpolated value at `p / 4` of a sample after sample `i - 6`
+/// (`i` = newest). Kaiser (beta 7.5) windowed sinc over 48 taps centred on tap 24, every phase
+/// normalised to unit DC gain; phase 0 is the identity (sample `i - 6` itself).
+fn true_peak_kernel() -> [[f32; TP_TAPS_PER_PHASE]; 4] {
+    const BETA: f64 = 7.5;
+    let half = (4 * TP_TAPS_PER_PHASE / 2) as f64; // 24
+    let i0 = |x: f64| -> f64 {
+        let (mut sum, mut term) = (1.0, 1.0);
+        let q = x * x / 4.0;
+        for k in 1..60 {
+            term *= q / (k as f64 * k as f64);
+            sum += term;
+        }
+        sum
+    };
+    let norm = i0(BETA);
+    let mut out = [[0.0_f32; TP_TAPS_PER_PHASE]; 4];
+    out[0][TP_TAPS_PER_PHASE / 2] = 1.0;
+    for p in 1..4 {
+        let mut row = [0.0_f64; TP_TAPS_PER_PHASE];
+        let mut sum = 0.0;
+        for j in 0..TP_TAPS_PER_PHASE {
+            let k = p + 4 * j;
+            let t = k as f64 - half; // in 4x-rate samples
+            let r = t / half;
+            let w = i0(BETA * (1.0 - r * r).max(0.0).sqrt()) / norm;
+            let a = std::f64::consts::PI * t / 4.0;
+            let sinc = if t == 0.0 { 1.0 } else { a.sin() / a };
+            row[j] = sinc * w;
+            sum += row[j];
+        }
+        for j in 0..TP_TAPS_PER_PHASE {
+            out[p][j] = (row[j] / sum) as f32;
+        }
+    }
+    out
+}
+
+/// Push `x` into one channel's history (newest first) and return the largest |value| of the 4x
+/// oversampled signal in the sample interval that ends 6 samples back.
+#[inline]
+fn true_peak_step(coef: &[[f32; TP_TAPS_PER_PHASE]; 4], hist: &mut [f32], x: f32) -> f32 {
+    hist.copy_within(0..TP_TAPS_PER_PHASE - 1, 1);
+    hist[0] = x;
+    let mut peak = hist[TP_TAPS_PER_PHASE / 2].abs();
+    for p in 1..4 {
+        let mut acc = 0.0_f32;
+        for j in 0..TP_TAPS_PER_PHASE {
+            acc += coef[p][j] * hist[j];
+        }
+        peak = peak.max(acc.abs());
+    }
+    peak
+}
+
+/// One TPDF dither value: the sum of two independent uniform variables in `[-0.5, 0.5) LSB`.
+#[inline]
+fn tpdf(state: &mut u32, lsb: f32) -> f32 {
+    let mut next = || {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        // Top 24 bits -> [0, 1).
+        (x >> 8) as f32 * (1.0 / 16_777_216.0)
+    };
+    let a = next();
+    let b = next();
+    (a + b - 1.0) * lsb
 }
 
 /// Enable flush-to-zero / denormals-are-zero on the CALLING thread, so denormal floats (slow on

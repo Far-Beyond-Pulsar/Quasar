@@ -113,6 +113,40 @@ impl BiquadFilter {
         );
     }
 
+    /// Configure as a 2nd-order highpass with an explicit Q (RBJ cookbook; coefficients computed
+    /// in f64). Two sections with Q = 1/sqrt(2) in series form a Linkwitz-Riley 4th-order highpass.
+    pub fn set_highpass_q(&mut self, cutoff_hz: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz as f64 / sample_rate as f64;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * (q as f64).max(1e-3));
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        let b0 = (1.0 + cos_w0) * 0.5 * inv_a0;
+        self.set_coefficients(
+            b0 as f32,
+            (-(1.0 + cos_w0) * inv_a0) as f32,
+            b0 as f32,
+            (-2.0 * cos_w0 * inv_a0) as f32,
+            ((1.0 - alpha) * inv_a0) as f32,
+        );
+    }
+
+    /// Like [`set_lowpass_q`](Self::set_lowpass_q) with the coefficients computed in f64 (use for
+    /// low cut-offs where the poles sit close to the unit circle).
+    pub fn set_lowpass_q_f64(&mut self, cutoff_hz: f32, q: f32, sample_rate: f32) {
+        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz as f64 / sample_rate as f64;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * (q as f64).max(1e-3));
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        let b0 = (1.0 - cos_w0) * 0.5 * inv_a0;
+        self.set_coefficients(
+            b0 as f32,
+            ((1.0 - cos_w0) * inv_a0) as f32,
+            b0 as f32,
+            (-2.0 * cos_w0 * inv_a0) as f32,
+            ((1.0 - alpha) * inv_a0) as f32,
+        );
+    }
+
     /// Configure as a peaking (bell) EQ: `gain_db` at `center_hz`, bandwidth set by `q` (RBJ cookbook).
     pub fn set_peaking(&mut self, center_hz: f32, q: f32, gain_db: f32, sample_rate: f32) {
         let a = 10.0_f32.powf(gain_db / 40.0);
@@ -144,6 +178,23 @@ impl BiquadFilter {
             a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
             2.0 * ((a - 1.0) - (a + 1.0) * cos_w0) * inv_a0,
             ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
+        );
+    }
+
+    /// Configure as a low shelf: `gain_db` below `corner_hz` (shelf slope S = 1, RBJ cookbook).
+    pub fn set_low_shelf(&mut self, corner_hz: f32, gain_db: f32, sample_rate: f32) {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * corner_hz / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 * 0.5 * std::f32::consts::SQRT_2;
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let inv_a0 = 1.0 / ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+        self.set_coefficients(
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha) * inv_a0,
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0) * inv_a0,
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0) * inv_a0,
+            ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha) * inv_a0,
         );
     }
 }

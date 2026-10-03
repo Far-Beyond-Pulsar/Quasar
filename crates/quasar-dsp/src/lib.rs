@@ -1,4 +1,5 @@
 pub mod audio_buffer;
+pub mod bass_management;
 pub mod channel_matrix;
 pub mod channel_order;
 pub mod biquad;
@@ -14,9 +15,11 @@ pub mod reflection_decoder;
 pub mod late_reverb;
 pub mod master_decoder;
 pub mod patch_bay;
+pub mod speaker_calibration;
 pub mod vbap;
 
 pub use audio_buffer::*;
+pub use bass_management::*;
 pub use channel_matrix::*;
 pub use channel_order::*;
 pub use binaural::*;
@@ -31,4 +34,5 @@ pub use reflection_decoder::*;
 pub use late_reverb::*;
 pub use master_decoder::*;
 pub use patch_bay::*;
+pub use speaker_calibration::*;
 pub use vbap::*;

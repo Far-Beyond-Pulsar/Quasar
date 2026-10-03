@@ -173,3 +173,106 @@ fn without_an_orientation_every_pattern_is_omnidirectional() {
     e.set_scene_output_pattern(o, Some(EmitterPattern::horn(30.0, 20.0)));
     assert_eq!(level(&mut e, freq), plain);
 }
+
+// ── Reflections leave the emitter in their own direction (#156) ─────────────
+
+mod reflections {
+    use super::*;
+    use quasar_audio::quasar_backends::cpu_simd::CpuSimdConfig;
+    use quasar_audio::quasar_backends::CpuSimdComputeBackend;
+    use quasar_audio::quasar_core::bands::Band8;
+    use quasar_audio::quasar_core::scene::{AcousticMesh, AcousticScene};
+    use quasar_audio::quasar_materials::instance::AcousticMaterialInstance;
+    use quasar_audio::quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
+
+    const C: f32 = 343.0;
+    const SRC: [f32; 3] = [10.0, 1.7, 8.0];
+    const LIS: [f32; 3] = [10.0, 1.7, 25.0];
+
+    /// Empty 20 x 20 x 30 m box (inward-facing quads), emitter at z = 8, listener at z = 25. The
+    /// ceiling is high so its reflection (40 m) does not share a window with the far wall (27 m).
+    fn room_engine() -> (SpatialAudioEngine, SceneOutputId) {
+        let mut e = SpatialAudioEngine::new(0, SR, 15.0);
+        e.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
+        let mat = e.materials().add_instance(AcousticMaterialInstance::new(
+            TABULAR_MODEL_ID,
+            Tabular8BandEvaluator::create_params(Band8::splat(0.1), Band8::zeros(), Band8::zeros()),
+        ));
+        let (lo, hi) = ([0.0_f32, 0.0, 0.0], [20.0_f32, 20.0, 30.0]);
+        let p = vec![
+            [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+        ];
+        let mut idx: Vec<u32> = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
+        ];
+        for t in idx.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+        let mut scene = AcousticScene::new();
+        scene.add_mesh(AcousticMesh::new(1, p, idx, mat));
+        let cfg = CpuSimdConfig { max_reflection_order: 1, max_reflections: 16, ..CpuSimdConfig::default() };
+        e.set_backend(Box::new(CpuSimdComputeBackend::new(scene, cfg)));
+        e.set_strategy(HybridSamplingStrategy::RealTimeOnly);
+        let s = e.load_source(SourceConfig { path: "imp.wav".into(), channels: 1 }).expect("source");
+        let o = e.add_scene_output(SceneOutputConfig::new(SRC, Movability::Static));
+        e.connect_pull(o, ChannelPull::new(s, 0, 0.0));
+        e.add_listener(ListenerConfig {
+            position: LIS,
+            heading: [0.0, 0.0, 1.0],
+            physical_layout: PhysicalOutputLayout::Stereo,
+        });
+        e.debug_audio_stage = 3; // direct + early reflections
+        (e, o)
+    }
+
+    /// Impulse response (L+R) after the engine has settled.
+    fn impulse(e: &mut SpatialAudioEngine) -> Vec<f32> {
+        e.update_scene_spatial();
+        let silence = AudioBuffer::new(1, BLOCK as u16);
+        let mut imp = AudioBuffer::new(1, BLOCK as u16);
+        imp.set(0, 0, 1.0);
+        let mut out = [AudioBuffer::new(2, BLOCK as u16)];
+        let mut y = Vec::new();
+        for b in 0..(24 + 110) {
+            let input = if b == 24 { &imp } else { &silence };
+            e.process_audio_scene(&[input], &mut out);
+            if b >= 24 {
+                for i in 0..BLOCK {
+                    y.push(out[0].channel(0)[i] + out[0].channel(1)[i]);
+                }
+            }
+        }
+        y
+    }
+
+    fn window(y: &[f32], metres: f32) -> f32 {
+        let c = (metres * SR / C).round() as usize;
+        let (lo, hi) = (c.saturating_sub(48), (c + 48).min(y.len()));
+        y[lo..hi].iter().map(|v| v * v).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn a_horn_keeps_the_on_axis_reflection_and_cuts_the_one_behind_the_speaker() {
+        // Far wall (z = 30): path 22 + 5 = 27 m, leaves the emitter on axis (toward +Z).
+        // Rear wall (z = 0): path 8 + 25 = 33 m, leaves it at 180 degrees.
+        let omni = {
+            let (mut e, _) = room_engine();
+            impulse(&mut e)
+        };
+        let horn = {
+            let (mut e, o) = room_engine();
+            e.set_scene_output_directivity(o, Some([0.0, 0.0, 1.0]), 0.0);
+            e.set_scene_output_pattern(o, Some(EmitterPattern::horn(60.0, 40.0)));
+            impulse(&mut e)
+        };
+        let far = db(window(&horn, 27.0), window(&omni, 27.0));
+        let rear = db(window(&horn, 33.0), window(&omni, 33.0));
+        assert!(window(&omni, 27.0) > 1e-4 && window(&omni, 33.0) > 1e-4, "reflections must exist");
+        assert!(far.abs() < 1.0, "on-axis far-wall reflection must be unchanged: {far} dB");
+        assert!(rear < -6.0, "rear-wall reflection must be cut by the horn's rear: {rear} dB");
+        // And the direct sound (17 m, on axis) is unchanged.
+        let direct = db(window(&horn, 17.0), window(&omni, 17.0));
+        assert!(direct.abs() < 1.0, "on-axis direct sound must be unchanged: {direct} dB");
+    }
+}

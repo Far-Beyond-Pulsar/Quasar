@@ -1357,6 +1357,103 @@ impl SpatialAudioEngine {
     }
 }
 
+impl SpatialAudioEngine {
+    /// Bass management of a listener (#85): the low band (Linkwitz-Riley 4th order crossover,
+    /// default 80 Hz) of the speakers flagged `small` is removed from them and summed into the
+    /// layout's LFE channel; large speakers are untouched. See `quasar_dsp::bass_management` for
+    /// the level convention (0 dB, summed coherent response flat) and the LFE low-pass option.
+    ///
+    /// The stage runs on the listener's physical-layout speaker feeds, before the output
+    /// conversion ([`set_listener_output_layout`](Self::set_listener_output_layout)) and the
+    /// limiter. `None` ramps it out (50 ms). A layout without an LFE channel (stereo, quad,
+    /// custom, HRTF), wrong flag count or out-of-range values return an error and change
+    /// nothing: bass is never silently dropped. Default (never called): bit-identical to an
+    /// engine without the stage. Sent through the lock-free command queue; allocation only here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_listener_bass_management(
+        &mut self,
+        id: ListenerId,
+        cfg: Option<quasar_dsp::bass_management::BassManagementConfig>,
+    ) -> Result<(), quasar_dsp::bass_management::BassError> {
+        use quasar_dsp::bass_management::BassManager;
+        use quasar_dsp::channel_matrix::layout_channel_count;
+        let idx = self.listener_index(id);
+        match cfg {
+            None => {
+                self.send(Command::SetBassEnabled { listener: idx, on: false });
+                Ok(())
+            }
+            Some(cfg) => {
+                let layout = render::physical_to_speaker_layout(&self.listeners[idx].physical_layout);
+                let hrtf = self.listeners[idx].physical_layout == PhysicalOutputLayout::Hrtf;
+                let lfe: &[usize] = if hrtf { &[] } else { quasar_dsp::master_decoder::layout_lfe(&layout) };
+                let mut mgr = BassManager::new(self.sample_rate, layout_channel_count(&layout), lfe, &cfg)?;
+                mgr.set_enabled(true);
+                self.send(Command::SetBass { listener: idx, mgr: Box::new(mgr) });
+                Ok(())
+            }
+        }
+    }
+}
+
+impl SpatialAudioEngine {
+    /// Speaker calibration of a listener (#84): per-speaker delay, level trim, up to three EQ
+    /// bands and an optional high-pass, applied to the physical speaker feeds after the bass
+    /// management and before the output conversion and the limiter (see
+    /// `quasar_dsp::speaker_calibration`). `None` ramps back to a flat (transparent) chain.
+    ///
+    /// The configuration must have exactly one entry per channel of the listener's physical
+    /// layout; invalid values, a delay beyond 50 ms or a wrong channel count return an error
+    /// and change nothing. Changes cross-fade (50 ms by default) and never click. Never called:
+    /// bit-identical to an engine without the stage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_listener_calibration(
+        &mut self,
+        id: ListenerId,
+        cfg: Option<quasar_dsp::speaker_calibration::CalibrationConfig>,
+    ) -> Result<(), quasar_dsp::speaker_calibration::CalibrationError> {
+        use quasar_dsp::channel_matrix::layout_channel_count;
+        use quasar_dsp::speaker_calibration::{CalibrationConfig, SpeakerCalibration, DEFAULT_MAX_DELAY_SECS};
+        let idx = self.listener_index(id);
+        let layout = render::physical_to_speaker_layout(&self.listeners[idx].physical_layout);
+        let n = layout_channel_count(&layout);
+        let cfg = cfg.unwrap_or_else(|| CalibrationConfig::flat(n));
+        // Validate on a scratch stage first so that nothing is sent on error.
+        let mut stage = SpeakerCalibration::new(self.sample_rate, n, DEFAULT_MAX_DELAY_SECS)?;
+        stage.set_config(&cfg)?;
+        let fresh = SpeakerCalibration::new(self.sample_rate, n, DEFAULT_MAX_DELAY_SECS)?;
+        self.send(Command::SetCalibration {
+            listener: idx,
+            swap: Box::new(render::CalibSwap { stage: Some(Box::new(fresh)), cfg }),
+        });
+        Ok(())
+    }
+
+    /// Auto-align a listener's speakers from their distances (metres) to the sweet spot: every
+    /// nearer speaker is delayed and attenuated to arrive together with, and as loud as, the
+    /// farthest one (see `CalibrationConfig::from_distances`). One distance per physical channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_listener_speaker_distances(
+        &mut self,
+        id: ListenerId,
+        distances_m: &[f32],
+    ) -> Result<(), quasar_dsp::speaker_calibration::CalibrationError> {
+        use quasar_dsp::speaker_calibration::{CalibrationConfig, DEFAULT_MAX_DELAY_SECS};
+        let max = DEFAULT_MAX_DELAY_SECS * self.sample_rate;
+        let cfg = CalibrationConfig::from_distances(distances_m, self.sample_rate, SPEED_OF_SOUND, 1.0, max)?;
+        self.set_listener_calibration(id, Some(cfg))
+    }
+}
+
 /// Patch-bay entry of a pull (API surface is dB; DSP is linear).
 fn patch_entry(pull: &ChannelPull) -> PatchEntry {
     PatchEntry {
