@@ -7,7 +7,9 @@ newer Helio (`05c2f7d7`, SceneDB-authoritative scene). The acoustic geometry is 
 every renderable object is also a Quasar acoustic mesh, so the audio engine evaluates the real scene (about 415 000
 triangles), not a hand-built proxy.
 
-Run from `examples/basic` (or from the repository root):
+The binary is self-contained: the 8-channel WAV (9.3 MB) and the material textures (about 31 MB of PNG/JPG) are embedded with `include_bytes!`, so the exe needs no `assets/` folder or working directory (`assets/` is only read at build time; `holiday.wav` and `speaker.png` are unused and not embedded). The release exe is about 58 MB. Helio's shaders are embedded in its crates; its shader hot-reload watcher only starts when the source tree exists on disk, and nothing is written at runtime (no bake cache).
+
+Run from anywhere:
 
 ```
 cargo run --release --manifest-path examples/basic/Cargo.toml

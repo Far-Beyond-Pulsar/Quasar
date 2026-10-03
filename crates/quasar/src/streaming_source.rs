@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,12 @@ use quasar_core::streaming_source::{StreamingPolicy, StreamingSource};
 // ── Low-level disk reader ─────────────────────────────────────────────
 
 /// A streaming WAV file reader that implements `StreamingSource`.
+/// Any seekable byte source a WAV can be read from (file or in-memory bytes).
+trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
 pub struct WaveFileStream {
-    reader: hound::WavReader<BufReader<File>>,
+    reader: hound::WavReader<Box<dyn ReadSeek>>,
     spec: hound::WavSpec,
     total_frames: u64,
     position: u64,
@@ -20,7 +24,17 @@ pub struct WaveFileStream {
 
 impl WaveFileStream {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, hound::Error> {
-        let reader = hound::WavReader::open(path)?;
+        let file: Box<dyn ReadSeek> = Box::new(BufReader::new(File::open(path).map_err(hound::Error::IoError)?));
+        Self::from_reader(file)
+    }
+
+    /// Stream a WAV held in memory (e.g. `include_bytes!`), without any file access.
+    pub fn from_bytes(bytes: &'static [u8]) -> Result<Self, hound::Error> {
+        Self::from_reader(Box::new(std::io::Cursor::new(bytes)))
+    }
+
+    fn from_reader(source: Box<dyn ReadSeek>) -> Result<Self, hound::Error> {
+        let reader = hound::WavReader::new(source)?;
         let spec = reader.spec();
         let total_frames = reader.duration() as u64;
         Ok(Self { reader, spec, total_frames, position: 0 })
@@ -621,6 +635,26 @@ mod tests {
         assert_eq!(n, 50);
         let n = stream.read_frames(&mut buf);
         assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_bytes_matches_the_path_reader() {
+        let path = std::env::temp_dir().join("quasar_test_stream_bytes.wav");
+        let p = path.to_str().unwrap().to_string();
+        let samples: Vec<i16> = (0..200).map(|i| (i * 37 % 1000) as i16).collect();
+        write_test_wav(&p, &samples, 2, 44100);
+        let bytes: &'static [u8] = Box::leak(std::fs::read(&path).unwrap().into_boxed_slice());
+        let mut a = WaveFileStream::open(&path).unwrap();
+        let mut b = WaveFileStream::from_bytes(bytes).unwrap();
+        assert_eq!((a.channels(), a.sample_rate(), a.total_frames()), (b.channels(), b.sample_rate(), b.total_frames()));
+        let (mut x, mut y) = (vec![0.0_f32; 60], vec![0.0_f32; 60]);
+        for _ in 0..2 {
+            assert_eq!(a.read_frames(&mut x), b.read_frames(&mut y));
+            assert_eq!(x, y);
+            a.seek_frames(0);
+            b.seek_frames(0);
+        }
         let _ = std::fs::remove_file(&path);
     }
 

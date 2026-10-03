@@ -223,7 +223,7 @@ pub fn run() -> Result<(), String> {
     let built = audio_demo::build_engine(
         world,
         SR,
-        "assets/8_Channel_ID.wav",
+        "embedded:8_Channel_ID.wav",
         8,
         PhysicalOutputLayout::Surround714,
         AUDIENCE,
@@ -379,7 +379,7 @@ pub fn sweep() {
     let scene_db = build_world();
     let world = &scene_db.world;
     let built = audio_demo::build_engine(
-        world, SR, "assets/8_Channel_ID.wav", 8, PhysicalOutputLayout::Surround714, AUDIENCE, audio_demo::tracer_config(SR),
+        world, SR, "embedded:8_Channel_ID.wav", 8, PhysicalOutputLayout::Surround714, AUDIENCE, audio_demo::tracer_config(SR),
     );
     let handles = built.class_handles.clone();
     let materials = built.engine.materials();
@@ -426,7 +426,7 @@ mod tests {
         let built = audio_demo::build_engine(
             &scene_db.world,
             SR,
-            "assets/8_Channel_ID.wav",
+            "embedded:8_Channel_ID.wav",
             8,
             PhysicalOutputLayout::Surround714,
             AUDIENCE,

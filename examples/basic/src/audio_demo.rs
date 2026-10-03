@@ -309,6 +309,10 @@ pub fn physical_layout_for(out_ch: usize) -> PhysicalOutputLayout {
     }
 }
 
+/// The 8-channel test WAV (about 9 MB), embedded so the binary needs no assets folder.
+const EMBEDDED_WAV: &'static [u8] = include_bytes!("../assets/8_Channel_ID.wav");
+const WAV_LABEL: &str = "embedded:8_Channel_ID.wav";
+
 /// Thin wrapper around `BufferedStream` for the audio callback. All disk I/O happens on a
 /// background thread; the callback never blocks.
 struct StreamingPlayback {
@@ -320,8 +324,8 @@ struct StreamingPlayback {
 
 impl StreamingPlayback {
     fn open(path: &str, output_sample_rate: f32) -> Self {
-        // Scan the first chunk for the peak (blocking, setup only).
-        let mut wave = quasar_audio::streaming_source::WaveFileStream::open(path).expect("open WAV for streaming");
+        // The WAV is embedded in the binary: no file access. `path` is only a label.
+        let mut wave = quasar_audio::streaming_source::WaveFileStream::from_bytes(EMBEDDED_WAV).expect("open embedded WAV for streaming");
         let sample_rate = wave.sample_rate();
         let channels = wave.channels();
         let total_frames = wave.total_frames().unwrap_or(0);
@@ -422,14 +426,13 @@ pub fn setup_audio_engine(world: &pulsar_scenedb::World) -> AudioEngine {
     let sr = out_sr as f32;
 
     // Open the WAV as a streaming source (no full-file load).
-    let wav_path = crate::asset_path("8_Channel_ID.wav");
-    let mut playback = StreamingPlayback::open(&wav_path, sr);
+    let mut playback = StreamingPlayback::open(WAV_LABEL, sr);
     let nch_wav = playback.channels;
 
     let built = build_engine(
         world,
         sr,
-        &wav_path,
+        WAV_LABEL,
         nch_wav,
         physical_layout_for(out_ch),
         AUDIENCE,

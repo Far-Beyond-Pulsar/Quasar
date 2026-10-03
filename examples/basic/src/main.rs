@@ -90,17 +90,6 @@ pub(crate) const LARGE_CANDLES: &[(f32, f32, f32)] = &[
     (2.0, 1.6, -63.5), (4.0, 1.6, -64.0),
 ];
 
-/// Path of a bundled asset: `assets/<name>` relative to the working directory when it exists
-/// (running from `examples/basic`), else relative to this crate's manifest directory (running from
-/// the repository root).
-pub fn asset_path(name: &str) -> String {
-    let local = std::path::Path::new("assets").join(name);
-    if local.exists() {
-        return local.to_string_lossy().into_owned();
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(name).to_string_lossy().into_owned()
-}
-
 fn main() {
     env_logger::init();
     if std::env::var_os("QUASAR_SWEEP").is_some() {
