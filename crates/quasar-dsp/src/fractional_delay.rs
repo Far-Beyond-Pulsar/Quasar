@@ -1,6 +1,8 @@
 /// Extra ring samples beyond `max_samples`, so a whole block (<= `BLOCK_HEADROOM` samples) can be
 /// pushed before its taps are read (see [`HermiteInterpolatingDelayLine::tap_back`]).
 pub const BLOCK_HEADROOM: usize = 512;
+/// Longest block [`HermiteInterpolatingDelayLine::tap_block_const`] reads.
+pub const CONST_BLOCK: usize = 256;
 
 /// A variable fractional delay line using 4-point Hermite interpolation.
 ///
@@ -105,8 +107,9 @@ impl HermiteInterpolatingDelayLine {
         let v0 = at(base);
         let v1 = at(base.wrapping_sub(1));
         let v2 = at(base.wrapping_sub(2));
-        // At the newest sample there is no newer one yet; extrapolate linearly.
-        let v_m1 = if int_delay + newer == 0 { 2.0 * v0 - v1 } else { at(base.wrapping_add(1)) };
+        // At delay < 1 there is no newer sample (as when the tap is read right after the push):
+        // extrapolate linearly, whatever is already in the ring from a block pushed ahead.
+        let v_m1 = if int_delay == 0 { 2.0 * v0 - v1 } else { at(base.wrapping_add(1)) };
         ([v_m1, v0, v1, v2], frac)
     }
 
@@ -138,9 +141,9 @@ impl HermiteInterpolatingDelayLine {
     /// `i`, i.e. the block of `out.len()` samples just pushed, read back at one fixed delay.
     /// Bit-identical to the per-sample `tap_back` loop, but the interpolation weights are computed
     /// once and the four neighbours are read from one contiguous window (a 4-tap FIR over
-    /// consecutive samples, which vectorises). `out.len()` is capped at [`BLOCK_HEADROOM`].
+    /// consecutive samples, which vectorises). At most [`CONST_BLOCK`] (256) samples are read.
     pub fn tap_block_const(&self, delay_samples: f32, out: &mut [f32]) {
-        let n = out.len().min(BLOCK_HEADROOM);
+        let n = out.len().min(CONST_BLOCK);
         if n == 0 {
             return;
         }
@@ -159,23 +162,21 @@ impl HermiteInterpolatingDelayLine {
         // Window `w[k] = buffer[start + k]`, `start` = (index of v2 of the first sample).
         let m = self.mask;
         let start = self.write_pos.wrapping_sub(1 + int_delay + (n - 1) + 2) & m;
-        let mut w = [0.0_f32; BLOCK_HEADROOM + 3];
+        let mut w = [0.0_f32; CONST_BLOCK + 3];
         let len = n + 3;
         let first = len.min(self.buffer.len() - start);
         w[..first].copy_from_slice(&self.buffer[start..start + first]);
         if first < len {
             w[first..len].copy_from_slice(&self.buffer[..len - first]);
         }
-        // The very newest sample (only when the delay is 0) has no newer neighbour: scalar path.
-        let n_fir = if int_delay == 0 { n - 1 } else { n };
-        for i in 0..n_fir {
-            let (v2, v1, v0, vm) = (w[i], w[i + 1], w[i + 2], w[i + 3]);
+        // Delay < 1: no newer neighbour, extrapolate (see `gather`).
+        let extrap = int_delay == 0;
+        for i in 0..n {
+            let (v2, v1, v0) = (w[i], w[i + 1], w[i + 2]);
+            let vm = if extrap { 2.0 * v0 - v1 } else { w[i + 3] };
             let m0 = (v1 - vm) * 0.5;
             let m1 = (v2 - v0) * 0.5;
             out[i] = h00 * v0 + h10 * m0 + h01 * v1 + h11 * m1;
-        }
-        if n_fir < n {
-            out[n - 1] = self.tap_back(delay_samples, 0);
         }
     }
 

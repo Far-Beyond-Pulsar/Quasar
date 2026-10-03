@@ -9,6 +9,7 @@ pub mod streaming_source;
 
 mod render;
 mod renderer;
+pub mod resampler;
 pub use render::{LFE_CUTOFF_HZ, MAX_LISTENERS, MAX_PROPAGATION_DELAY_SECS, MAX_SCENE_OUTPUTS};
 pub use renderer::AudioRenderer;
 use render::{

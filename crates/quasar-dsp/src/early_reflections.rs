@@ -234,11 +234,16 @@ impl AudioNode for EarlyReflectionDelayNode {
         let mut rd = [0.0_f32; DEFAULT_BLOCK_SIZE];
         for r in &self.ramps {
             let (d0, dd, g0, dg) = (r.d0, r.d1 - r.d0, r.g0, r.g1 - r.g0);
-            for (i, d) in dly[..n].iter_mut().enumerate() {
-                let t = (i + 1) as f32 * inv_n;
-                *d = d0 + dd * t;
+            if dd == 0.0 {
+                // Steady tap (the common case): one set of interpolation weights, FIR read.
+                self.delay_line.tap_block_const(d0, &mut rd[..n]);
+            } else {
+                for (i, d) in dly[..n].iter_mut().enumerate() {
+                    let t = (i + 1) as f32 * inv_n;
+                    *d = d0 + dd * t;
+                }
+                self.delay_line.tap_many(&dly[..n], n - 1, true, &mut rd[..n]);
             }
-            self.delay_line.tap_many(&dly[..n], n - 1, true, &mut rd[..n]);
             for (i, (o, x)) in out.iter_mut().zip(&rd[..n]).enumerate() {
                 let t = (i + 1) as f32 * inv_n;
                 *o += *x * (g0 + dg * t);

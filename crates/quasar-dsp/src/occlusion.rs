@@ -1,6 +1,6 @@
 use quasar_core::bands::{Band8, FREQ_BAND_CENTRES};
 use quasar_core::param_exchange::SpatialCoefficients;
-use crate::audio_buffer::AudioBuffer;
+use crate::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 use crate::fractional_delay::HermiteInterpolatingDelayLine;
 use crate::node_graph::AudioNode;
 
@@ -179,41 +179,59 @@ impl AirAbsorptionOcclusionNode {
 
         let g0 = self.cur_scalar;
         let gstep = (target_scalar - g0) * inv_n;
-        let mut coefs = self.cur_coefs;
 
-        for i in 0..n {
-            let t = (i + 1) as f32;
-            for s in 0..BANDS {
-                if active[s] {
-                    for k in 0..5 {
-                        coefs[s][k] += step[s][k];
-                    }
-                }
+        // Live sections, in cascade order, with their start coefficients / per-sample slopes.
+        let mut live = [0usize; BANDS];
+        let mut n_live = 0;
+        for s in 0..BANDS {
+            if active[s] {
+                live[n_live] = s;
+                n_live += 1;
             }
-            let gain = g0 + gstep * t;
+        }
+        let ramping = (0..n_live).any(|l| step[live[l]] != [0.0; 5]);
+        let nn = n.min(DEFAULT_BLOCK_SIZE);
 
-            for ch in 0..channels {
-                let line = &mut self.delay_lines[ch];
-                line.push(input.channel(ch as u16)[i]);
-                let mut y = if jump {
-                    let w = t * inv_n;
-                    (1.0 - w) * line.tap(d0) + w * line.tap(target_delay)
-                } else {
-                    line.tap(d0 + delay_slope * t)
-                };
-
-                let st = &mut self.states[ch];
-                for s in 0..BANDS {
-                    if !active[s] {
-                        continue;
-                    }
-                    let c = &coefs[s];
-                    let out = c[0] * y + st[s][0];
-                    st[s][0] = c[1] * y - c[3] * out + st[s][1];
-                    st[s][1] = c[2] * y - c[4] * out;
-                    y = out;
+        for ch in 0..channels {
+            // Push the whole block, then read it back (see `HermiteInterpolatingDelayLine::tap_back`):
+            // a steady delay is one FIR pass, a gliding one a gather + vectorised interpolation.
+            let line = &mut self.delay_lines[ch];
+            line.push_slice(&input.channel(ch as u16)[..nn]);
+            let mut y = [0.0_f32; DEFAULT_BLOCK_SIZE];
+            if jump {
+                let mut b = [0.0_f32; DEFAULT_BLOCK_SIZE];
+                line.tap_block_const(d0, &mut y[..nn]);
+                line.tap_block_const(target_delay, &mut b[..nn]);
+                for i in 0..nn {
+                    let w = (i + 1) as f32 * inv_n;
+                    y[i] = (1.0 - w) * y[i] + w * b[i];
                 }
-                output.channel_mut(ch as u16)[i] = y * gain;
+            } else if delay_slope == 0.0 {
+                line.tap_block_const(d0, &mut y[..nn]);
+            } else {
+                let mut d = [0.0_f32; DEFAULT_BLOCK_SIZE];
+                for (i, v) in d[..nn].iter_mut().enumerate() {
+                    *v = d0 + delay_slope * (i + 1) as f32;
+                }
+                line.tap_many(&d[..nn], nn - 1, true, &mut y[..nn]);
+            }
+
+            // EQ cascade, section-major in groups of 4 / 2 / 1 sections fused in one pass.
+            let st = &mut self.states[ch];
+            let mut l = 0;
+            while l < n_live {
+                let left = n_live - l;
+                let take = if left >= 4 { 4 } else if left >= 2 { 2 } else { 1 };
+                match take {
+                    4 => run_group::<4>(&mut y[..nn], &live[l..l + 4], &self.cur_coefs, &step, st, ramping),
+                    2 => run_group::<2>(&mut y[..nn], &live[l..l + 2], &self.cur_coefs, &step, st, ramping),
+                    _ => run_group::<1>(&mut y[..nn], &live[l..l + 1], &self.cur_coefs, &step, st, ramping),
+                }
+                l += take;
+            }
+            let out = output.channel_mut(ch as u16);
+            for (i, (o, v)) in out[..nn].iter_mut().zip(&y[..nn]).enumerate() {
+                *o = *v * (g0 + gstep * (i + 1) as f32);
             }
         }
 
@@ -510,5 +528,61 @@ fn section_coef(kind: Kind, freq: f64, gain_db: f64, sample_rate: f64) -> [f64; 
                 ((a + 1.0) - (a - 1.0) * cos_w0 - t) / a0,
             ]
         }
+    }
+}
+
+/// Run `N` consecutive live sections (`idx`, indices into the cascade) over `y` in place, fused in
+/// one pass so their independent recursions overlap. Section `s` uses the coefficients
+/// `base[s] + (i + 1) * step[s]` (accumulated per sample) at sample `i` when `ramp`, the constant
+/// `base[s]` otherwise.
+#[inline(always)]
+fn run_group<const N: usize>(
+    y: &mut [f32],
+    idx: &[usize],
+    base: &[[f32; 5]; BANDS],
+    step: &[[f32; 5]; BANDS],
+    states: &mut [[f32; 2]; BANDS],
+    ramp: bool,
+) {
+    let mut b = [[0.0_f32; 5]; N];
+    let mut d = [[0.0_f32; 5]; N];
+    let mut z = [[0.0_f32; 2]; N];
+    for k in 0..N {
+        b[k] = base[idx[k]];
+        d[k] = step[idx[k]];
+        z[k] = states[idx[k]];
+    }
+    if ramp {
+        // Coefficients advance by `step` per sample (accumulated, exactly as the per-sample
+        // interpolation always did, so the output is unchanged).
+        let mut c = b;
+        for v in y.iter_mut() {
+            let mut x = *v;
+            for k in 0..N {
+                for j in 0..5 {
+                    c[k][j] += d[k][j];
+                }
+                let out = c[k][0] * x + z[k][0];
+                z[k][0] = c[k][1] * x - c[k][3] * out + z[k][1];
+                z[k][1] = c[k][2] * x - c[k][4] * out;
+                x = out;
+            }
+            *v = x;
+        }
+    } else {
+        for v in y.iter_mut() {
+            let mut x = *v;
+            for k in 0..N {
+                let c = &b[k];
+                let out = c[0] * x + z[k][0];
+                z[k][0] = c[1] * x - c[3] * out + z[k][1];
+                z[k][1] = c[2] * x - c[4] * out;
+                x = out;
+            }
+            *v = x;
+        }
+    }
+    for k in 0..N {
+        states[idx[k]] = z[k];
     }
 }

@@ -147,6 +147,8 @@ struct EarlySc {
     noise: Noise,
     input: AudioBuffer,
     out: AudioBuffer,
+    /// Taps never move (steady scene): exercises the constant-delay read.
+    steady: bool,
 }
 fn refl_set(b: usize, n: usize) -> Vec<EarlyReflectionCoeffs> {
     (0..n)
@@ -160,11 +162,15 @@ fn refl_set(b: usize, n: usize) -> Vec<EarlyReflectionCoeffs> {
 }
 impl EarlySc {
     fn new() -> Self {
+        Self::with(false)
+    }
+    fn with(steady: bool) -> Self {
         Self {
             node: EarlyReflectionDelayNode::new(2, SR, 0.5, 16),
             noise: Noise(0x9e37_79b9),
             input: AudioBuffer::new(2, BLOCK as u16),
             out: AudioBuffer::new(1, BLOCK as u16),
+            steady,
         }
     }
 }
@@ -175,7 +181,7 @@ impl Scenario for EarlySc {
             self.noise.fill(&mut tmp);
             self.input.channel_mut(c).copy_from_slice(&tmp);
         }
-        self.node.update_reflections(&refl_set(b, 16));
+        self.node.update_reflections(&refl_set(if self.steady { 0 } else { b }, 16));
         let p = coeffs([1.0; 8], 0.0, Band8::splat(1.0), -60.0, Vec::new());
         self.node.process(&self.input, &mut self.out, &p);
     }
@@ -276,10 +282,16 @@ struct OccSc {
     input: AudioBuffer,
     out: AudioBuffer,
     ch: u16,
+    /// Constant gains and delay (steady scene).
+    steady: bool,
 }
 impl OccSc {
     fn new(ch: u16) -> Self {
+        Self::with(ch, false)
+    }
+    fn with(ch: u16, steady: bool) -> Self {
         Self {
+            steady,
             node: AirAbsorptionOcclusionNode::new(ch, SR, 1.0),
             noise: Noise(0x7777_1234),
             input: AudioBuffer::new(ch, BLOCK as u16),
@@ -295,6 +307,7 @@ impl Scenario for OccSc {
             self.noise.fill(&mut tmp);
             self.input.channel_mut(c).copy_from_slice(&tmp);
         }
+        let b = if self.steady { 0 } else { b };
         let k = 1.0 + 0.2 * ((b % 5) as f32);
         let g = [0.9, 0.85, 0.7 / k, 0.5 / k, 0.4 / k, 0.25 / k, 0.15 / k, 0.08 / k];
         let delay = 300.0 + 20.0 * ((b as f32) * 0.3).sin();
@@ -465,11 +478,13 @@ fn bench_all() {
     println!("--- #91 DSP bench (block = {BLOCK} samples @ {SR} Hz) ---");
     report("fdn_bus_6out", &mut FdnSc::new(), 4000, 1, "block");
     report("early_reflections_16tap_mono", &mut EarlySc::new(), 3000, 16, "tap-block");
+    report("early_reflections_16tap_steady", &mut EarlySc::with(true), 3000, 16, "tap-block");
     report("reflection_decoder_5.1_16tap", &mut DecoderSc::new(false, 16), 2000, 16, "tap-block");
     report("reflection_decoder_hrtf_6tap", &mut DecoderSc::new(true, 6), 1000, 6, "tap-block");
     report("binaural_1tap", &mut BinauralSc::new(), 4000, 1, "tap-block");
     report("occlusion_1ch_8sec", &mut OccSc::new(1), 6000, 1, "ch-block");
     report("occlusion_2ch_8sec", &mut OccSc::new(2), 4000, 2, "ch-block");
+    report("occlusion_2ch_8sec_steady", &mut OccSc::with(2, true), 4000, 2, "ch-block");
     report("vbap_planar_5.1_gains+decode", &mut VbapSc::new(false), 20000, 1, "block");
     report("vbap_hull_7.1.4_gains+decode", &mut VbapSc::new(true), 20000, 1, "block");
 
@@ -534,4 +549,58 @@ fn decay_has_no_denormal_spike() {
     }
     println!("BENCH decay: steady {steady:.0} ns/block, worst 10-block decay window {worst:.0} ns/block ({:.2}x)", worst / steady);
     assert!(worst <= 1.5 * steady, "decaying tail slowed down: {worst} vs steady {steady}");
+}
+
+// ── delay line: block reads equal the per-sample reference (bit for bit) ──
+
+/// Reference: the per-sample `tap` right after each push (the pre-#91 access pattern).
+fn reference_block(dl_in: &[f32], history: &[f32], delay: impl Fn(usize) -> f32) -> Vec<f32> {
+    use quasar_dsp::fractional_delay::HermiteInterpolatingDelayLine as Dl;
+    let mut dl = Dl::new(0.05, SR);
+    for &x in history {
+        dl.push(x);
+    }
+    let mut out = Vec::new();
+    for (i, &x) in dl_in.iter().enumerate() {
+        dl.push(x);
+        out.push(dl.tap(delay(i)));
+    }
+    out
+}
+
+#[test]
+fn delay_block_reads_match_per_sample_taps() {
+    use quasar_dsp::fractional_delay::HermiteInterpolatingDelayLine as Dl;
+    let mut noise = Noise(99);
+    // History long enough to wrap the ring, then a block; delays from 0 to near the maximum.
+    for hist_len in [0usize, 5, 3000, 4093, 20_000] {
+        for &d0 in &[0.0f32, 0.25, 1.0, 17.75, 300.5, 2000.0, 2396.9, 5000.0] {
+            for &slope in &[0.0f32, 0.01, -0.02] {
+                let mut history = vec![0.0f32; hist_len];
+                noise.fill(&mut history);
+                let mut block = vec![0.0f32; 256];
+                noise.fill(&mut block);
+                let n = block.len();
+                let want = reference_block(&block, &history, |i| d0 + slope * (i + 1) as f32);
+
+                let mut dl = Dl::new(0.05, SR);
+                for &x in &history {
+                    dl.push(x);
+                }
+                dl.push_slice(&block);
+                let delays: Vec<f32> = (0..n).map(|i| d0 + slope * (i + 1) as f32).collect();
+                let mut got = vec![0.0f32; n];
+                dl.tap_many(&delays, n - 1, true, &mut got);
+                assert_eq!(got, want, "tap_many hist={hist_len} d0={d0} slope={slope}");
+                for (i, w) in want.iter().enumerate() {
+                    assert_eq!(dl.tap_back(delays[i], n - 1 - i), *w, "tap_back i={i}");
+                }
+                if slope == 0.0 {
+                    let mut c = vec![0.0f32; n];
+                    dl.tap_block_const(d0, &mut c);
+                    assert_eq!(c, want, "tap_block_const hist={hist_len} d0={d0}");
+                }
+            }
+        }
+    }
 }
