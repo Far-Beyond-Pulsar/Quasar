@@ -2,7 +2,7 @@
 
 Run `cargo run --release --manifest-path examples/basic/Cargo.toml` from the repository root.
 
-Press **V** to toggle the acoustic trace overlay (**R** is an alias). The capture starts disabled and key repeat will not toggle it repeatedly.
+Press **V** to start, pause, or resume acoustic trace capture (**R** is an alias). Pausing freezes the last nonempty trace on screen. Empty updates also keep the previous snapshot, so the lines remain visible when the listener and scene stop changing. Key repeat will not toggle capture repeatedly.
 
 - **Blue:** ray tests that reached the end of the query interval without a hit.
 - **Red:** ray tests that hit acoustic geometry, ending at the actual intersection, with short surface normals.
@@ -12,6 +12,6 @@ Press **V** to toggle the acoustic trace overlay (**R** is an alias). The captur
 
 Lines show through walls. The window title shows ray and path counts. The overlay grows its own GPU line buffer to fit all captured rays. Capture can be expensive in dense scenes.
 
-The drawing refreshes every display frame. Captured geometry refreshes with the engine's existing roughly 30 Hz spatial update, across all speaker/listener pairs, so it does not restart audio crossfades on every display frame.
+The drawing refreshes every display frame. Captured geometry refreshes with the engine's existing roughly 30 Hz spatial update, across all speaker/listener pairs, so it does not restart audio crossfades on every display frame. Pausing capture freezes the displayed geometry while audio spatial processing continues as before.
 
 The demo's acoustic scene contains the room shell and columns, rather than every decorative visual mesh. Early reflections use image-source geometry and BVH visibility queries. Late reverb is statistical and has no traced reflection paths.

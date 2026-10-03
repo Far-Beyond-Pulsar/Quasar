@@ -25,20 +25,23 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
-mod v3_demo_common;
 mod acoustic_overlay;
+mod v3_demo_common;
 
 use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig, Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer, RendererConfig, Scene,
+    required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig,
+    Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer,
+    RendererConfig, Scene,
 };
 // (BillboardInstance referenced inline as helio::BillboardInstance)
-use helio_pass_perf_overlay::PerfOverlayMode;
 use helio_default_graphs::build_default_graph;
+use helio_pass_perf_overlay::PerfOverlayMode;
 use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use quasar_audio::SpatialAudioEngine;
+use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
 use quasar_core::bands::Band8;
-use quasar_core::streaming_source::StreamingSource;
 use quasar_core::hybrid::HybridSamplingStrategy;
 use quasar_core::probe_grid::{AcousticProbe, AcousticProbeGrid};
 use quasar_core::scene::{AcousticMesh as QMesh, AcousticScene as QScene};
@@ -46,15 +49,14 @@ use quasar_core::scene_output::{
     ChannelPull, ListenerConfig, ListenerId, PhysicalOutputLayout, SceneOutputConfig,
     SceneOutputId, SourceConfig, SourceId,
 };
-use quasar_audio::SpatialAudioEngine;
-use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
+use quasar_core::streaming_source::StreamingSource;
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 use quasar_materials::instance::AcousticMaterialInstance;
 use quasar_materials::tabular::{Tabular8BandEvaluator, TABULAR_MODEL_ID};
 
 use std::io::{self, BufRead};
-use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use winit::{
@@ -72,7 +74,7 @@ use std::collections::HashSet;
 // Column positions along the nave (Z axis), symmetric at x = ±5.5
 /// Minimum seconds between `update_scene_spatial()` calls (~30 Hz).
 const SPATIAL_UPDATE_INTERVAL: f32 = 1.0 / 30.0;
-const COLUMN_Z: &[f32] =&[-22.0, 18.0];
+const COLUMN_Z: &[f32] = &[-22.0, 18.0];
 
 // Stained glass window lights: (x_wall_side, y, z, r, g, b)
 // Positive x = right-side windows, negative = left-side; placed just inside the wall
@@ -122,14 +124,14 @@ const NUM_SPEAKERS: usize = 8;
 /// WAV channels: 0=FL, 1=FR, 2=C, 3=BL, 4=BR, 5=Sub, 6=SL, 7=SR.
 /// CHANNEL_MAP below reconnects each output to the correct WAV channel.
 const SPEAKER_POSITIONS: [glam::Vec3; 8] = [
-    glam::Vec3::new(-7.0, 5.5,-12.0), // device 0 — Front Left    ← WAV ch 0
-    glam::Vec3::new( 7.0, 5.5,-12.0), // device 1 — Front Right   ← WAV ch 1
-    glam::Vec3::new( 0.0, 3.0,-12.0), // device 2 — Center        ← WAV ch 2
-    glam::Vec3::new( 0.0, 0.3, -7.0), // device 3 — Sub/LFE       ← WAV ch 5
-    glam::Vec3::new(-7.0, 2.0, 12.0), // device 4 — Back Left     ← WAV ch 3
-    glam::Vec3::new( 7.0, 2.0, 12.0), // device 5 — Back Right    ← WAV ch 4
-    glam::Vec3::new(-7.0, 0.5,-12.0), // device 6 — Side Left     ← WAV ch 6
-    glam::Vec3::new( 7.0, 0.5,-12.0), // device 7 — Side Right    ← WAV ch 7
+    glam::Vec3::new(-7.0, 5.5, -12.0), // device 0 — Front Left    ← WAV ch 0
+    glam::Vec3::new(7.0, 5.5, -12.0),  // device 1 — Front Right   ← WAV ch 1
+    glam::Vec3::new(0.0, 3.0, -12.0),  // device 2 — Center        ← WAV ch 2
+    glam::Vec3::new(0.0, 0.3, -7.0),   // device 3 — Sub/LFE       ← WAV ch 5
+    glam::Vec3::new(-7.0, 2.0, 12.0),  // device 4 — Back Left     ← WAV ch 3
+    glam::Vec3::new(7.0, 2.0, 12.0),   // device 5 — Back Right    ← WAV ch 4
+    glam::Vec3::new(-7.0, 0.5, -12.0), // device 6 — Side Left     ← WAV ch 6
+    glam::Vec3::new(7.0, 0.5, -12.0),  // device 7 — Side Right    ← WAV ch 7
 ];
 /// Maps device-channel index → WAV-channel index so each physical speaker
 /// plays the correct sweep tone.  Replaces the old 1:1 identity mapping
@@ -157,7 +159,9 @@ impl StreamingPlayback {
 
         let mut scan_buf = vec![0.0_f32; 4096 * channels];
         let n = wave.read_frames(&mut scan_buf);
-        let peak = scan_buf[..n * channels].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let peak = scan_buf[..n * channels]
+            .iter()
+            .fold(0.0f32, |m, &s| m.max(s.abs()));
         wave.seek_frames(0);
 
         // This demo's ambient cathedral bed is meant to loop forever —
@@ -210,11 +214,15 @@ impl AudioEngine {
     /// Master volume: the output stage's pre-limiter gain (set through the engine's lock-free
     /// command queue), so the limiter ceiling (-1 dBFS) holds at any master volume.
     fn set_master_gain_db(&self, db: f32) {
-        self.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+        self.master_gain_db
+            .store(db.to_bits(), AtomicOrdering::Relaxed);
         if let Ok(mut e) = self.engine.lock() {
             e.set_output_safety(
                 self.listener_id,
-                quasar_dsp::limiter::OutputSafetyConfig { headroom_db: db, ..Default::default() },
+                quasar_dsp::limiter::OutputSafetyConfig {
+                    headroom_db: db,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -247,12 +255,20 @@ fn setup_audio_engine() -> AudioEngine {
     //   walls   - rough stone, slightly more absorbent toward HF;
     //   ceiling - vaulted stone/plaster, a little LF panel absorption.
     // Registered BEFORE the backend is created so mesh handles are valid.
-    engine.materials().register_evaluator(Box::new(Tabular8BandEvaluator::new()));
+    engine
+        .materials()
+        .register_evaluator(Box::new(Tabular8BandEvaluator::new()));
     let material = |absorption: [f32; 8]| {
-        engine.materials().add_instance(AcousticMaterialInstance::new(
-            TABULAR_MODEL_ID,
-            Tabular8BandEvaluator::create_params(Band8::new(absorption), Band8::zeros(), Band8::zeros()),
-        ))
+        engine
+            .materials()
+            .add_instance(AcousticMaterialInstance::new(
+                TABULAR_MODEL_ID,
+                Tabular8BandEvaluator::create_params(
+                    Band8::new(absorption),
+                    Band8::zeros(),
+                    Band8::zeros(),
+                ),
+            ))
     };
     let floor_mat = material([0.08, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22]);
     let wall_mat = material([0.06, 0.05, 0.05, 0.06, 0.07, 0.09, 0.12, 0.15]);
@@ -264,12 +280,72 @@ fn setup_audio_engine() -> AudioEngine {
     // columns so occluding a speaker behind a column is demonstrable (columns are
     // 0.65 x 20 x 0.65 acoustic boxes at x = +-5.5, z = -22 / +18).
     let mut qs = QScene::new();
-    qs.add_mesh(QMesh::new(1, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,0.,28.],[-11.,0.,28.]], vec![0,1,2,0,2,3], floor_mat));
-    qs.add_mesh(QMesh::new(2, vec![[-11.,0.,-28.],[-11.,0.,28.],[-11.,21.,28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
-    qs.add_mesh(QMesh::new(3, vec![[11.,0.,-28.],[11.,0.,28.],[11.,21.,28.],[11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
-    qs.add_mesh(QMesh::new(8, vec![[-11.,21.,-28.],[11.,21.,-28.],[11.,21.,28.],[-11.,21.,28.]], vec![0,1,2,0,2,3], ceiling_mat));
-    qs.add_mesh(QMesh::new(9, vec![[-11.,0.,-28.],[11.,0.,-28.],[11.,21.,-28.],[-11.,21.,-28.]], vec![0,1,2,0,2,3], wall_mat));
-    qs.add_mesh(QMesh::new(10, vec![[-11.,0.,28.],[11.,0.,28.],[11.,21.,28.],[-11.,21.,28.]], vec![0,1,2,0,2,3], wall_mat));
+    qs.add_mesh(QMesh::new(
+        1,
+        vec![
+            [-11., 0., -28.],
+            [11., 0., -28.],
+            [11., 0., 28.],
+            [-11., 0., 28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        floor_mat,
+    ));
+    qs.add_mesh(QMesh::new(
+        2,
+        vec![
+            [-11., 0., -28.],
+            [-11., 0., 28.],
+            [-11., 21., 28.],
+            [-11., 21., -28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        wall_mat,
+    ));
+    qs.add_mesh(QMesh::new(
+        3,
+        vec![
+            [11., 0., -28.],
+            [11., 0., 28.],
+            [11., 21., 28.],
+            [11., 21., -28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        wall_mat,
+    ));
+    qs.add_mesh(QMesh::new(
+        8,
+        vec![
+            [-11., 21., -28.],
+            [11., 21., -28.],
+            [11., 21., 28.],
+            [-11., 21., 28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        ceiling_mat,
+    ));
+    qs.add_mesh(QMesh::new(
+        9,
+        vec![
+            [-11., 0., -28.],
+            [11., 0., -28.],
+            [11., 21., -28.],
+            [-11., 21., -28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        wall_mat,
+    ));
+    qs.add_mesh(QMesh::new(
+        10,
+        vec![
+            [-11., 0., 28.],
+            [11., 0., 28.],
+            [11., 21., 28.],
+            [-11., 21., 28.],
+        ],
+        vec![0, 1, 2, 0, 2, 3],
+        wall_mat,
+    ));
     for (i, &cz) in COLUMN_Z.iter().enumerate() {
         for (j, &cx) in [-5.5_f32, 5.5].iter().enumerate() {
             qs.add_mesh(QMesh::new(
@@ -285,16 +361,20 @@ fn setup_audio_engine() -> AudioEngine {
                     [cx - 0.325, 20.0, cz + 0.325],
                 ],
                 vec![
-                    0,1,2, 0,2,3, 4,6,5, 4,7,6, 0,4,5, 0,5,1,
-                    2,6,7, 2,7,3, 0,3,7, 0,7,4, 1,5,6, 1,6,2,
+                    0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 2, 6, 7, 2, 7, 3, 0, 3,
+                    7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
                 ],
                 wall_mat,
             ));
         }
     }
     let cfg = CpuSimdConfig {
-        max_reflection_order: 3, diffuse_rays_per_query: 128, max_reflection_distance: 60.,
-        speed_of_sound: 343., temperature_celsius: 20., humidity_percent: 50.,
+        max_reflection_order: 3,
+        diffuse_rays_per_query: 128,
+        max_reflection_distance: 60.,
+        speed_of_sound: 343.,
+        temperature_celsius: 20.,
+        humidity_percent: 50.,
         sample_rate: 48_000.,
         ..CpuSimdConfig::default()
     };
@@ -394,65 +474,85 @@ fn setup_audio_engine() -> AudioEngine {
     let engine = Arc::new(Mutex::new(engine));
 
     let master_gain_db = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-    let levels: Arc<[AtomicU32; NUM_SPEAKERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
+    let levels: Arc<[AtomicU32; NUM_SPEAKERS]> =
+        Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
     let levels_cb = levels.clone();
     let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
 
-    let stream = device.build_output_stream(
-        &out_config.config(),
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let total_frames = data.len() / out_ch_cb;
-            data.fill(0.0);
-            if total_frames == 0 { return; }
+    let stream = device
+        .build_output_stream(
+            &out_config.config(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let total_frames = data.len() / out_ch_cb;
+                data.fill(0.0);
+                if total_frames == 0 {
+                    return;
+                }
 
-            let nch = playback.channels;
-            let ratio = playback.rate_ratio;
-            let mut remain = total_frames;
-            let mut offset = 0;
+                let nch = playback.channels;
+                let ratio = playback.rate_ratio;
+                let mut remain = total_frames;
+                let mut offset = 0;
 
-            while remain > 0 {
-                let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
+                while remain > 0 {
+                    let block = (DEFAULT_BLOCK_SIZE as usize).min(remain);
 
-                let mut src = AudioBuffer::new(nch as u16, block as u16);
-                for k in 0..nch.min(NUM_SPEAKERS) {
-                    let ch = src.channel_mut(k as u16);
+                    let mut src = AudioBuffer::new(nch as u16, block as u16);
+                    for k in 0..nch.min(NUM_SPEAKERS) {
+                        let ch = src.channel_mut(k as u16);
+                        for i in 0..block {
+                            let pos = playback.read_pos + i as f64 * ratio;
+                            let fa = pos.floor() as u64;
+                            let fb = fa + 1;
+                            let frac = (pos - fa as f64) as f32;
+                            ch[i] = playback.source_sample(fa, k)
+                                + (playback.source_sample(fb, k) - playback.source_sample(fa, k))
+                                    * frac;
+                        }
+                    }
+                    for k in 0..nch.min(NUM_SPEAKERS) {
+                        let ch = src.channel(k as u16);
+                        let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
+                        levels_cb[k].store(
+                            (sum_sq / block as f32).sqrt().to_bits(),
+                            AtomicOrdering::Relaxed,
+                        );
+                    }
+                    let source_frames = (block as f64 * ratio).ceil() as u64;
+                    playback.stream.advance_read(source_frames);
+                    playback.read_pos += block as f64 * ratio;
+
+                    let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
+                    renderer.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
+
                     for i in 0..block {
-                        let pos = playback.read_pos + i as f64 * ratio;
-                        let fa = pos.floor() as u64;
-                        let fb = fa + 1;
-                        let frac = (pos - fa as f64) as f32;
-                        ch[i] = playback.source_sample(fa, k) + (playback.source_sample(fb, k) - playback.source_sample(fa, k)) * frac;
+                        let dst = offset + i;
+                        for c in 0..out_ch_cb.min(out.channels() as usize) {
+                            data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
+                        }
                     }
-                }
-                for k in 0..nch.min(NUM_SPEAKERS) {
-                    let ch = src.channel(k as u16);
-                    let sum_sq: f32 = ch.iter().take(block).map(|&s| s * s).sum();
-                    levels_cb[k].store((sum_sq / block as f32).sqrt().to_bits(), AtomicOrdering::Relaxed);
-                }
-                let source_frames = (block as f64 * ratio).ceil() as u64;
-                playback.stream.advance_read(source_frames);
-                playback.read_pos += block as f64 * ratio;
 
-                let mut out = AudioBuffer::new(out_ch_cb as u16, block as u16);
-                renderer.process_audio_scene(&[&src], std::slice::from_mut(&mut out));
-
-                for i in 0..block {
-                    let dst = offset + i;
-                    for c in 0..out_ch_cb.min(out.channels() as usize) {
-                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
-                    }
+                    remain -= block;
+                    offset += block;
                 }
-
-                remain -= block;
-                offset += block;
-            }
-        },
-        err_fn, None,
-    ).expect("build output stream");
+            },
+            err_fn,
+            None,
+        )
+        .expect("build output stream");
     stream.play().expect("play stream");
 
-    AudioEngine { debug_capture, engine, _stream: stream, master_gain_db, levels, source_id, outputs, listener_id }
+    AudioEngine {
+        debug_capture,
+        engine,
+        _stream: stream,
+        master_gain_db,
+        levels,
+        source_id,
+        outputs,
+        listener_id,
+    }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -488,18 +588,26 @@ fn apply_billboard_replacement(
 
 /// Generate a simple 16x16 white speaker icon as RGBA pixel data.
 fn generate_speaker_icon() -> (Vec<u8>, u32, u32) {
-    let w = 32u32; let h = 32u32;
+    let w = 32u32;
+    let h = 32u32;
     let mut pixels = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h { for x in 0..w {
-        let cx = x as i32 - 16; let cy = y as i32 - 16;
-        let in_cabinet = cx >= -8 && cx <= -3 && cy >= -8 && cy <= 8;
-        let in_cone = cx >= -2 && cx <= 8 && cy.abs() <= (10 - cx);
-        let in_grill = cx == -3 && cy >= -6 && cy <= 6 && cy % 3 == 0;
-        let lit = in_cabinet || in_cone || in_grill;
-        if lit { let idx = ((y * w + x) * 4) as usize;
-            pixels[idx]=255; pixels[idx+1]=255; pixels[idx+2]=255; pixels[idx+3]=255;
+    for y in 0..h {
+        for x in 0..w {
+            let cx = x as i32 - 16;
+            let cy = y as i32 - 16;
+            let in_cabinet = cx >= -8 && cx <= -3 && cy >= -8 && cy <= 8;
+            let in_cone = cx >= -2 && cx <= 8 && cy.abs() <= (10 - cx);
+            let in_grill = cx == -3 && cy >= -6 && cy <= 6 && cy % 3 == 0;
+            let lit = in_cabinet || in_cone || in_grill;
+            if lit {
+                let idx = ((y * w + x) * 4) as usize;
+                pixels[idx] = 255;
+                pixels[idx + 1] = 255;
+                pixels[idx + 2] = 255;
+                pixels[idx + 3] = 255;
+            }
         }
-    }}
+    }
     (pixels, w, h)
 }
 
@@ -520,8 +628,14 @@ mod tests {
         let (pixels, _w, _h) = generate_speaker_icon();
         let opaque = pixels.chunks_exact(4).filter(|c| c[3] == 255).count();
         // Should have many white pixels (the speaker shape), not all transparent
-        assert!(opaque > 0, "speaker icon must contain non-transparent pixels");
-        assert!(opaque < pixels.len() / 4, "speaker icon should have transparent background");
+        assert!(
+            opaque > 0,
+            "speaker icon must contain non-transparent pixels"
+        );
+        assert!(
+            opaque < pixels.len() / 4,
+            "speaker icon should have transparent background"
+        );
     }
 
     #[test]
@@ -539,9 +653,18 @@ mod tests {
 }
 
 fn hsl_to_rgba(h: f32, s: f32, l: f32, a: f32) -> [f32; 4] {
-    let c = (1.0-(2.0*l-1.0).abs())*s; let x = c*(1.0-((h*6.0)%2.0-1.0).abs()); let m = l-c*0.5;
-    let (r,g,b) = match (h*6.0).floor() as i32 { 0=>(c,x,0.),1=>(x,c,0.),2=>(0.,c,x),3=>(0.,x,c),4=>(x,0.,c),_=>(c,0.,x) };
-    [r+m, g+m, b+m, a]
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = l - c * 0.5;
+    let (r, g, b) = match (h * 6.0).floor() as i32 {
+        0 => (c, x, 0.),
+        1 => (x, c, 0.),
+        2 => (0., c, x),
+        3 => (0., x, c),
+        4 => (x, 0., c),
+        _ => (c, 0., x),
+    };
+    [r + m, g + m, b + m, a]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -611,7 +734,9 @@ struct AppState {
 
     // Quasar spatial audio
     _audio_engine: AudioEngine,
+    /// V toggles trace capture; the last nonempty snapshot stays on screen when paused.
     show_rays: bool,
+    has_acoustic_snapshot: bool,
     acoustic_overlay: acoustic_overlay::AcousticOverlay,
     show_probes: bool,
     show_material_zones: bool,
@@ -692,7 +817,7 @@ impl ApplicationHandler for App {
         );
 
         let config = RendererConfig::new(size.width, size.height, format)
-                .with_shadow_quality(helio::ShadowQuality::Ultra);
+            .with_shadow_quality(helio::ShadowQuality::Ultra);
         let mut scene = Scene::new(device.clone(), queue.clone());
 
         // Sky MUST be added to scene BEFORE build_default_graph / Renderer::new,
@@ -714,21 +839,43 @@ impl ApplicationHandler for App {
         let debug_camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Debug Camera Buffer"),
             size: std::mem::size_of::<helio::DebugCameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let cull_stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Cull Stats Buffer"),
             size: 32,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let debug_state = Arc::new(std::sync::Mutex::new(DebugDrawState::default()));
-        let graph = build_default_graph(&device, &queue, &scene, config, debug_state.clone(), &debug_camera_buf, &cull_stats_buf, None);
+        let graph = build_default_graph(
+            &device,
+            &queue,
+            &scene,
+            config,
+            debug_state.clone(),
+            &debug_camera_buf,
+            &cull_stats_buf,
+            None,
+        );
         let mut renderer = Renderer::new(
-            device.clone(), queue.clone(),
-            config.surface_format, config.width, config.height, config.render_scale,
-            config, scene, graph, debug_state, debug_camera_buf.clone(), cull_stats_buf,
+            device.clone(),
+            queue.clone(),
+            config.surface_format,
+            config.width,
+            config.height,
+            config.render_scale,
+            config,
+            scene,
+            graph,
+            debug_state,
+            debug_camera_buf.clone(),
+            cull_stats_buf,
         );
         renderer.set_editor_mode(true);
 
@@ -746,14 +893,67 @@ impl ApplicationHandler for App {
 
         // Nave + aisles: total width = 22m (x: -11..+11), length = 60m (z: -28..+28), height = 21m
         // Expand floor to cover full cathedral footprint. 32m radius = 64m square.
-        let _floor =            renderer.scene_mut().insert_actor(helio::SceneActor::mesh(plane_mesh([0.0, 0.0, 0.0], 32.0))).as_mesh().unwrap();
-        let _wall_back =        renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [11.0, 10.5, 0.25]))).as_mesh().unwrap();
-        let _wall_front =       renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [11.0, 10.5, 0.25]))).as_mesh().unwrap();
-        let _aisle_ceil_l =     renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [2.5, 0.15, 28.0]))).as_mesh().unwrap();
-        let _nave_ceiling =     renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [6.0, 0.18, 28.0]))).as_mesh().unwrap();
-        let _aisle_ceil_r =     renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [2.5, 0.15, 28.0]))).as_mesh().unwrap();
-        let _wall_left_outer =  renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.25, 7.0, 28.0]))).as_mesh().unwrap();
-        let _wall_right_outer = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.25, 7.0, 28.0]))).as_mesh().unwrap();
+        let _floor = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(plane_mesh([0.0, 0.0, 0.0], 32.0)))
+            .as_mesh()
+            .unwrap();
+        let _wall_back = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [11.0, 10.5, 0.25],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _wall_front = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [11.0, 10.5, 0.25],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _aisle_ceil_l = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [2.5, 0.15, 28.0],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _nave_ceiling = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [6.0, 0.18, 28.0],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _aisle_ceil_r = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [2.5, 0.15, 28.0],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _wall_left_outer = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [0.25, 7.0, 28.0],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _wall_right_outer = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [0.25, 7.0, 28.0],
+            )))
+            .as_mesh()
+            .unwrap();
         let _ =
             v3_demo_common::insert_object(&mut renderer, _floor, mat, glam::Mat4::IDENTITY, 11.0);
         let _ = v3_demo_common::insert_object(
@@ -810,7 +1010,14 @@ impl ApplicationHandler for App {
         let _columns: Vec<MeshId> = COLUMN_Z
             .iter()
             .flat_map(|&z| {
-                let l = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.65, 10.0, 0.65]))).as_mesh().unwrap();
+                let l = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [0.65, 10.0, 0.65],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     l,
@@ -818,7 +1025,14 @@ impl ApplicationHandler for App {
                     glam::Mat4::from_translation(glam::Vec3::new(-5.5, 10.0, z)),
                     10.0,
                 );
-                let r = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.65, 10.0, 0.65]))).as_mesh().unwrap();
+                let r = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [0.65, 10.0, 0.65],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     r,
@@ -831,10 +1045,38 @@ impl ApplicationHandler for App {
             .collect();
 
         // Altar: at far end (z = -26)
-        let _altar_step = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [5.5, 0.20, 3.0]))).as_mesh().unwrap();
-        let _altar_plinth = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [3.0, 0.45, 1.5]))).as_mesh().unwrap();
-        let _cross_vert = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.18, 2.2, 0.18]))).as_mesh().unwrap();
-        let _cross_horiz = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [1.0, 0.18, 0.18]))).as_mesh().unwrap();
+        let _altar_step = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [5.5, 0.20, 3.0],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _altar_plinth = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [3.0, 0.45, 1.5],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _cross_vert = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [0.18, 2.2, 0.18],
+            )))
+            .as_mesh()
+            .unwrap();
+        let _cross_horiz = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(box_mesh(
+                [0.0, 0.0, 0.0],
+                [1.0, 0.18, 0.18],
+            )))
+            .as_mesh()
+            .unwrap();
         let _ = v3_demo_common::insert_object(
             &mut renderer,
             _altar_step,
@@ -868,7 +1110,14 @@ impl ApplicationHandler for App {
         let _pews_left: Vec<MeshId> = (0..PEW_COUNT)
             .map(|i| {
                 let z = PEW_Z_START + i as f32 * PEW_Z_STEP;
-                let id = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [1.5, 0.45, 0.5]))).as_mesh().unwrap();
+                let id = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [1.5, 0.45, 0.5],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     id,
@@ -882,7 +1131,14 @@ impl ApplicationHandler for App {
         let _pews_right: Vec<MeshId> = (0..PEW_COUNT)
             .map(|i| {
                 let z = PEW_Z_START + i as f32 * PEW_Z_STEP;
-                let id = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [1.5, 0.45, 0.5]))).as_mesh().unwrap();
+                let id = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [1.5, 0.45, 0.5],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     id,
@@ -905,7 +1161,14 @@ impl ApplicationHandler for App {
         let _chandelier_chains: Vec<MeshId> = CHANDELIER_Z
             .iter()
             .map(|&z| {
-                let id = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [0.06, 2.0, 0.06]))).as_mesh().unwrap();
+                let id = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [0.06, 2.0, 0.06],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     id,
@@ -919,7 +1182,14 @@ impl ApplicationHandler for App {
         let _chandelier_rings: Vec<MeshId> = CHANDELIER_Z
             .iter()
             .map(|&z| {
-                let id = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(box_mesh([0.0, 0.0, 0.0], [1.2, 0.12, 1.2]))).as_mesh().unwrap();
+                let id = renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::mesh(box_mesh(
+                        [0.0, 0.0, 0.0],
+                        [1.2, 0.12, 1.2],
+                    )))
+                    .as_mesh()
+                    .unwrap();
                 let _ = v3_demo_common::insert_object(
                     &mut renderer,
                     id,
@@ -939,7 +1209,11 @@ impl ApplicationHandler for App {
             [0.0, 1.0, 0.3],
             1.5,
         ));
-        let listener_mesh = renderer.scene_mut().insert_actor(helio::SceneActor::mesh(cube_mesh([0.0, 0.0, 0.0], 0.4))).as_mesh().unwrap();
+        let listener_mesh = renderer
+            .scene_mut()
+            .insert_actor(helio::SceneActor::mesh(cube_mesh([0.0, 0.0, 0.0], 0.4)))
+            .as_mesh()
+            .unwrap();
         let _ = v3_demo_common::insert_object(
             &mut renderer,
             listener_mesh,
@@ -951,30 +1225,44 @@ impl ApplicationHandler for App {
         // Register lights (chandelier & candle light_ids stored for per-frame flicker updates)
         let mut chandelier_light_ids = Vec::new();
         for &z in CHANDELIER_Z {
-            chandelier_light_ids.push(renderer.scene_mut().insert_actor(helio::SceneActor::light(point_light(
-                [0.0_f32, 15.0, z],
-                [1.0, 0.92, 0.78],
-                8.0,
-                22.0,
-            ))).as_light().unwrap());
+            chandelier_light_ids.push(
+                renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::light(point_light(
+                        [0.0_f32, 15.0, z],
+                        [1.0, 0.92, 0.78],
+                        8.0,
+                        22.0,
+                    )))
+                    .as_light()
+                    .unwrap(),
+            );
         }
         // Stained glass shafts — Stationary: they never animate, so they're excluded
         // from the real-time deferred-light loop once baked lighting is loaded.
         // Without this they were running full tiled PCF every frame despite being "baked".
         for &(x, y, z, r, g, b) in GLASS_LIGHTS {
-            let _ = renderer.scene_mut().insert_actor(helio::SceneActor::light_with_movability(
-                point_light([x, y, z], [r, g, b], 1.8, 8.0),
-                Some(Movability::Stationary),
-            ));
+            let _ = renderer
+                .scene_mut()
+                .insert_actor(helio::SceneActor::light_with_movability(
+                    point_light([x, y, z], [r, g, b], 1.8, 8.0),
+                    Some(Movability::Stationary),
+                ));
         }
         let mut candle_light_ids = Vec::new();
         for &(x, y, z) in CANDLES {
-            candle_light_ids.push(renderer.scene_mut().insert_actor(helio::SceneActor::light(point_light(
-                [x, y, z],
-                [1.0, 0.6, 0.15],
-                1.2,
-                4.0,
-            ))).as_light().unwrap());
+            candle_light_ids.push(
+                renderer
+                    .scene_mut()
+                    .insert_actor(helio::SceneActor::light(point_light(
+                        [x, y, z],
+                        [1.0, 0.6, 0.15],
+                        1.2,
+                        4.0,
+                    )))
+                    .as_light()
+                    .unwrap(),
+            );
         }
         renderer.set_ambient([0.65, 0.7, 0.85], 0.015);
         renderer.set_clear_color([0.0, 0.0, 0.0, 1.0]);
@@ -993,10 +1281,17 @@ impl ApplicationHandler for App {
 
         // Draw initial probe grid
         {
-            for x in -2..=2 { for z in -2..=2 {
-                let hue = (((x + 2) * 5 + (z + 2)) as f32 / 25.0) * 0.7;
-                renderer.debug_sphere([x as f32 * 2.0, 0.3, z as f32 * 2.0], 0.08, hsl_to_rgba(hue, 0.8, 0.6, 1.0), 8);
-            }}
+            for x in -2..=2 {
+                for z in -2..=2 {
+                    let hue = (((x + 2) * 5 + (z + 2)) as f32 / 25.0) * 0.7;
+                    renderer.debug_sphere(
+                        [x as f32 * 2.0, 0.3, z as f32 * 2.0],
+                        0.08,
+                        hsl_to_rgba(hue, 0.8, 0.6, 1.0),
+                        8,
+                    );
+                }
+            }
         }
 
         let renderer = Arc::new(Mutex::new(renderer));
@@ -1010,12 +1305,10 @@ impl ApplicationHandler for App {
                 let stdin = io::stdin();
                 for line in stdin.lock().lines() {
                     match line {
-                        Ok(cmd) if !cmd.trim().is_empty() => {
-                            match bridge.run(&cmd) {
-                                Ok(()) => println!("OK: {}", cmd),
-                                Err(e) => println!("ERR: {} -> {}", cmd, e),
-                            }
-                        }
+                        Ok(cmd) if !cmd.trim().is_empty() => match bridge.run(&cmd) {
+                            Ok(()) => println!("OK: {}", cmd),
+                            Err(e) => println!("ERR: {} -> {}", cmd, e),
+                        },
                         _ => {}
                     }
                 }
@@ -1066,6 +1359,7 @@ impl ApplicationHandler for App {
             start_time: std::time::Instant::now(),
             _audio_engine: audio_engine,
             show_rays: false,
+            has_acoustic_snapshot: false,
             show_probes: true,
             show_material_zones: true,
             aux_swapped: false,
@@ -1094,40 +1388,73 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // V toggles actual acoustic tracing; R remains an alias.
+            // V pauses/resumes trace capture. Keep the last captured drawing visible.
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, repeat: false, physical_key: PhysicalKey::Code(KeyCode::KeyV | KeyCode::KeyR), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        physical_key: PhysicalKey::Code(KeyCode::KeyV | KeyCode::KeyR),
+                        ..
+                    },
                 ..
             } => {
                 state.show_rays = !state.show_rays;
-                state._audio_engine.debug_capture.set_enabled(state.show_rays);
+                state
+                    ._audio_engine
+                    .debug_capture
+                    .set_enabled(state.show_rays);
                 state.spatial_accum = SPATIAL_UPDATE_INTERVAL;
-                if !state.show_rays {
-                    state.acoustic_overlay.update(&state.device, &state.queue, &Default::default());
-                    state.window.set_title("Helio & Quasar; Indoor Cathedral w/ Spatial Audio");
-                }
-                println!("[quasar] acoustic rays: {} | blue: clear tests, red: hits, purple: valid candidate paths, green: selected paths, yellow: bounce points and normals; updated at the ~30 Hz spatial compute rate", state.show_rays);
-            },
+                let status = if state.show_rays {
+                    "capturing"
+                } else {
+                    "paused; showing last trace"
+                };
+                state.window.set_title(&format!(
+                    "Quasar acoustic rays: {status} | V to pause/resume"
+                ));
+                println!("[quasar] acoustic capture: {status}. The last nonempty trace stays visible. Blue: clear tests; red: hits; purple: candidates; green: selected paths; yellow: bounce points and normals.");
+            }
             // T: toggle Quasar probe grid
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyT), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::KeyT),
+                        ..
+                    },
                 ..
-            } => { state.show_probes = !state.show_probes; },
+            } => {
+                state.show_probes = !state.show_probes;
+            }
             // Y: toggle Quasar material zones
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyY), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::KeyY),
+                        ..
+                    },
                 ..
-            } => { state.show_material_zones = !state.show_material_zones; },
+            } => {
+                state.show_material_zones = !state.show_material_zones;
+            }
 
             // 1: cycle audio DSP stage (0=silence, 1=raw, 2=+occ, 3=+early, 4=full)
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit1), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::Digit1),
+                        ..
+                    },
                 ..
             } => {
                 if let Ok(mut engine) = state._audio_engine.engine.lock() {
                     let stage = (engine.debug_audio_stage + 1) % 5;
                     engine.set_debug_audio_stage(stage);
-                    println!("[audio] dsp stage {}: {}",
+                    println!(
+                        "[audio] dsp stage {}: {}",
                         stage,
                         match stage {
                             0 => "silence",
@@ -1140,10 +1467,14 @@ impl ApplicationHandler for App {
                 }
             }
 
-
             // 2: print audio timing snapshot
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit2), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::Digit2),
+                        ..
+                    },
                 ..
             } => {
                 if let Ok(engine) = state._audio_engine.engine.lock() {
@@ -1159,7 +1490,12 @@ impl ApplicationHandler for App {
             }
             // 3: reset audio timing counters
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::Digit3), .. },
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(KeyCode::Digit3),
+                        ..
+                    },
                 ..
             } => {
                 if let Ok(engine) = state._audio_engine.engine.lock() {
@@ -1206,7 +1542,9 @@ impl ApplicationHandler for App {
                     PerfOverlayMode::PassOutput => PerfOverlayMode::Disabled,
                 };
                 if let Ok(mut renderer) = state.renderer.lock() {
-                    if let Some(pass) = renderer.find_pass_mut::<helio_pass_perf_overlay::PerfOverlayPass>() {
+                    if let Some(pass) =
+                        renderer.find_pass_mut::<helio_pass_perf_overlay::PerfOverlayPass>()
+                    {
                         pass.set_mode(state.perf_overlay_mode);
                     }
                 }
@@ -1225,7 +1563,9 @@ impl ApplicationHandler for App {
             } => {
                 state.debug_overlay_enabled = !state.debug_overlay_enabled;
                 if let Ok(mut renderer) = state.renderer.lock() {
-                    if let Some(pass) = renderer.find_pass_mut::<helio_pass_debug_overlay::DebugOverlayPass>() {
+                    if let Some(pass) =
+                        renderer.find_pass_mut::<helio_pass_debug_overlay::DebugOverlayPass>()
+                    {
                         pass.set_enabled(state.debug_overlay_enabled);
                     }
                 }
@@ -1246,9 +1586,15 @@ impl ApplicationHandler for App {
                 if let Ok(mut engine) = state._audio_engine.engine.lock() {
                     let src = state._audio_engine.source_id;
                     engine.disconnect_pull(state._audio_engine.outputs[6], src, 6);
-                    engine.connect_pull(state._audio_engine.outputs[6], ChannelPull::new(src, 7, 0.0));
+                    engine.connect_pull(
+                        state._audio_engine.outputs[6],
+                        ChannelPull::new(src, 7, 0.0),
+                    );
                     engine.disconnect_pull(state._audio_engine.outputs[7], src, 7);
-                    engine.connect_pull(state._audio_engine.outputs[7], ChannelPull::new(src, 6, 0.0));
+                    engine.connect_pull(
+                        state._audio_engine.outputs[7],
+                        ChannelPull::new(src, 6, 0.0),
+                    );
                 }
                 state.aux_swapped = !state.aux_swapped;
                 println!("[audio] aux channels swapped = {}", state.aux_swapped);
@@ -1264,13 +1610,17 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                {
-                    let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
-                    let db = (f32::from_bits(g) - 3.0).max(-60.0);
-                    state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
-                    state._audio_engine.set_master_gain_db(db);
-                    println!("[audio] master gain = {} dB", db);
-                }
+                let g = state
+                    ._audio_engine
+                    .master_gain_db
+                    .load(AtomicOrdering::Relaxed);
+                let db = (f32::from_bits(g) - 3.0).max(-60.0);
+                state
+                    ._audio_engine
+                    .master_gain_db
+                    .store(db.to_bits(), AtomicOrdering::Relaxed);
+                state._audio_engine.set_master_gain_db(db);
+                println!("[audio] master gain = {} dB", db);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -1281,13 +1631,17 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                {
-                    let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
-                    let db = (f32::from_bits(g) + 3.0).min(24.0);
-                    state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
-                    state._audio_engine.set_master_gain_db(db);
-                    println!("[audio] master gain = {} dB", db);
-                }
+                let g = state
+                    ._audio_engine
+                    .master_gain_db
+                    .load(AtomicOrdering::Relaxed);
+                let db = (f32::from_bits(g) + 3.0).min(24.0);
+                state
+                    ._audio_engine
+                    .master_gain_db
+                    .store(db.to_bits(), AtomicOrdering::Relaxed);
+                state._audio_engine.set_master_gain_db(db);
+                println!("[audio] master gain = {} dB", db);
             }
 
             WindowEvent::KeyboardInput {
@@ -1470,21 +1824,35 @@ impl AppState {
         // Update the scene pipeline: move the listener with the camera, then
         // resolve every (scene output, listener) pair (compute thread side).
         if let Ok(mut engine) = self._audio_engine.engine.lock() {
-            engine.update_listener(self._audio_engine.listener_id, self.cam_pos.to_array(), forward.to_array());
+            engine.update_listener(
+                self._audio_engine.listener_id,
+                self.cam_pos.to_array(),
+                forward.to_array(),
+            );
             // Throttle the (crossfade-restarting) spatial compute to ~30 Hz;
             // running it every render frame keeps the fade perpetually at t≈0.
             self.spatial_accum += dt;
             if self.spatial_accum >= SPATIAL_UPDATE_INTERVAL {
                 self.spatial_accum = 0.0;
-                if self.show_rays { self._audio_engine.debug_capture.begin_update(); }
+                if self.show_rays {
+                    self._audio_engine.debug_capture.begin_update();
+                }
                 engine.update_scene_spatial();
                 if self.show_rays {
                     let frame = self._audio_engine.debug_capture.take_frame();
-                    self.window.set_title(&format!(
-                        "Quasar | V: toggle rays | {} ray tests | {} selected / {} valid paths | blue clear, red hit, green selected, purple candidate, yellow bounce",
-                        frame.rays.len(), frame.paths.iter().filter(|p| p.selected).count(), frame.paths.len(),
-                    ));
-                    self.acoustic_overlay.update(&self.device, &self.queue, &frame);
+                    // Unchanged scenes or a skipped engine query may yield an empty
+                    // batch. Keep the last useful drawing rather than erasing it.
+                    if !frame.rays.is_empty() || !frame.paths.is_empty() {
+                        let ray_count = frame.rays.len();
+                        let selected = frame.paths.iter().filter(|p| p.selected).count();
+                        let paths = frame.paths.len();
+                        self.acoustic_overlay
+                            .update(&self.device, &self.queue, &frame);
+                        self.has_acoustic_snapshot = true;
+                        self.window.set_title(&format!(
+                            "Quasar | capturing | {ray_count} ray tests | {selected} selected / {paths} valid paths | V pauses with last trace visible",
+                        ));
+                    }
                 }
             }
         }
@@ -1494,48 +1862,91 @@ impl AppState {
             let color = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
             renderer.debug_sphere(pos.into(), 0.25, color, 16);
             let dir = (glam::Vec3::new(0.0, 1.6, 0.0) - pos).normalize();
-            renderer.debug_cone((pos + dir * 0.3).into(), dir.into(), 1.5, 0.8, [color[0], color[1], color[2], 0.3], 12);
+            renderer.debug_cone(
+                (pos + dir * 0.3).into(),
+                dir.into(),
+                1.5,
+                0.8,
+                [color[0], color[1], color[2], 0.3],
+                12,
+            );
             renderer.debug_circle(pos.into(), 2.0, [color[0], color[1], color[2], 0.12], 24);
         }
         renderer.debug_sphere(listener_pos.into(), 0.2, [0.0, 1.0, 0.3, 1.0], 12);
-        renderer.debug_cone((listener_pos + forward * 0.2).into(), forward.into(), 0.4, 0.15, [0.0, 0.8, 0.0, 0.4], 8);
+        renderer.debug_cone(
+            (listener_pos + forward * 0.2).into(),
+            forward.into(),
+            0.4,
+            0.15,
+            [0.0, 0.8, 0.0, 0.4],
+            8,
+        );
 
         // Billboard speaker icons at each speaker position, flash on audio activity
-        let src_levels: [f32; NUM_SPEAKERS] =
-            std::array::from_fn(|i| f32::from_bits(self._audio_engine.levels[i].load(AtomicOrdering::Relaxed)));
-        let billboards: Vec<helio::BillboardInstance> = SPEAKER_POSITIONS.iter().enumerate().map(|(i, &pos)| {
-            let lvl = src_levels[i];
-            let active = lvl > 0.005;
-            let scale = if active { (0.5 + lvl * 4.0).min(1.5) } else { 0.5 };
-            let mut c = hsl_to_rgba(i as f32 / SPEAKER_POSITIONS.len() as f32, 0.9, 0.6, 1.0);
-            if active {
-                let boost = (lvl * 6.0).min(1.0);
-                c[0] = c[0] * (1.0 - boost) + boost;
-                c[1] = c[1] * (1.0 - boost) + boost;
-                c[2] = c[2] * (1.0 - boost) + boost;
-            }
-            helio::BillboardInstance {
-                world_pos: [pos.x, pos.y + 1.2, pos.z, 1.0],
-                scale_flags: [scale, scale, 0.0, 0.0],
-                color: c,
-            }
-        }).collect();
+        let src_levels: [f32; NUM_SPEAKERS] = std::array::from_fn(|i| {
+            f32::from_bits(self._audio_engine.levels[i].load(AtomicOrdering::Relaxed))
+        });
+        let billboards: Vec<helio::BillboardInstance> = SPEAKER_POSITIONS
+            .iter()
+            .enumerate()
+            .map(|(i, &pos)| {
+                let lvl = src_levels[i];
+                let active = lvl > 0.005;
+                let scale = if active {
+                    (0.5 + lvl * 4.0).min(1.5)
+                } else {
+                    0.5
+                };
+                let mut c = hsl_to_rgba(i as f32 / SPEAKER_POSITIONS.len() as f32, 0.9, 0.6, 1.0);
+                if active {
+                    let boost = (lvl * 6.0).min(1.0);
+                    c[0] = c[0] * (1.0 - boost) + boost;
+                    c[1] = c[1] * (1.0 - boost) + boost;
+                    c[2] = c[2] * (1.0 - boost) + boost;
+                }
+                helio::BillboardInstance {
+                    world_pos: [pos.x, pos.y + 1.2, pos.z, 1.0],
+                    scale_flags: [scale, scale, 0.0, 0.0],
+                    color: c,
+                }
+            })
+            .collect();
         renderer.set_billboard_instances(&billboards);
 
         if self.show_probes {
-            for x in -2..=2 { for z in -2..=2 {
-                let p = glam::Vec3::new(x as f32 * 3.0, 0.5, z as f32 * 3.0);
-                renderer.debug_sphere(p.into(), 0.08, [0.3, 0.6, 1.0, 0.7], 6);
-                if x < 2 { renderer.debug_line(p.into(), glam::Vec3::new((x+1) as f32*3.0, 0.5, z as f32*3.0).into(), [0.3,0.6,1.0,0.15]); }
-                if z < 2 { renderer.debug_line(p.into(), glam::Vec3::new(x as f32*3.0, 0.5, (z+1) as f32*3.0).into(), [0.3,0.6,1.0,0.15]); }
-            }}
+            for x in -2..=2 {
+                for z in -2..=2 {
+                    let p = glam::Vec3::new(x as f32 * 3.0, 0.5, z as f32 * 3.0);
+                    renderer.debug_sphere(p.into(), 0.08, [0.3, 0.6, 1.0, 0.7], 6);
+                    if x < 2 {
+                        renderer.debug_line(
+                            p.into(),
+                            glam::Vec3::new((x + 1) as f32 * 3.0, 0.5, z as f32 * 3.0).into(),
+                            [0.3, 0.6, 1.0, 0.15],
+                        );
+                    }
+                    if z < 2 {
+                        renderer.debug_line(
+                            p.into(),
+                            glam::Vec3::new(x as f32 * 3.0, 0.5, (z + 1) as f32 * 3.0).into(),
+                            [0.3, 0.6, 1.0, 0.15],
+                        );
+                    }
+                }
+            }
         }
         if self.show_material_zones {
-            for x in -4..=4 { for z in -4..=4 {
-                let center = glam::Vec3::new(x as f32 * 2.0, 0.01, z as f32 * 2.0);
-                let color = if (x+z)%2==0 { [0.8,0.2,0.2,0.3] } else { [0.3,0.3,0.8,0.15] };
-                renderer.debug_filled_box(center.into(), 0.96, color);
-            }}
+            for x in -4..=4 {
+                for z in -4..=4 {
+                    let center = glam::Vec3::new(x as f32 * 2.0, 0.01, z as f32 * 2.0);
+                    let color = if (x + z) % 2 == 0 {
+                        [0.8, 0.2, 0.2, 0.3]
+                    } else {
+                        [0.3, 0.3, 0.8, 0.15]
+                    };
+                    renderer.debug_filled_box(center.into(), 0.96, color);
+                }
+            }
         }
 
         // Scene state is persistent — no per-frame setup needed.
@@ -1550,7 +1961,10 @@ impl AppState {
         if let Err(e) = renderer.render(&camera, &view) {
             log::error!("Render: {:?}", e);
         }
-        if self.show_rays { self.acoustic_overlay.render(&self.device, &self.queue, &camera, &view); }
+        if self.has_acoustic_snapshot {
+            self.acoustic_overlay
+                .render(&self.device, &self.queue, &camera, &view);
+        }
         self.queue.present(output);
     }
 }
