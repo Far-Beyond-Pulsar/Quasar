@@ -25,7 +25,6 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
-mod acoustic_overlay;
 mod v3_demo_common;
 
 use helio::{
@@ -41,6 +40,7 @@ use v3_demo_common::{box_mesh, cube_mesh, make_material, plane_mesh, point_light
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use quasar_audio::SpatialAudioEngine;
 use quasar_backends::cpu_simd::{CpuSimdComputeBackend, CpuSimdConfig};
+use quasar_backends::debug_capture::AcousticDebugFrame;
 use quasar_core::bands::Band8;
 use quasar_core::hybrid::HybridSamplingStrategy;
 use quasar_core::probe_grid::{AcousticProbe, AcousticProbeGrid};
@@ -736,12 +736,52 @@ struct AppState {
     _audio_engine: AudioEngine,
     /// V toggles trace capture; the last nonempty snapshot stays on screen when paused.
     show_rays: bool,
-    has_acoustic_snapshot: bool,
-    acoustic_overlay: acoustic_overlay::AcousticOverlay,
+    acoustic_snapshot: Option<AcousticDebugFrame>,
     show_probes: bool,
     show_material_zones: bool,
     // Aux Left/Right pulls swapped live via the G key (patch-bay remap).
     aux_swapped: bool,
+}
+
+/// Replay the retained acoustic trace through Helio's world-space debug API.
+/// The renderer clears debug geometry every frame, so paused captures are redrawn here.
+fn draw_acoustic_snapshot(renderer: &mut Renderer, frame: &AcousticDebugFrame) {
+    for sample in &frame.rays {
+        let ray = &sample.ray;
+        let end = sample.hit.as_ref().map(|hit| hit.point).unwrap_or_else(|| {
+            ray.point_at(if ray.max_distance < 1.0e6 { ray.max_distance } else { 60.0 })
+        });
+        renderer.debug_line(
+            ray.point_at(ray.min_distance),
+            end,
+            if sample.hit.is_some() { [1.0, 0.18, 0.12, 0.28] } else { [0.1, 0.65, 1.0, 0.22] },
+        );
+        if let Some(hit) = &sample.hit {
+            let p = glam::Vec3::from_array(hit.point);
+            renderer.debug_line(hit.point, (p + glam::Vec3::from_array(hit.normal) * 0.18).to_array(), [1.0, 0.3, 0.15, 0.85]);
+        }
+    }
+
+    // Draw selected audio paths last so they remain easy to follow.
+    for selected in [false, true] {
+        for path in frame.paths.iter().filter(|path| path.selected == selected) {
+            let color = if selected { [0.2, 1.0, 0.3, 1.0] } else { [0.7, 0.4, 1.0, 0.35] };
+            let mut from = path.source;
+            for &bounce in &path.bounces {
+                renderer.debug_line(from, bounce, color);
+                from = bounce;
+            }
+            renderer.debug_line(from, path.listener, color);
+            for (&point, &normal) in path.bounces.iter().zip(&path.normals) {
+                let p = glam::Vec3::from_array(point);
+                let mark = if selected { [1.0, 0.85, 0.05, 1.0] } else { color };
+                for axis in [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z] {
+                    renderer.debug_line((p - axis * 0.07).to_array(), (p + axis * 0.07).to_array(), mark);
+                }
+                renderer.debug_line(point, (p + glam::Vec3::from_array(normal) * 0.35).to_array(), mark);
+            }
+        }
+    }
 }
 
 impl App {
@@ -1316,7 +1356,6 @@ impl ApplicationHandler for App {
         }
 
         self.state = Some(AppState {
-            acoustic_overlay: acoustic_overlay::AcousticOverlay::new(&device, format),
             window,
             surface,
             device,
@@ -1359,7 +1398,7 @@ impl ApplicationHandler for App {
             start_time: std::time::Instant::now(),
             _audio_engine: audio_engine,
             show_rays: false,
-            has_acoustic_snapshot: false,
+            acoustic_snapshot: None,
             show_probes: true,
             show_material_zones: true,
             aux_swapped: false,
@@ -1846,9 +1885,7 @@ impl AppState {
                         let ray_count = frame.rays.len();
                         let selected = frame.paths.iter().filter(|p| p.selected).count();
                         let paths = frame.paths.len();
-                        self.acoustic_overlay
-                            .update(&self.device, &self.queue, &frame);
-                        self.has_acoustic_snapshot = true;
+                        self.acoustic_snapshot = Some(frame);
                         self.window.set_title(&format!(
                             "Quasar | capturing | {ray_count} ray tests | {selected} selected / {paths} valid paths | V pauses with last trace visible",
                         ));
@@ -1948,6 +1985,9 @@ impl AppState {
                 }
             }
         }
+        if let Some(snapshot) = &self.acoustic_snapshot {
+            draw_acoustic_snapshot(&mut renderer, snapshot);
+        }
 
         // Scene state is persistent — no per-frame setup needed.
 
@@ -1960,10 +2000,6 @@ impl AppState {
 
         if let Err(e) = renderer.render(&camera, &view) {
             log::error!("Render: {:?}", e);
-        }
-        if self.has_acoustic_snapshot {
-            self.acoustic_overlay
-                .render(&self.device, &self.queue, &camera, &view);
         }
         self.queue.present(output);
     }

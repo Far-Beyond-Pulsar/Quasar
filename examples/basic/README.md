@@ -10,7 +10,7 @@ Press **V** to start, pause, or resume acoustic trace capture (**R** is an alias
 - **Green:** paths selected by the backend for audio, from speaker through each bounce to listener.
 - **Yellow:** selected bounce points and surface normals.
 
-Lines show through walls. The window title shows ray and path counts. The overlay grows its own GPU line buffer to fit all captured rays. Capture can be expensive in dense scenes.
+Lines use Helio's world-space debug drawing and show through walls. The window title shows ray and path counts. Capture can be expensive in dense scenes.
 
 The drawing refreshes every display frame. Captured geometry refreshes with the engine's existing roughly 30 Hz spatial update, across all speaker/listener pairs, so it does not restart audio crossfades on every display frame. Pausing capture freezes the displayed geometry while audio spatial processing continues as before.
 
