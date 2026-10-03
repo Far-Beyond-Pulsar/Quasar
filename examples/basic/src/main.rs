@@ -21,7 +21,9 @@
 //!   Escape      — release cursor / exit
 
 mod acoustic_geometry;
+mod audio_demo;
 mod architectural_materials;
+mod headless_check;
 mod hlfs_capture;
 mod architectural_mesh;
 mod cathedral_large;
@@ -93,8 +95,28 @@ const LARGE_CANDLES: &[(f32, f32, f32)] = &[
     (2.0, 1.6, -63.5), (4.0, 1.6, -64.0),
 ];
 
+/// Path of a bundled asset: `assets/<name>` relative to the working directory when it exists
+/// (running from `examples/basic`), else relative to this crate's manifest directory (running from
+/// the repository root).
+pub fn asset_path(name: &str) -> String {
+    let local = std::path::Path::new("assets").join(name);
+    if local.exists() {
+        return local.to_string_lossy().into_owned();
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(name).to_string_lossy().into_owned()
+}
+
 fn main() {
     env_logger::init();
+    if std::env::var_os("QUASAR_HEADLESS_CHECK").is_some() || std::env::args().any(|a| a == "--check") {
+        match headless_check::run() {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("headless check failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("run");
@@ -674,7 +696,7 @@ fn large_cathedral_camera(t: f32, aspect: f32) -> Camera {
     camera
 }
 
-fn populate_large_cathedral(world: &mut World) -> (Vec<Entity>, Vec<Entity>) {
+pub(crate) fn populate_large_cathedral(world: &mut World) -> (Vec<Entity>, Vec<Entity>) {
     configure_cathedral_fog(world, true);
     spawn_indoor_cathedral_sky(world);
     cathedral_large::populate(world);

@@ -1,0 +1,1 @@
+- src/audio_demo.rs (stage, build_engine from World, cpal callback, SpatialWorker thread, probe grid) + src/headless_check.rs written; cargo check passes. Running `QUASAR_HEADLESS_CHECK=1 cargo run --release` next (release deps build is slow).

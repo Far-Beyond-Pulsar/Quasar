@@ -26,6 +26,9 @@ const ACOUSTIC_CLASSES: [AcousticClass; 9] = [
     AcousticClass::AltarStone,
 ];
 
+/// Triangles authored by the last `populate` call (opaque meshes + glass panes), for cross-checks.
+pub static AUTHORED_TRIANGLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn populate(world: &mut World) {
     // Stone, carved stone, basalt, paving, oak, bronze, wax, flame, altar.
     let properties = [
@@ -336,5 +339,6 @@ pub fn populate(world: &mut World) {
         spawn_object(world, mesh, material, Mat4::IDENTITY, 160.)
             .expect("cathedral-scale glazing");
     }
+    AUTHORED_TRIANGLES.store(triangles, std::sync::atomic::Ordering::Relaxed);
     eprintln!("Cathedral-scale interior: {triangles} triangles, 145 x 45 x 43 m shell");
 }
