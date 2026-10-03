@@ -25,6 +25,13 @@ struct ResonantPanelParams {
 ///
 /// - `panel_mass_kgm2` — surface density in kg/m² (typically 1–20)
 /// - `cavity_depth_m` — air gap behind the panel in meters (typically 0.02–0.5)
+///
+/// **Angle dependence (#67): intentionally none.** The model is a Lorentzian directly in the
+/// absorption domain; it has no surface impedance, so the locally-reacting `cos(theta)` law
+/// `R = (Zs cos - Z0)/(Zs cos + Z0)` cannot be applied without inventing an impedance (the
+/// phase is not recoverable from `alpha`). `RayInteractionContext::incident_angle_rad` is
+/// therefore ignored; use [`crate::tabular::Tabular8BandAngleEvaluator`] if an angle law is
+/// needed for a panel.
 pub struct ResonantPanelEvaluator;
 
 impl ResonantPanelEvaluator {
@@ -89,14 +96,28 @@ impl IAcousticMaterialEvaluator for ResonantPanelEvaluator {
         RESONANT_PANEL_MODEL_ID
     }
 
+    fn validate(&self, params: &MaterialParameterBuffer) -> Result<(), String> {
+        let p = params.read_value::<ResonantPanelParams>().ok_or_else(|| {
+            format!("resonant panel buffer must be exactly 8 bytes, got {}", params.len())
+        })?;
+        if !(p.panel_mass_kgm2.is_finite() && p.panel_mass_kgm2 > 0.0) {
+            return Err(format!("panel mass must be finite and > 0, got {}", p.panel_mass_kgm2));
+        }
+        if !(p.cavity_depth_m.is_finite() && p.cavity_depth_m > 0.0) {
+            return Err(format!("cavity depth must be finite and > 0, got {}", p.cavity_depth_m));
+        }
+        Ok(())
+    }
+
     fn evaluate(
         &self,
         params: &MaterialParameterBuffer,
         _context: &RayInteractionContext,
     ) -> AcousticResponse8Band {
-        let p: &ResonantPanelParams = params
-            .as_value::<ResonantPanelParams>()
-            .expect("ResonantPanelEvaluator: parameter buffer must be exactly 8 bytes");
+        // Malformed buffer (rejected by `validate`): documented default, never a panic.
+        let Some(p) = params.read_value::<ResonantPanelParams>() else {
+            return AcousticResponse8Band::default();
+        };
 
         let mut absorption = [0.0_f32; 8];
         for (i, &freq) in FREQ_BAND_CENTRES.iter().enumerate() {

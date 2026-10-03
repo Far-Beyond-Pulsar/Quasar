@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use quasar_core::spsc::{SpscConsumer, SpscProducer};
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
+use quasar_dsp::limiter::{set_flush_to_zero, OutputMeter};
 
 use crate::render::{Command, Garbage, SceneRenderState};
 use crate::AudioTiming;
@@ -62,6 +63,9 @@ pub struct AudioRenderer {
     garbage: SpscProducer<Garbage>,
     pub(crate) shared: Arc<RendererShared>,
     timing: Arc<AudioTiming>,
+    /// Whether to set FTZ / DAZ on the audio thread at the first block (default true).
+    flush_denormals: bool,
+    thread_prepared: bool,
 }
 
 impl AudioRenderer {
@@ -72,7 +76,28 @@ impl AudioRenderer {
         shared: Arc<RendererShared>,
         timing: Arc<AudioTiming>,
     ) -> Self {
-        Self { scene, commands, garbage, shared, timing }
+        Self { scene, commands, garbage, shared, timing, flush_denormals: true, thread_prepared: false }
+    }
+
+    /// Prepare the CALLING thread for audio work: enables flush-to-zero / denormals-are-zero
+    /// (see [`quasar_dsp::limiter::set_flush_to_zero`]) so decaying tails never hit slow denormal
+    /// arithmetic. Called automatically on the first [`process_audio_scene`](Self::process_audio_scene)
+    /// unless disabled with [`set_flush_denormals`](Self::set_flush_denormals); the FP mode is
+    /// per thread, so call it again if the renderer is moved to another thread. Returns whether
+    /// the platform supports it (x86_64, aarch64).
+    pub fn prepare_audio_thread(&mut self) -> bool {
+        self.thread_prepared = true;
+        set_flush_to_zero()
+    }
+
+    /// Enable / disable the automatic FTZ / DAZ setup of the audio thread (default on).
+    pub fn set_flush_denormals(&mut self, on: bool) {
+        self.flush_denormals = on;
+    }
+
+    /// Meters of the output stage of listener `index` (renderer-side order).
+    pub fn output_meter(&self, index: usize) -> Option<&Arc<OutputMeter>> {
+        self.scene.meter(index)
     }
 
     /// Apply one command (used directly by the combined engine and by the queue drain).
@@ -123,6 +148,9 @@ impl AudioRenderer {
     /// the block and increments [`invalid_block_count`](Self::invalid_block_count).
     pub fn process_audio_scene(&mut self, sources: &[&AudioBuffer], listener_outputs: &mut [AudioBuffer]) {
         let t_start = Instant::now();
+        if self.flush_denormals && !self.thread_prepared {
+            self.prepare_audio_thread();
+        }
         self.drain_commands();
 
         let too_long = sources.iter().any(|s| s.samples() as usize > DEFAULT_BLOCK_SIZE)

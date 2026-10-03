@@ -194,13 +194,28 @@ struct AudioEngine {
     /// Compute / configuration side (registries, ray tracing, command queue to the renderer).
     engine: Arc<Mutex<SpatialAudioEngine>>,
     _stream: cpal::Stream,
-    /// Master gain in dB (f32 bits), read by the callback each buffer.
+    /// Master gain in dB (f32 bits): UI state; applied as the output stage's pre-limiter gain, so the
+    /// limiter ceiling holds whatever the master volume.
     master_gain_db: Arc<AtomicU32>,
     /// Per-speaker RMS (f32 bits), written by the callback, read by the UI.
     levels: Arc<[AtomicU32; NUM_SPEAKERS]>,
     source_id: SourceId,
     outputs: [SceneOutputId; NUM_SPEAKERS],
     listener_id: ListenerId,
+}
+
+impl AudioEngine {
+    /// Master volume: the output stage's pre-limiter gain (set through the engine's lock-free
+    /// command queue), so the limiter ceiling (-1 dBFS) holds at any master volume.
+    fn set_master_gain_db(&self, db: f32) {
+        self.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+        if let Ok(mut e) = self.engine.lock() {
+            e.set_output_safety(
+                self.listener_id,
+                quasar_dsp::limiter::OutputSafetyConfig { headroom_db: db, ..Default::default() },
+            );
+        }
+    }
 }
 
 fn setup_audio_engine() -> AudioEngine {
@@ -376,7 +391,6 @@ fn setup_audio_engine() -> AudioEngine {
 
     let master_gain_db = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let levels: Arc<[AtomicU32; NUM_SPEAKERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
-    let master_cb = master_gain_db.clone();
     let levels_cb = levels.clone();
     let out_ch_cb = out_ch;
     let err_fn = |e: cpal::StreamError| eprintln!("Audio error: {e}");
@@ -390,7 +404,6 @@ fn setup_audio_engine() -> AudioEngine {
 
             let nch = playback.channels;
             let ratio = playback.rate_ratio;
-            let master_gain = 10.0_f32.powf(f32::from_bits(master_cb.load(AtomicOrdering::Relaxed)) / 20.0);
             let mut remain = total_frames;
             let mut offset = 0;
 
@@ -423,7 +436,7 @@ fn setup_audio_engine() -> AudioEngine {
                 for i in 0..block {
                     let dst = offset + i;
                     for c in 0..out_ch_cb.min(out.channels() as usize) {
-                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i] * master_gain;
+                        data[dst * out_ch_cb + c] = out.channel(c as u16)[i];
                     }
                 }
 
@@ -1240,6 +1253,7 @@ impl ApplicationHandler for App {
                     let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
                     let db = (f32::from_bits(g) - 3.0).max(-60.0);
                     state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+                    state._audio_engine.set_master_gain_db(db);
                     println!("[audio] master gain = {} dB", db);
                 }
             }
@@ -1254,8 +1268,9 @@ impl ApplicationHandler for App {
             } => {
                 {
                     let g = state._audio_engine.master_gain_db.load(AtomicOrdering::Relaxed);
-                    let db = (f32::from_bits(g) + 3.0).min(36.0);
+                    let db = (f32::from_bits(g) + 3.0).min(24.0);
                     state._audio_engine.master_gain_db.store(db.to_bits(), AtomicOrdering::Relaxed);
+                    state._audio_engine.set_master_gain_db(db);
                     println!("[audio] master gain = {} dB", db);
                 }
             }

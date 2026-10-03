@@ -27,9 +27,13 @@
 //!   the same diffuse gains (an overhead source is "everywhere on the ring").
 //!   Where two azimuth-adjacent speakers are >= 180 degrees apart (e.g. the
 //!   rear of a stereo pair) VBAP is undefined, so that arc is covered by a
-//!   constant-power sine/cosine crossfade linear in angle between the two
-//!   bounding speakers: a stereo rear source keeps playing (at 180 degrees both
-//!   speakers get 0.707), with no hard cut.
+//!   constant-power sine/cosine crossfade between the two bounding speakers
+//!   whose position `s(t)` across the gap (`t` = fraction of the gap, 0..1) is
+//!   shaped as `s = t^4 / (t^4 + (1-t)^4)`: odd-symmetric about the gap centre,
+//!   smooth, and almost 0 / 1 near each speaker, so a source at +-90 degrees on
+//!   stereo goes (almost) wholly to the nearer speaker (far-speaker gain
+//!   < 0.01, issue #126) while the rear (180 degrees) still plays with both
+//!   speakers at 0.707, with no hard cut.
 //! * 3D layouts: triplets come from the convex hull of the speaker directions.
 //!   Imaginary speakers are added at +-Y (unless a real speaker sits there) so
 //!   the hull closes over the whole sphere; energy panned to an imaginary
@@ -465,8 +469,11 @@ impl VbapPanner {
                     }
                     None => {
                         let t = (chosen_rel / chosen.gap).clamp(0.0, 1.0);
+                        // Shaped position: lateral sources stay with the near speaker.
+                        let (t4, u4) = (t.powi(4), (1.0 - t).powi(4));
+                        let t = t4 / (t4 + u4);
                         let a = t * std::f32::consts::FRAC_PI_2;
-                        (a.cos(), a.sin())
+                        (a.cos().max(0.0), a.sin().max(0.0))
                     }
                 };
                 let norm = (ga * ga + gb * gb).sqrt();
@@ -558,6 +565,25 @@ impl VbapPanner {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `dst[i] += src[i] * (g0 + (g1 - g0) * (i + 1) / n)` for `n = min(dst, src)` samples: the gain
+/// ramps linearly from `g0` (end of the previous block) to `g1` (end of this block). This is the
+/// per-speaker decode loop of the panner; `g0 == g1` takes the plain-gain path.
+/// Allocation-free.
+#[inline]
+pub fn ramp_add(dst: &mut [f32], src: &[f32], g0: f32, g1: f32) {
+    let n = dst.len().min(src.len());
+    if g0 == g1 {
+        for i in 0..n {
+            dst[i] += src[i] * g1;
+        }
+    } else {
+        let step = (g1 - g0) / n.max(1) as f32;
+        for i in 0..n {
+            dst[i] += src[i] * (g0 + step * (i + 1) as f32);
         }
     }
 }

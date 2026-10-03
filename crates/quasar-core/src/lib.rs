@@ -7,6 +7,7 @@ pub mod scene_output;
 pub mod param_exchange;
 pub mod probe_grid;
 pub mod hybrid;
+pub mod source_directivity;
 pub mod distance;
 pub mod air;
 pub mod reverb_model;

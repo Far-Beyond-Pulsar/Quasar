@@ -48,9 +48,13 @@ pub struct SourceConfig {
 pub struct SceneOutputConfig {
     /// World-space position.
     pub position: [f32; 3],
-    /// Heading for directivity (reserved for future phases).
+    /// Forward axis of the emitter's radiation pattern (need not be normalised). `None` = no
+    /// orientation: the emitter is omnidirectional whatever `directivity` says.
     pub orientation: Option<[f32; 3]>,
-    /// Directivity: `0.0` = omnidirectional, `1.0` = max cone.
+    /// Directivity: `0.0` = omnidirectional, `1.0` = max cone (a cardioid at 1 kHz, tighter at
+    /// higher bands, wider at lower ones). See [`crate::source_directivity`] for the exact pattern; it
+    /// is applied per (listener, emitter) pair to the direct path, the early reflections and the
+    /// reverb send.
     pub directivity: f32,
     /// Patch-bay taps that define this output's audible content.
     pub pulls: Vec<ChannelPull>,

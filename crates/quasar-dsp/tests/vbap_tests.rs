@@ -249,6 +249,7 @@ fn coeffs(az: f32, el: f32) -> SpatialCoefficients {
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }
 }
@@ -460,4 +461,78 @@ fn continuity_metric_detects_an_artificial_discontinuity() {
     });
     assert!(good < 0.05, "real panner step {good}");
     assert!(bad > 0.2, "metric failed to flag the discontinuity (step {bad})");
+}
+
+// ---- #126: lateral sources on gap layouts go to the nearer speaker -----------
+
+#[test]
+fn stereo_lateral_sources_do_not_leak_into_the_far_speaker() {
+    let (pos, lfe) = named(SpeakerLayout::Stereo);
+    let p = VbapPanner::new(&pos, &lfe);
+    for &d in &[90.0f32, 100.0] {
+        let r = gains_of(&p, deg(d), 0.0, 2); // hard right: left must be ~0
+        let l = gains_of(&p, deg(-d), 0.0, 2);
+        assert!(r[0] < 0.05 && r[1] > 0.99, "+{d}: {r:?}");
+        assert!(l[1] < 0.05 && l[0] > 0.99, "-{d}: {l:?}");
+        assert!((power(&r) - 1.0).abs() < 1e-5);
+    }
+    // The rear still plays on both speakers and the far gain rises monotonically toward it.
+    let rear = gains_of(&p, PI, 0.0, 2);
+    assert!(rear[0] > 0.7 && rear[0] < 0.72 && (rear[0] - rear[1]).abs() < 1e-5, "{rear:?}");
+    let mut prev = 0.0f32;
+    for d in (90..=180).step_by(5) {
+        let g = gains_of(&p, deg(d as f32), 0.0, 2)[0];
+        assert!(g >= prev - 1e-6, "far gain not monotonic at {d}");
+        prev = g;
+    }
+}
+
+#[test]
+fn stereo_gap_crossfade_is_continuous_and_constant_power_at_fine_steps() {
+    let (pos, lfe) = named(SpeakerLayout::Stereo);
+    let p = VbapPanner::new(&pos, &lfe);
+    let step = deg(0.1);
+    let mut prev = gains_of(&p, -PI, 0.0, 2);
+    let mut az = -PI + step;
+    while az <= PI {
+        let g = gains_of(&p, az, 0.0, 2);
+        assert!((power(&g) - 1.0).abs() < 1e-4);
+        assert!((g[0] - prev[0]).abs() < 0.05 && (g[1] - prev[1]).abs() < 0.05, "step at {az}");
+        prev = g;
+        az += step;
+    }
+}
+
+#[test]
+fn front_only_planar_layouts_with_wide_gaps_stay_well_behaved() {
+    // Front-only planar layouts: a >= 180 degree rear gap between the outermost speakers.
+    let layouts: [&[f32]; 3] = [&[-30.0, 0.0, 30.0], &[-90.0, 90.0], &[-60.0, -20.0, 20.0, 60.0]];
+    for az_list in layouts {
+        let pos: Vec<[f32; 3]> =
+            az_list.iter().map(|&a| [deg(a).sin(), 0.0, -deg(a).cos()]).collect();
+        let p = VbapPanner::new(&pos, &[]);
+        let n = pos.len();
+        let mut prev = gains_of(&p, -PI, 0.0, n);
+        let mut az = -PI;
+        while az <= PI {
+            let g = gains_of(&p, az, 0.0, n);
+            assert!((power(&g) - 1.0).abs() < 1e-4, "{az_list:?} power at {az}");
+            for k in 0..n {
+                assert!((g[k] - prev[k]).abs() < 0.05, "{az_list:?} step at {az}");
+            }
+            prev = g;
+            az += deg(0.1);
+        }
+        // Each speaker direction is still reproduced exactly by that speaker.
+        for (i, &a) in az_list.iter().enumerate() {
+            let g = gains_of(&p, deg(a), 0.0, n);
+            assert!((g[i] - 1.0).abs() < 1e-4, "{az_list:?} speaker {i}: {g:?}");
+        }
+        // Rear is audible and mirror symmetric for symmetric layouts.
+        let (r, l) = (gains_of(&p, deg(170.0), 0.0, n), gains_of(&p, deg(-170.0), 0.0, n));
+        assert!(power(&r) > 0.99 && power(&l) > 0.99);
+        for k in 0..n {
+            assert!((r[k] - l[n - 1 - k]).abs() < 1e-4);
+        }
+    }
 }

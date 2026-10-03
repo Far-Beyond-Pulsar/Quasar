@@ -82,6 +82,7 @@ fn copy_reflections(dst: &mut Vec<EarlyReflectionCoeffs>, src: &[EarlyReflection
 fn copy_coeffs(dst: &mut SpatialCoefficients, src: &SpatialCoefficients) {
     dst.source_id = src.source_id;
     dst.direct_gain = src.direct_gain;
+    dst.directivity_gain = src.directivity_gain;
     dst.direct_delay_samples = src.direct_delay_samples;
     dst.direct_azimuth = src.direct_azimuth;
     dst.direct_elevation = src.direct_elevation;
@@ -97,6 +98,7 @@ fn with_capacity(src: &SpatialCoefficients) -> SpatialCoefficients {
         source_id: src.source_id,
         direct_gain: src.direct_gain,
         direct_delay_samples: src.direct_delay_samples,
+        directivity_gain: src.directivity_gain,
         direct_azimuth: src.direct_azimuth,
         direct_elevation: src.direct_elevation,
         early_reflections: Vec::with_capacity(MAX_CROSSFADE_REFLECTIONS),
@@ -146,6 +148,7 @@ impl EqualPowerCrossfader {
         let c = &self.current;
         self.from.source_id = c.source_id;
         self.from.direct_gain = c.direct_gain;
+        self.from.directivity_gain = c.directivity_gain;
         self.from.direct_delay_samples = c.direct_delay_samples;
         self.from.direct_azimuth = c.direct_azimuth;
         self.from.direct_elevation = c.direct_elevation;
@@ -271,6 +274,12 @@ impl EqualPowerCrossfader {
         }
 
         lerp_band(&self.from.direct_gain, &self.target.direct_gain, t, &mut self.current.direct_gain);
+        lerp_band(
+            &self.from.directivity_gain,
+            &self.target.directivity_gain,
+            t,
+            &mut self.current.directivity_gain,
+        );
         self.current.direct_delay_samples =
             lerp(self.from.direct_delay_samples, self.target.direct_delay_samples, t);
         self.current.direct_azimuth =

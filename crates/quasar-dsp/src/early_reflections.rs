@@ -1,5 +1,5 @@
 use quasar_core::param_exchange::{SpatialCoefficients, EarlyReflectionCoeffs};
-use crate::audio_buffer::AudioBuffer;
+use crate::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 use crate::fractional_delay::HermiteInterpolatingDelayLine;
 use crate::node_graph::AudioNode;
 
@@ -114,6 +114,12 @@ impl EarlyReflectionDelayNode {
         self.delay_line.tap(delay_from_newest)
     }
 
+    /// Read a block of taps: `out[j] = tap_at(delays[j])` (same arithmetic, vectorisable layout).
+    #[inline]
+    pub fn tap_many_at(&self, delays: &[f32], out: &mut [f32]) {
+        self.delay_line.tap_many(delays, 0, false, out);
+    }
+
     /// Largest delay (samples) [`Self::tap_at`] can read.
     pub fn max_tap_delay(&self) -> f32 {
         (self.delay_line.max_samples() - 3) as f32
@@ -203,25 +209,40 @@ impl AudioNode for EarlyReflectionDelayNode {
         let inv_n = 1.0 / num_samples.max(1) as f32;
         self.build_ramps(num_samples);
 
+        // Fold to mono and push the whole block first; each tap is then read per sample
+        // counted back from the end of the block (`tap_back`), which is exactly what a read right
+        // after the push of sample `i` returns, and lets the loop run tap-major (constants of
+        // one tap hoisted, the line read in a tight loop).
+        let mut mono = [0.0_f32; DEFAULT_BLOCK_SIZE];
+        let n = num_samples.min(DEFAULT_BLOCK_SIZE);
+        let chs = input.channels() as usize;
+        for c in 0..chs {
+            let ch = &input.channel(c as u16)[..n];
+            for (m, x) in mono[..n].iter_mut().zip(ch) {
+                *m += *x;
+            }
+        }
+        let chf = input.channels() as f32;
+        for m in mono[..n].iter_mut() {
+            *m /= chf;
+        }
+        self.delay_line.push_slice(&mono[..n]);
+
         output.channel_mut(0).fill(0.0);
-
-        for i in 0..num_samples {
-            let mut mono = 0.0_f32;
-            for ch in 0..input.channels() as usize {
-                mono += input.channel(ch as u16)[i];
+        let out = &mut output.channel_mut(0)[..n];
+        let mut dly = [0.0_f32; DEFAULT_BLOCK_SIZE];
+        let mut rd = [0.0_f32; DEFAULT_BLOCK_SIZE];
+        for r in &self.ramps {
+            let (d0, dd, g0, dg) = (r.d0, r.d1 - r.d0, r.g0, r.g1 - r.g0);
+            for (i, d) in dly[..n].iter_mut().enumerate() {
+                let t = (i + 1) as f32 * inv_n;
+                *d = d0 + dd * t;
             }
-            mono /= input.channels() as f32;
-
-            self.delay_line.push(mono);
-
-            let t = (i + 1) as f32 * inv_n;
-            let mut acc = 0.0_f32;
-            for r in &self.ramps {
-                let d = r.d0 + (r.d1 - r.d0) * t;
-                let g = r.g0 + (r.g1 - r.g0) * t;
-                acc += self.delay_line.tap(d) * g;
+            self.delay_line.tap_many(&dly[..n], n - 1, true, &mut rd[..n]);
+            for (i, (o, x)) in out.iter_mut().zip(&rd[..n]).enumerate() {
+                let t = (i + 1) as f32 * inv_n;
+                *o += *x * (g0 + dg * t);
             }
-            output.channel_mut(0)[i] += acc;
         }
     }
 

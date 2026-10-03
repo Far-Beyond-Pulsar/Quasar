@@ -27,6 +27,8 @@ pub struct CpuSimdComputeBackend {
     planes: Vec<ReflectPlane>,
     /// Volume / area statistics for the late-reverb estimate.
     room: RoomStats,
+    /// Number of "room is not closed" warnings emitted (at most 1 per backend).
+    room_warnings: u32,
     config: CpuSimdConfig,
     distance_model: DistanceModel,
 }
@@ -805,11 +807,14 @@ pub(crate) struct RoomStats {
     /// Bounding box of the scene.
     pub(crate) min: [f32; 3],
     pub(crate) max: [f32; 3],
+    /// The triangle soup is a closed, consistently wound surface (the volume is exact);
+    /// `false` means the bounding-box volume fallback was used (or the scene is empty).
+    pub(crate) closed: bool,
 }
 
 impl RoomStats {
     pub(crate) fn empty() -> Self {
-        Self { volume: 0.0, area: 0.0, by_material: Vec::new(), min: [0.0; 3], max: [0.0; 3] }
+        Self { volume: 0.0, area: 0.0, by_material: Vec::new(), min: [0.0; 3], max: [0.0; 3], closed: false }
     }
 
     /// Inside the bounding box padded by 0.5 m.
@@ -821,7 +826,8 @@ impl RoomStats {
     /// closed, consistently oriented surface (every directed edge occurs once and so does
     /// its reverse); the net `|sum|` is then the cavity minus any closed solids (columns
     /// wound outward, the room shell wound inward). Otherwise the bounding-box VOLUME
-    /// (a warning is printed: the figure is only right for box-like rooms).
+    /// (`closed` is false: the figure is only right for box-like rooms; the backend
+    /// warns once, see `CpuSimdComputeBackend::room_is_closed`).
     pub(crate) fn build(triangles: &[Triangle]) -> Self {
         use std::collections::{BTreeMap, HashMap};
         if triangles.is_empty() {
@@ -847,16 +853,13 @@ impl RoomStats {
         }
         let closed = edges.iter().all(|(&(p, q), &c)| c == 1 && edges.get(&(q, p)) == Some(&1));
         let box_volume = (0..3).map(|i| (aabb.max[i] - aabb.min[i]).max(0.0)).product::<f32>();
-        let volume = if closed && signed.abs() > 1e-6 {
+        let volume_closed = closed && signed.abs() > 1e-6;
+        let volume = if volume_closed {
             signed.abs() as f32
         } else {
-            eprintln!(
-                "quasar-backends: acoustic scene is not a closed, consistently wound surface; \
-                 using the bounding-box volume ({box_volume:.1} m^3) for the late-reverb estimate"
-            );
             box_volume
         };
-        Self { volume, area, by_material: per.into_iter().collect(), min: aabb.min, max: aabb.max }
+        Self { volume, area, by_material: per.into_iter().collect(), min: aabb.min, max: aabb.max, closed: volume_closed }
     }
 }
 
@@ -942,6 +945,7 @@ impl CpuSimdComputeBackend {
             triangles: Vec::new(),
             planes: Vec::new(),
             room: RoomStats::empty(),
+            room_warnings: 0,
             config,
             distance_model: DistanceModel::default(),
         };
@@ -955,12 +959,33 @@ impl CpuSimdComputeBackend {
         self.triangles = Self::triangles_from_scene(&self.scene);
         self.planes = build_planes(&self.triangles, self.config.max_reflection_planes);
         self.room = RoomStats::build(&self.triangles);
+        if !self.triangles.is_empty() && !self.room.closed && self.room_warnings == 0 {
+            self.room_warnings = 1;
+            eprintln!(
+                "quasar-backends: acoustic scene is not a closed, consistently wound surface; \
+                 using the bounding-box volume ({:.1} m^3) for the late-reverb estimate (warned once)",
+                self.room.volume
+            );
+        }
         if self.triangles.is_empty() {
             self.bvh = None;
             return;
         }
         let mut triangles = self.triangles.clone();
         self.bvh = Some(BvhNode::build(&mut triangles));
+    }
+
+    /// Whether the current scene is a closed, consistently wound surface (exact room
+    /// volume). `false` for open / inconsistent / empty scenes, which use the
+    /// bounding-box volume for the late-reverb estimate; the warning for that is
+    /// printed at most once per backend (see [`Self::room_warning_count`]).
+    pub fn room_is_closed(&self) -> bool {
+        self.room.closed
+    }
+
+    /// How many "room is not closed" warnings this backend has printed (0 or 1).
+    pub fn room_warning_count(&self) -> u32 {
+        self.room_warnings
     }
 
     /// Number of distinct mirror planes the early-reflection tracer considers
@@ -1594,6 +1619,13 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
 
     fn set_distance_model(&mut self, model: DistanceModel) {
         self.distance_model = model;
+    }
+
+    fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
+        if temperature_celsius.is_finite() && humidity_percent.is_finite() {
+            self.config.temperature_celsius = temperature_celsius;
+            self.config.humidity_percent = humidity_percent;
+        }
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {

@@ -1,4 +1,4 @@
-use std::f32::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use quasar_core::bands::{Band8, FREQ_BAND_CENTRES};
 use quasar_core::rays::RayInteractionContext;
@@ -18,20 +18,68 @@ struct DelanyBazleyParams {
 }
 
 /// Air density at 20°C (kg/m³).
-const RHO_0: f32 = 1.204;
+const RHO_0: f64 = 1.204;
 
 /// Speed of sound at 20°C (m/s).
-const C_0: f32 = 343.0;
+const C_0: f64 = 343.0;
 
 /// Characteristic impedance of air (rayls).
-const Z_0: f32 = RHO_0 * C_0; // ≈ 413.0
+const Z_0: f64 = RHO_0 * C_0; // ≈ 413.0
+
+/// Validity range of the Delany-Bazley regression in the dimensionless variable
+/// `X = rho0 * f / sigma` (`f` in Hz, `sigma` = flow resistivity in SI rayls/m = Pa s/m^2):
+/// `0.01 <= X <= 1.0` (the original fit; equivalently `f/sigma_cgs` of roughly 0.01..1 in
+/// kHz / cgs rayls units). Outside it the power laws extrapolate silently; this evaluator
+/// **clamps `X` to the range inside the empirical `Zc` / `k` power laws** (the frequency
+/// dependence `omega` of `k` and of the layer response is kept) and warns once per process
+/// (see [`PorousDelanyBazleyEvaluator::x_in_validity_range`]).
+pub const DELANY_BAZLEY_X_RANGE: (f32, f32) = (0.01, 1.0);
+
+/// Largest incidence angle used for the oblique-incidence law (89 degrees): at exactly 90 degrees
+/// `cos(theta) = 0` and the reflection coefficient is exactly -1 (zero absorption), which would
+/// make absorption discontinuous in the tracer's grazing hits.
+pub const DELANY_BAZLEY_MAX_ANGLE_RAD: f32 = 89.0 * std::f32::consts::PI / 180.0;
+
+static WARNED_RANGE: AtomicBool = AtomicBool::new(false);
+
+/// Minimal complex number (f64) for the layer impedance chain.
+#[derive(Clone, Copy)]
+struct C64 {
+    re: f64,
+    im: f64,
+}
+
+impl C64 {
+    fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
+    }
+    fn mul(self, o: Self) -> Self {
+        Self::new(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+    }
+    fn div(self, o: Self) -> Self {
+        let d = o.re * o.re + o.im * o.im;
+        Self::new((self.re * o.re + self.im * o.im) / d, (self.im * o.re - self.re * o.im) / d)
+    }
+    fn norm_sqr(self) -> f64 {
+        self.re * self.re + self.im * self.im
+    }
+}
 
 /// Delany-Bazley porous absorber material evaluator.
 ///
 /// Parameter buffer: `[flow_resistivity: f32, thickness_m: f32]` (8 bytes).
 ///
-/// Implements the empirical Delany-Bazley model for fibrous porous absorbers.
-/// Flow resistivity is in Rayls/m (typically 1000 – 100 000), thickness in meters.
+/// Implements the empirical Delany-Bazley model for fibrous porous absorbers (rigid backing)
+/// treated as **locally reacting**: the normal-incidence surface impedance
+/// `Zs = -j Zc cot(k d)` is used at every angle, with the oblique-incidence reflection
+/// coefficient
+///
+/// `R(theta) = (Zs cos(theta) - Z0) / (Zs cos(theta) + Z0)`, `alpha(theta) = 1 - |R(theta)|^2`,
+///
+/// where `theta` is `RayInteractionContext::incident_angle_rad` (angle from the surface normal,
+/// folded into `[0, pi/2]` and clamped to [`DELANY_BAZLEY_MAX_ANGLE_RAD`] = 89 degrees).
+/// Flow resistivity is in Rayls/m (typically 1000 - 100 000), thickness in meters. Validity
+/// range: see [`DELANY_BAZLEY_X_RANGE`].
 pub struct PorousDelanyBazleyEvaluator;
 
 impl PorousDelanyBazleyEvaluator {
@@ -49,76 +97,84 @@ impl PorousDelanyBazleyEvaluator {
         MaterialParameterBuffer::new(bytemuck::bytes_of(&params).to_vec())
     }
 
-    /// Compute absorption coefficient for a single frequency using the Delany-Bazley model.
+    /// Whether `X = rho0 f / sigma` lies in the Delany-Bazley validity range
+    /// [`DELANY_BAZLEY_X_RANGE`].
+    pub fn x_in_validity_range(freq: f32, flow_resistivity: f32) -> bool {
+        if freq <= 0.0 || flow_resistivity <= 0.0 {
+            return false;
+        }
+        let x = RHO_0 as f32 * freq / flow_resistivity;
+        x >= DELANY_BAZLEY_X_RANGE.0 && x <= DELANY_BAZLEY_X_RANGE.1
+    }
+
+    /// Normal-incidence surface impedance `Zs` (rayls, complex as `(re, im)`) of a rigidly
+    /// backed layer, or `None` for degenerate input.
+    fn surface_impedance(freq: f64, sigma: f64, d: f64) -> Option<C64> {
+        // X clamped to the validity range inside the power laws.
+        let e = (RHO_0 * freq / sigma).clamp(DELANY_BAZLEY_X_RANGE.0 as f64, DELANY_BAZLEY_X_RANGE.1 as f64);
+
+        // Characteristic impedance Zc and propagation constant k (e^{+j w t} convention).
+        let zc = C64::new(Z_0 * (1.0 + 0.0571 * e.powf(-0.754)), -Z_0 * 0.087 * e.powf(-0.732));
+        let w_c = 2.0 * std::f64::consts::PI * freq / C_0;
+        let kd = C64::new(w_c * (1.0 + 0.0978 * e.powf(-0.700)) * d, -w_c * 0.189 * e.powf(-0.595) * d);
+
+        // cot(a + jb) = cos/sin with
+        // cos(a+jb) = cos a cosh b - j sin a sinh b ; sin(a+jb) = sin a cosh b + j cos a sinh b.
+        let cos = C64::new(kd.re.cos() * kd.im.cosh(), -(kd.re.sin() * kd.im.sinh()));
+        let sin = C64::new(kd.re.sin() * kd.im.cosh(), kd.re.cos() * kd.im.sinh());
+        if sin.norm_sqr() < 1e-24 || !cos.re.is_finite() || !sin.re.is_finite() {
+            return None;
+        }
+        let cot = cos.div(sin);
+        // Zs = -j * Zc * cot(kd)
+        let p = zc.mul(cot);
+        Some(C64::new(p.im, -p.re))
+    }
+
+    /// Absorption coefficient at normal incidence (see [`Self::absorption_at_freq_angle`]).
+    pub fn absorption_at_freq(freq: f32, flow_resistivity: f32, thickness_m: f32) -> f32 {
+        Self::absorption_at_freq_angle(freq, flow_resistivity, thickness_m, 0.0)
+    }
+
+    /// Absorption coefficient at incidence angle `theta_rad` (from the normal) using the
+    /// locally-reacting oblique-incidence reflection coefficient (see the type docs).
     ///
     /// # Parameters
     /// - `freq` — frequency in Hz
     /// - `flow_resistivity` — flow resistivity in Rayls/m
     /// - `thickness_m` — material thickness in meters
-    pub fn absorption_at_freq(freq: f32, flow_resistivity: f32, thickness_m: f32) -> f32 {
-        if freq <= 0.0 || flow_resistivity <= 0.0 || thickness_m <= 0.0 {
+    /// - `theta_rad` — angle of incidence from the surface normal (folded into `[0, pi/2]`,
+    ///   clamped to 89 degrees)
+    pub fn absorption_at_freq_angle(freq: f32, flow_resistivity: f32, thickness_m: f32, theta_rad: f32) -> f32 {
+        if !(freq > 0.0 && flow_resistivity > 0.0 && thickness_m > 0.0) || !theta_rad.is_finite() {
             return 0.0;
         }
-
-        // Dimensionless parameter E = ρ₀ · f / R_s
-        let e = RHO_0 * freq / flow_resistivity;
-
-        // Characteristic impedance Zc (complex)
-        let zc_real = Z_0 * (1.0 + 0.0571 * e.powf(-0.754));
-        let zc_imag = -Z_0 * 0.087 * e.powf(-0.732);
-
-        // Propagation constant k (complex)
-        let omega = 2.0 * PI * freq;
-        let omega_over_c0 = omega / C_0;
-        let k_real = omega_over_c0 * (1.0 + 0.0978 * e.powf(-0.700));
-        let k_imag = -omega_over_c0 * 0.189 * e.powf(-0.595);
-
-        // Surface impedance Zs = -j · Zc · cot(k · d)
-        // cot(x) = cos(x) / sin(x); handle the complex number arithmetic manually.
-        let kd_real = k_real * thickness_m;
-        let kd_imag = k_imag * thickness_m;
-
-        // Compute cot(kd) for complex kd = kd_real + j * kd_imag
-        // cot(z) = cos(z) / sin(z)
-        // cos(a + jb) = cos(a)cosh(b) - j·sin(a)sinh(b)
-        // sin(a + jb) = sin(a)cosh(b) + j·cos(a)sinh(b)
-        let cos_kd_real = kd_real.cos() * kd_imag.cosh();
-        let cos_kd_imag = -(kd_real.sin() * kd_imag.sinh());
-        let sin_kd_real = kd_real.sin() * kd_imag.cosh();
-        let sin_kd_imag = kd_real.cos() * kd_imag.sinh();
-
-        // cot(z) = (cos_real + j·cos_imag) / (sin_real + j·sin_imag)
-        let denom = sin_kd_real * sin_kd_real + sin_kd_imag * sin_kd_imag;
-        if denom.abs() < 1e-12 {
-            return 1.0; // near singularity — fully absorbed
+        let mut theta = (theta_rad as f64).abs() % (2.0 * std::f64::consts::PI);
+        if theta > std::f64::consts::PI {
+            theta = 2.0 * std::f64::consts::PI - theta;
         }
-        let cot_real = (cos_kd_real * sin_kd_real + cos_kd_imag * sin_kd_imag) / denom;
-        let cot_imag = (cos_kd_imag * sin_kd_real - cos_kd_real * sin_kd_imag) / denom;
+        if theta > std::f64::consts::FRAC_PI_2 {
+            theta = std::f64::consts::PI - theta;
+        }
+        let theta = theta.min(DELANY_BAZLEY_MAX_ANGLE_RAD as f64);
 
-        // Zs = -j · Zc · cot(kd)
-        // -j · (zc_real + j·zc_imag) · (cot_real + j·cot_imag)
-        // = -j · [ (zc_real·cot_real - zc_imag·cot_imag) + j·(zc_real·cot_imag + zc_imag·cot_real) ]
-        let a = zc_real * cot_real - zc_imag * cot_imag;
-        let b = zc_real * cot_imag + zc_imag * cot_real;
-        // -j · (a + jb) = -j·a + b  =>  real = b, imag = -a
-        let zs_real = b;
-        let zs_imag = -a;
-
-        // Reflection coefficient R = (Zs - Z₀) / (Zs + Z₀)
-        let r_num_real = zs_real - Z_0;
-        let r_num_imag = zs_imag;
-        let r_den_real = zs_real + Z_0;
-        let r_den_imag = zs_imag;
-        let r_den_mag2 = r_den_real * r_den_real + r_den_imag * r_den_imag;
-        if r_den_mag2.abs() < 1e-12 {
+        let Some(zs) = Self::surface_impedance(freq as f64, flow_resistivity as f64, thickness_m as f64) else {
+            return 1.0; // near singularity of cot: fully absorbed (as before)
+        };
+        // R = (Zs cos - Z0) / (Zs cos + Z0)
+        let c = theta.cos();
+        let zc = C64::new(zs.re * c, zs.im * c);
+        let den = C64::new(zc.re + Z_0, zc.im);
+        if den.norm_sqr() < 1e-24 {
             return 1.0;
         }
-        let r_real = (r_num_real * r_den_real + r_num_imag * r_den_imag) / r_den_mag2;
-        let r_imag = (r_num_imag * r_den_real - r_num_real * r_den_imag) / r_den_mag2;
-
-        // Absorption α = 1 - |R|²
-        let r_mag2 = r_real * r_real + r_imag * r_imag;
-        (1.0 - r_mag2).clamp(0.0, 1.0)
+        let r = C64::new(zc.re - Z_0, zc.im).div(den);
+        let alpha = 1.0 - r.norm_sqr();
+        if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        }
     }
 }
 
@@ -127,18 +183,42 @@ impl IAcousticMaterialEvaluator for PorousDelanyBazleyEvaluator {
         DELANY_BAZLEY_MODEL_ID
     }
 
+    fn validate(&self, params: &MaterialParameterBuffer) -> Result<(), String> {
+        let p = params.read_value::<DelanyBazleyParams>().ok_or_else(|| {
+            format!("Delany-Bazley buffer must be exactly 8 bytes, got {}", params.len())
+        })?;
+        if !(p.flow_resistivity.is_finite() && p.flow_resistivity > 0.0) {
+            return Err(format!("flow resistivity must be finite and > 0, got {}", p.flow_resistivity));
+        }
+        if !(p.thickness_m.is_finite() && p.thickness_m > 0.0) {
+            return Err(format!("thickness must be finite and > 0, got {}", p.thickness_m));
+        }
+        Ok(())
+    }
+
     fn evaluate(
         &self,
         params: &MaterialParameterBuffer,
-        _context: &RayInteractionContext,
+        context: &RayInteractionContext,
     ) -> AcousticResponse8Band {
-        let p: &DelanyBazleyParams = params
-            .as_value::<DelanyBazleyParams>()
-            .expect("PorousDelanyBazleyEvaluator: parameter buffer must be exactly 8 bytes");
+        // Malformed buffer (rejected by `validate`): documented default, never a panic.
+        let Some(p) = params.read_value::<DelanyBazleyParams>() else {
+            return AcousticResponse8Band::default();
+        };
 
         let mut absorption = [0.0_f32; 8];
+        let mut out_of_range = false;
         for (i, &freq) in FREQ_BAND_CENTRES.iter().enumerate() {
-            absorption[i] = Self::absorption_at_freq(freq, p.flow_resistivity, p.thickness_m);
+            out_of_range |= !Self::x_in_validity_range(freq, p.flow_resistivity);
+            absorption[i] =
+                Self::absorption_at_freq_angle(freq, p.flow_resistivity, p.thickness_m, context.incident_angle_rad);
+        }
+        if out_of_range && !WARNED_RANGE.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "quasar-materials: Delany-Bazley used outside its validity range ({} <= rho0*f/sigma <= {}) \
+                 for flow resistivity {} rayls/m; X is clamped (warned once)",
+                DELANY_BAZLEY_X_RANGE.0, DELANY_BAZLEY_X_RANGE.1, p.flow_resistivity
+            );
         }
 
         AcousticResponse8Band {

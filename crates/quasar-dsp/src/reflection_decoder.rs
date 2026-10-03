@@ -102,6 +102,10 @@ impl Slot {
 pub struct ReflectionDecoder {
     slots: Vec<Slot>,
     scratch: Vec<f32>,
+    /// Per-block scratch: tap delays, raw tap reads, low-passed reads.
+    dl: Vec<f32>,
+    xs: Vec<f32>,
+    lps: Vec<f32>,
     /// One-pole coefficient `1 - exp(-2 pi f / fs)` of the crossover.
     xover_a: f32,
 }
@@ -115,6 +119,9 @@ impl ReflectionDecoder {
         Self {
             slots: (0..REFLECTION_SLOTS).map(|_| Slot::new(hrtf, sr)).collect(),
             scratch: vec![0.0; DEFAULT_BLOCK_SIZE],
+            dl: vec![0.0; DEFAULT_BLOCK_SIZE],
+            xs: vec![0.0; DEFAULT_BLOCK_SIZE],
+            lps: vec![0.0; DEFAULT_BLOCK_SIZE],
             xover_a: 1.0 - (-2.0 * std::f32::consts::PI * CROSSOVER_HZ / sr).exp(),
         }
     }
@@ -235,21 +242,32 @@ impl ReflectionDecoder {
 
             let silent = lo0.abs() <= SILENT && hi0.abs() <= SILENT && lo1.abs() <= SILENT && hi1.abs() <= SILENT;
             if !silent {
-                // Tap read with per-sample delay / gain ramps and the two-band split.
-                let mut lp = slot.lp;
-                for j in 0..block {
+                // Tap read with per-sample delay / gain ramps and the two-band split, as three
+                // passes over the block (delays + vectorised Hermite read, the one-pole recursion,
+                // the band mix) so each pass is a tight loop of one kind.
+                let line_dl = &mut self.dl[..block];
+                for (j, d) in line_dl.iter_mut().enumerate() {
                     let t = (j + 1) as f32 * inv_n;
-                    let d = (d0 + (d1 - d0) * t).clamp(0.0, max_d) + (block - 1 - j) as f32;
-                    let x = line.tap_at(d);
+                    *d = (d0 + (d1 - d0) * t).clamp(0.0, max_d) + (block - 1 - j) as f32;
+                }
+                let xs = &mut self.xs[..block];
+                line.tap_many_at(line_dl, xs);
+                let mut lp = slot.lp;
+                let lps = &mut self.lps[..block];
+                for (l, &x) in lps.iter_mut().zip(xs.iter()) {
                     lp += xover_a * (x - lp);
                     if lp.abs() < 1e-24 {
                         lp = 0.0; // flush denormals
                     }
-                    let g_lo = lo0 + (lo1 - lo0) * t;
-                    let g_hi = hi0 + (hi1 - hi0) * t;
-                    self.scratch[j] = g_lo * lp + g_hi * (x - lp);
+                    *l = lp;
                 }
                 slot.lp = lp;
+                for (j, ((s, &x), &l)) in self.scratch[..block].iter_mut().zip(xs.iter()).zip(lps.iter()).enumerate() {
+                    let t = (j + 1) as f32 * inv_n;
+                    let g_lo = lo0 + (lo1 - lo0) * t;
+                    let g_hi = hi0 + (hi1 - hi0) * t;
+                    *s = g_lo * l + g_hi * (x - l);
+                }
 
                 // Decode at the tap's own direction.
                 if let Some(bin) = slot.bin.as_mut() {
@@ -270,10 +288,7 @@ impl ReflectionDecoder {
                             continue;
                         }
                         let ch = out.channel_mut(sp as u16);
-                        let step = (g1 - g0) * inv_n;
-                        for j in 0..block {
-                            ch[j] += self.scratch[j] * (g0 + step * (j + 1) as f32);
-                        }
+                        crate::vbap::ramp_add(&mut ch[..block], &self.scratch[..block], g0, g1);
                     }
                 }
             }

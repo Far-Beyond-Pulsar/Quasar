@@ -118,6 +118,7 @@ fn coeffs(source_id: u32, gain: f32, delay: f32, azimuth: f32, version: u64) -> 
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version,
     }
 }
@@ -410,8 +411,9 @@ fn directivity_omni_uniform() {
         input.set(0, i, (i as f32 * 0.1).sin());
     }
     let mut output = AudioBuffer::new(1, 64);
-    // Omni radiates equally everywhere, whatever the source id maps to.
-    for id in [0u32, 5, 31] {
+    // Omni radiates equally everywhere, whatever the emission angle (and source id) is.
+    for (id, az, el) in [(0u32, 0.0f32, 0.0f32), (5, 1.0, 0.3), (31, std::f32::consts::PI, -0.7)] {
+        node.set_angle(az, el);
         node.process(&input, &mut output, &coeffs(id, 1.0, 0.0, 0.0, 0));
         for i in 0..64 {
             assert!((output.get(0, i) - input.get(0, i)).abs() < 1e-6, "omni must pass through");
@@ -421,9 +423,8 @@ fn directivity_omni_uniform() {
 
 // ── directivity_cardioid_null ─────────────────────────────────────────
 
-/// NOTE: `DirectivityDspNode::process` still derives its azimuth from
-/// `source_id * 0.1` (placeholder in the node), so the on-axis / rear angles
-/// are selected through the id: id 0 -> 0 rad, id 31 -> 3.1 rad (~177 deg).
+/// The node's angle is an explicit input (no more `source_id * 0.1` placeholder): the cardioid is
+/// 1 on axis, 1/2 at 90 degrees and a null at 180, and the source id has no influence.
 #[test]
 fn directivity_cardioid_null() {
     let mut cardioid = DirectivityDspNode::new(DirectivityPattern::Cardioid, 1);
@@ -432,17 +433,37 @@ fn directivity_cardioid_null() {
         input.set(0, i, 1.0);
     }
     let mut output = AudioBuffer::new(1, 64);
+    let pi = std::f32::consts::PI;
 
+    cardioid.set_angle(0.0, 0.0);
     cardioid.process(&input, &mut output, &coeffs(0, 1.0, 0.0, 0.0, 0));
     assert!((output.get(0, 10) - 1.0).abs() < 1e-6, "cardioid on-axis gain is 1");
 
-    cardioid.process(&input, &mut output, &coeffs(31, 1.0, 0.0, 0.0, 0));
-    let rear = output.get(0, 10);
-    assert!(rear >= 0.0 && rear < 1e-2, "cardioid rear is (almost) a null, got {rear}");
+    cardioid.set_angle(pi, 0.0);
+    cardioid.process(&input, &mut output, &coeffs(0, 1.0, 0.0, 0.0, 0));
+    assert!(output.get(0, 10).abs() < 1e-6, "cardioid rear is a null, got {}", output.get(0, 10));
 
-    // Side (id 16 -> 1.6 rad ~ 91.7 deg) is about half amplitude.
-    cardioid.process(&input, &mut output, &coeffs(16, 1.0, 0.0, 0.0, 0));
-    assert!((output.get(0, 10) - 0.5 * (1.0 + 1.6_f32.cos())).abs() < 1e-5);
+    cardioid.set_angle(pi / 2.0, 0.0);
+    cardioid.process(&input, &mut output, &coeffs(31, 1.0, 0.0, 0.0, 0));
+    assert!((output.get(0, 10) - 0.5).abs() < 1e-6, "side is -6 dB, whatever the source id");
+
+    // Elevation counts: 90 degrees up is also 90 degrees off axis.
+    cardioid.set_angle(0.0, pi / 2.0);
+    cardioid.process(&input, &mut output, &coeffs(0, 1.0, 0.0, 0.0, 0));
+    assert!((output.get(0, 10) - 0.5).abs() < 1e-6);
+
+    // Figure-8 and SH patterns.
+    let mut f8 = DirectivityDspNode::new(DirectivityPattern::Figure8, 1);
+    f8.set_angle(pi, 0.0);
+    assert!((f8.current_gain() - 1.0).abs() < 1e-6, "figure-8 radiates equally to the rear");
+    f8.set_angle(pi / 2.0, 0.0);
+    assert!(f8.current_gain().abs() < 1e-6, "figure-8 null at the sides");
+    let sh = DirectivityPattern::SphericalHarmonics { weights: vec![0.5, 0.0, 0.0, 0.5], order: 1 };
+    assert!((DirectivityDspNode::compute_gain(&sh, 0.0, 0.0) - 1.0).abs() < 1e-6);
+    assert!((DirectivityDspNode::compute_gain(&sh, pi, 0.0)).abs() < 1e-6);
+    // Non-finite angles read as on axis.
+    cardioid.set_angle(f32::NAN, f32::INFINITY);
+    assert_eq!(cardioid.current_gain(), 1.0);
 }
 
 // ── master_decoder_stereo_pan ─────────────────────────────────────────

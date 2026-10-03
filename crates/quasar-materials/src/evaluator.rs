@@ -59,7 +59,16 @@ pub trait IAcousticMaterialEvaluator: Send + Sync {
     /// Unique identifier for this material model.
     fn model_id(&self) -> MaterialModelId;
 
+    /// Check a parameter buffer (size, finite values, sane ranges). Called by the registry at
+    /// `add_instance` / `update_instance` so `evaluate` cannot meet a malformed buffer. Default: accept.
+    fn validate(&self, _params: &MaterialParameterBuffer) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Evaluate the acoustic response for the given parameters and interaction context.
+    ///
+    /// Must not panic: a buffer that fails [`Self::validate`] yields the documented default
+    /// response [`AcousticResponse8Band::default`] (fully reflective, opaque).
     fn evaluate(
         &self,
         params: &MaterialParameterBuffer,

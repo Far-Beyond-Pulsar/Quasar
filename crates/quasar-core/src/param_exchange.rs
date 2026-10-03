@@ -14,6 +14,11 @@ pub struct SpatialCoefficients {
     pub direct_gain: Band8,
     /// Direct-path fractional delay in samples.
     pub direct_delay_samples: f32,
+    /// Source directivity (#74): per-band linear gain of the emitter's radiation pattern toward
+    /// this listener (emission angle from the emitter orientation). 1.0 = omnidirectional. It is
+    /// a separate factor from [`direct_gain`](Self::direct_gain) (distance, air, occlusion) and the
+    /// direct chain applies their product.
+    pub directivity_gain: Band8,
     /// Direct-path azimuth in radians (-π = left, 0 = centre, π = right).
     pub direct_azimuth: f32,
     /// Direct-path elevation in radians.

@@ -135,6 +135,11 @@ pub trait IAcousticComputeBackend: Send + Sync {
     /// reference). Backends that do not model distance may ignore it.
     fn set_distance_model(&mut self, _model: DistanceModel) {}
 
+    /// Set the air temperature (Celsius) and relative humidity (percent) used for
+    /// ISO 9613-1 air absorption (default: 20 C / 50 %). Backends without air
+    /// absorption may ignore it. Called off the audio thread (#121).
+    fn set_atmosphere(&mut self, _temperature_celsius: f32, _humidity_percent: f32) {}
+
     /// Whether this backend supports dynamic scene updates.
     fn supports_dynamic_geometry(&self) -> bool {
         false

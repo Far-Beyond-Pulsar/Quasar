@@ -109,6 +109,7 @@ direct_delay_samples: 0.0,
             early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     };
     let tb = ParameterTripleBuffer::new(1, initial);
@@ -122,6 +123,7 @@ direct_delay_samples: 0.0,
         early_reflections: Vec::new(),
         late_t60: Band8::splat(1.2),
         late_gain_db: -6.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     };
 
@@ -152,6 +154,7 @@ direct_delay_samples: 0.0,
             early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     };
     let tb = ParameterTripleBuffer::new(1, initial);
@@ -166,6 +169,7 @@ direct_delay_samples: 0.0,
             early_reflections: Vec::new(),
             late_t60: Band8::splat(0.5),
             late_gain_db: -10.0,
+            directivity_gain: quasar_core::bands::Band8::splat(1.0),
             version: 0,
         };
         unsafe { *tb.begin_write(0) = v; }
@@ -190,6 +194,7 @@ direct_delay_samples: 0.0,
             early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: -10.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     };
     let tb = std::sync::Arc::new(ParameterTripleBuffer::new(1, initial));
@@ -206,6 +211,7 @@ direct_delay_samples: 0.0,
                 early_reflections: Vec::new(),
                 late_t60: Band8::splat(0.5),
                 late_gain_db: -10.0,
+                directivity_gain: quasar_core::bands::Band8::splat(1.0),
                 version: 0,
             };
             unsafe { *tb_writer.begin_write(0) = v; }

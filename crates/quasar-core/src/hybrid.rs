@@ -33,6 +33,8 @@ pub struct HybridProbeSampler {
     distance_model: DistanceModel,
     /// Air temperature (C) / relative humidity (%) for BakedOnly air absorption.
     atmosphere: (f32, f32),
+    /// Whether `set_atmosphere` was called (otherwise an installed backend keeps its own config).
+    atmosphere_set: bool,
 }
 
 impl HybridProbeSampler {
@@ -45,6 +47,7 @@ impl HybridProbeSampler {
             sample_rate: DEFAULT_SAMPLE_RATE,
             distance_model: DistanceModel::default(),
             atmosphere: (20.0, 50.0),
+            atmosphere_set: false,
         }
     }
 
@@ -66,10 +69,15 @@ impl HybridProbeSampler {
     }
 
     /// Air temperature (C) and relative humidity (%) used for the air absorption
-    /// the sampler itself applies (BakedOnly; default 20 C / 50 %). Real-time
-    /// backends use their own configuration.
+    /// the sampler itself applies (BakedOnly; default 20 C / 50 %). Forwarded to
+    /// the real-time backend (and re-applied when one is installed) so every
+    /// strategy uses the same atmosphere.
     pub fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
         self.atmosphere = (temperature_celsius, humidity_percent);
+        self.atmosphere_set = true;
+        if let Some(b) = self.realtime_backend.as_mut() {
+            b.set_atmosphere(temperature_celsius, humidity_percent);
+        }
     }
 
     /// The active distance model.
@@ -91,6 +99,9 @@ impl HybridProbeSampler {
     pub fn set_realtime_backend(&mut self, mut backend: Box<dyn IAcousticComputeBackend>) {
         backend.set_sample_rate(self.sample_rate);
         backend.set_distance_model(self.distance_model);
+        if self.atmosphere_set {
+            backend.set_atmosphere(self.atmosphere.0, self.atmosphere.1);
+        }
         self.realtime_backend = Some(backend);
     }
 

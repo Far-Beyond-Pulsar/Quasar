@@ -53,7 +53,7 @@
 //!   No adapter / insufficient limits / shader failure are explicit
 //!   [`SpatialAudioError::Backend`] errors from the constructors.
 //! * **Atmosphere.** Temperature / humidity come from [`WgpuComputeConfig`]; there is
-//!   no `set_atmosphere` trait hook yet (#121).
+//!   updated through `IAcousticComputeBackend::set_atmosphere` (#121).
 //! * **Dispatch size.** Batches larger than `max_sources_per_dispatch` (and than the
 //!   device's storage-binding limit) are split into several dispatches; every query
 //!   gets a result, in order.
@@ -783,6 +783,15 @@ impl IAcousticComputeBackend for WgpuComputeBackend {
 
     fn set_distance_model(&mut self, model: DistanceModel) {
         self.distance_model = model;
+    }
+
+    fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
+        if temperature_celsius.is_finite() && humidity_percent.is_finite() {
+            self.config.temperature_celsius = temperature_celsius;
+            self.config.humidity_percent = humidity_percent;
+            self.cpu_config.temperature_celsius = temperature_celsius;
+            self.cpu_config.humidity_percent = humidity_percent;
+        }
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {

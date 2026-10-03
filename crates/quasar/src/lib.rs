@@ -28,7 +28,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery};
+use quasar_core::backend::{IAcousticComputeBackend, SpatialQuery, SPEED_OF_SOUND};
+use quasar_core::bands::Band8;
+use quasar_core::source_directivity::{
+    diffuse_send_gain, emission_cos, first_order_bounce_point, pattern_band_gains,
+};
 use quasar_core::distance::DistanceModel;
 use quasar_core::error::SpatialAudioError;
 use quasar_core::hybrid::{HybridProbeSampler, HybridSamplingStrategy};
@@ -43,6 +47,7 @@ use quasar_core::scene_output::{
 };
 use quasar_dsp::audio_buffer::{AudioBuffer, DEFAULT_BLOCK_SIZE};
 use quasar_dsp::crossfader::EqualPowerCrossfader;
+use quasar_dsp::limiter::{OutputMeter, OutputSafetyConfig};
 use quasar_dsp::node_graph::AudioNodeGraph;
 use quasar_dsp::patch_bay::{PatchBayBus, PatchEntry, MAX_PULLS_PER_OUTPUT};
 use quasar_materials::registry::AcousticMaterialRegistry;
@@ -167,6 +172,10 @@ pub struct SpatialAudioEngine {
     next_scene_output_id: u32,
     /// Next ID to hand out for a freshly added listener.
     next_listener_id: u32,
+    /// Output-stage meters of each listener (shared with the renderer), parallel to `listeners`.
+    listener_meters: Vec<Arc<OutputMeter>>,
+    /// Output-stage configuration of each listener, parallel to `listeners`.
+    safety_cfgs: Vec<OutputSafetyConfig>,
 
     /// Debug stage selector for isolating noise sources:
     ///   0 = silence, 1 = raw pull only, 2 = +occlusion, 3 = +early reflections, 4 = full.
@@ -237,6 +246,8 @@ impl SpatialAudioEngine {
             next_source_id: 0,
             next_scene_output_id: 0,
             next_listener_id: 0,
+            listener_meters: Vec::new(),
+            safety_cfgs: Vec::new(),
             debug_audio_stage: 4,
             timing,
         }
@@ -262,6 +273,13 @@ impl SpatialAudioEngine {
     /// backend, so the strategy does not change the direct-path loudness.
     pub fn set_distance_model(&mut self, model: DistanceModel) {
         self.hybrid_sampler.set_distance_model(model);
+    }
+
+    /// Set the air temperature (Celsius) and relative humidity (percent) used for
+    /// air absorption by every strategy (baked, real-time, hybrid). Takes effect
+    /// on the next compute update (#121).
+    pub fn set_atmosphere(&mut self, temperature_celsius: f32, humidity_percent: f32) {
+        self.hybrid_sampler.set_atmosphere(temperature_celsius, humidity_percent);
     }
 
     /// Override the distance model of one scene output (`None` = engine-wide model).
@@ -352,6 +370,7 @@ impl SpatialAudioEngine {
                 source_id: query.source_id,
                 direct_gain: res.direct_path.attenuation,
                 direct_delay_samples: res.direct_path.delay_samples,
+                directivity_gain: Band8::splat(1.0),
                 direct_azimuth,
                 direct_elevation,
                 early_reflections,
@@ -436,17 +455,49 @@ impl SpatialAudioEngine {
                             res.direct_path.attenuation = res.direct_path.attenuation.scale(ratio);
                         }
                     }
+                    // Source directivity (#74), per (listener, emitter) pair. An emitter without
+                    // an orientation, or with `directivity == 0`, is omnidirectional: every factor
+                    // below is then exactly 1.0 / 0 dB and the coefficients are unchanged.
+                    let out_cfg = &self.scene_outputs[o];
+                    let (e_pos, l_pos) = (query.source_position, query.listener_position);
+                    let pattern_on = out_cfg.orientation.is_some() && out_cfg.directivity > 0.0;
+                    let pattern_at = |target: Option<[f32; 3]>| -> Band8 {
+                        match target.and_then(|t| emission_cos(out_cfg.orientation, e_pos, t)) {
+                            Some(c) if pattern_on => pattern_band_gains(out_cfg.directivity, c),
+                            _ => Band8::splat(1.0),
+                        }
+                    };
+                    // Direct path: emitter -> listener.
+                    let directivity_gain = pattern_at(Some(l_pos));
+                    // Speed of sound the backend used, recovered from its own direct path.
+                    let c_eff = if res.direct_path.delay_samples > 1e-3 && res.direct_path.distance > 1e-3 {
+                        res.direct_path.distance * self.sample_rate / res.direct_path.delay_samples
+                    } else {
+                        SPEED_OF_SOUND
+                    };
+                    // Reverb send: the late field follows the emitter's total radiated power.
+                    let diffuse_db = if pattern_on {
+                        20.0 * diffuse_send_gain(out_cfg.directivity).max(1e-6).log10()
+                    } else {
+                        0.0
+                    };
+
                     let early_reflections: Vec<_> = res
                         .early_reflections
                         .iter()
                         .map(|er| {
                             let (azimuth, elevation) = direction_to_angles(er.direction);
-                            EarlyReflectionCoeffs {
-                                azimuth,
-                                elevation,
-                                delay_samples: er.delay_samples,
-                                gain: er.gain,
-                            }
+                            // Each reflection leaves the emitter toward ITS first bounce point
+                            // (exact for first order; for higher orders the last bounce point is
+                            // used as the best available approximation of the departure).
+                            let gain = if pattern_on {
+                                let path = er.delay_samples * c_eff / self.sample_rate;
+                                let bounce = first_order_bounce_point(e_pos, l_pos, er.direction, path);
+                                er.gain.mul(&pattern_at(bounce))
+                            } else {
+                                er.gain
+                            };
+                            EarlyReflectionCoeffs { azimuth, elevation, delay_samples: er.delay_samples, gain }
                         })
                         .collect();
 
@@ -463,11 +514,12 @@ impl SpatialAudioEngine {
                         source_id: 0,
                         direct_gain: res.direct_path.attenuation,
                         direct_delay_samples: res.direct_path.delay_samples,
+                        directivity_gain,
                         direct_azimuth: dx.atan2(-dz),
                         direct_elevation: dy.atan2((dx * dx + dz * dz).sqrt()),
                         early_reflections,
                         late_t60: res.late_reverb.t60,
-                        late_gain_db: res.late_reverb.late_loudness_db,
+                        late_gain_db: res.late_reverb.late_loudness_db + diffuse_db,
                         version: 0,
                     };
 
@@ -768,6 +820,26 @@ impl SpatialAudioEngine {
         self.scene_outputs[idx].position = pos;
     }
 
+    /// Orient a scene output and set how directional it is (#74).
+    ///
+    /// `orientation`: forward axis of the radiation pattern (any non-zero length; `None` makes the
+    /// emitter omnidirectional). `directivity`: `0.0` omnidirectional .. `1.0` max cone (clamped);
+    /// see [`quasar_core::source_directivity`] for the pattern. The pattern is evaluated per
+    /// (listener, emitter) pair for the direct path, each early reflection (toward its own first
+    /// bounce point) and the reverb send (diffuse-field average).
+    ///
+    /// Compute-side only: takes effect at the next [`update_scene_spatial`] (the new gains then
+    /// fade in over the crossfade time).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered scene output.
+    pub fn set_scene_output_directivity(&mut self, id: SceneOutputId, orientation: Option<[f32; 3]>, directivity: f32) {
+        let idx = self.scene_output_index(id);
+        self.scene_outputs[idx].orientation = orientation;
+        self.scene_outputs[idx].directivity = if directivity.is_finite() { directivity.clamp(0.0, 1.0) } else { 0.0 };
+    }
+
     /// Set a scene output's LFE send (linear gain, `>= 0`; default 0 = none).
     ///
     /// For every listener whose layout has an LFE slot (named 5.1 / 7.1), the
@@ -903,6 +975,8 @@ impl SpatialAudioEngine {
             params_row.push(params);
         }
         let mut listener = ListenerRender::new(sr, &cfg);
+        self.listener_meters.push(listener.meter());
+        self.safety_cfgs.push(OutputSafetyConfig::default());
         listener.set_pairs(pairs);
         self.pair_params.push(params_row);
         self.send(Command::AddListener(listener));
@@ -927,10 +1001,61 @@ impl SpatialAudioEngine {
         let idx = self.listener_index(id);
         self.listeners.remove(idx);
         self.next_listener_id = self.listeners.len() as u32;
+        self.listener_meters.remove(idx);
+        self.safety_cfgs.remove(idx);
         if idx < self.pair_params.len() {
             self.pair_params.remove(idx);
         }
         self.send(Command::RemoveListener(idx));
+    }
+
+    // ── Output safety stage (#80) ──────────────────────────────────────
+
+    /// Configure a listener's output safety stage: pre-limiter headroom, look-ahead peak limiter
+    /// (ceiling, look-ahead / attack, release), NaN / inf scrub and metering. See
+    /// [`OutputSafetyConfig`] and the `quasar_dsp::limiter` module docs.
+    ///
+    /// The default is enabled, ceiling -1 dBFS, ZERO latency (instant attack). A look-ahead
+    /// (`lookahead_ms > 0`) adds exactly that much latency to this listener's output, reported by
+    /// [`output_latency_samples`](Self::output_latency_samples). The limiter is a SAMPLE-peak
+    /// limiter (no oversampling): intersample peaks can exceed the ceiling by up to a few dB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn set_output_safety(&mut self, id: ListenerId, cfg: OutputSafetyConfig) {
+        let idx = self.listener_index(id);
+        self.safety_cfgs[idx] = cfg;
+        self.send(Command::SetSafety { listener: idx, cfg });
+    }
+
+    /// Output safety configuration of a listener.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn output_safety(&self, id: ListenerId) -> OutputSafetyConfig {
+        self.safety_cfgs[self.listener_index(id)]
+    }
+
+    /// Latency (samples at the engine rate) the output stage adds to a listener's bus: the
+    /// look-ahead of its limiter (0 by default).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn output_latency_samples(&self, id: ListenerId) -> usize {
+        self.safety_cfgs[self.listener_index(id)].latency_samples(self.sample_rate)
+    }
+
+    /// Lock-free meters of a listener's output stage (peak, gain reduction, limited / clipped /
+    /// non-finite sample counters). Readable from any thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a registered listener.
+    pub fn output_meter(&self, id: ListenerId) -> Arc<OutputMeter> {
+        Arc::clone(&self.listener_meters[self.listener_index(id)])
     }
 
     /// Update a listener's world position and heading.

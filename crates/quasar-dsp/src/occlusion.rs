@@ -123,6 +123,18 @@ impl AirAbsorptionOcclusionNode {
         params: &SpatialCoefficients,
         delay_samples: f32,
     ) {
+        self.process_with_gains(input, output, &params.direct_gain, delay_samples);
+    }
+
+    /// Render one block with explicit per-band `gains` (linear) and delay. The engine passes
+    /// `direct_gain x directivity_gain` here (#74).
+    pub fn process_with_gains(
+        &mut self,
+        input: &AudioBuffer,
+        output: &mut AudioBuffer,
+        gains: &Band8,
+        delay_samples: f32,
+    ) {
         debug_assert_eq!(input.channels(), self.input_channels);
         debug_assert_eq!(output.channels(), self.output_channels);
         debug_assert_eq!(input.samples(), output.samples());
@@ -130,7 +142,7 @@ impl AirAbsorptionOcclusionNode {
         let n = input.samples() as usize;
         let channels = (self.input_channels as usize).min(self.delay_lines.len());
 
-        let (target_scalar, target_coefs) = self.design_for(&params.direct_gain);
+        let (target_scalar, target_coefs) = self.design_for(gains);
         let target_delay = self.clamp_delay(delay_samples);
 
         if !self.primed {

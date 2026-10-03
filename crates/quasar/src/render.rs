@@ -28,7 +28,6 @@ use quasar_dsp::early_reflections::EarlyReflectionDelayNode;
 use quasar_dsp::late_reverb::FdnReverbNode;
 use quasar_dsp::limiter::{OutputMeter, OutputSafety, OutputSafetyConfig};
 use quasar_dsp::master_decoder::{layout_lfe, layout_panner, SpeakerLayout};
-use quasar_dsp::node_graph::AudioNode;
 use quasar_dsp::occlusion::AirAbsorptionOcclusionNode;
 use quasar_dsp::patch_bay::{PatchBayBus, PatchBayNode, PatchEntry};
 use quasar_dsp::reflection_decoder::{ReflectionDecoder, TapTarget};
@@ -395,7 +394,7 @@ impl SceneRenderState {
             out.clear();
             let n_speakers = out.channels() as usize;
             let n_o = n_out.min(lis.pairs.len());
-            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, lfe_slots, lfe_filters, lfe_hot, .. } = lis;
+            let ListenerRender { panner, pairs, rev_bus, rev_out, rev_slots, rev_gain, lfe_slots, lfe_filters, lfe_hot, safety, .. } = lis;
             let n = panner.num_outputs().min(MAX_AUDIO_CHANNELS);
 
             for o in 0..n_o {
@@ -412,7 +411,16 @@ impl SceneRenderState {
                 match stage {
                     0 => pair.direct.clear(),
                     1 => pair.direct.copy_from(&self.outputs[o].mixed),
-                    _ => pair.occ.process(&self.outputs[o].mixed, &mut pair.direct, coeff),
+                    _ => {
+                        // Emitter directivity toward THIS listener is a separate per-band factor.
+                        let gains = coeff.direct_gain.mul(&coeff.directivity_gain);
+                        pair.occ.process_with_gains(
+                            &self.outputs[o].mixed,
+                            &mut pair.direct,
+                            &gains,
+                            coeff.direct_delay_samples,
+                        );
+                    }
                 }
                 let combined = &pair.direct;
                 let (az, el) = basis.to_listener_angles(coeff.direct_azimuth, coeff.direct_elevation);
@@ -578,9 +586,10 @@ impl SceneRenderState {
                     }
                 }
             }
-        }
 
-        // (the output safety stage runs at the end of each listener's render, see below)
+            // Output safety stage (#80): gain staging, NaN / inf scrub, look-ahead limiter, meters.
+            safety.process(out);
+        }
 
         // 5. Advance all crossfaders by the block size (fades complete in ~fade_ms of real time).
         for lis in self.listeners.iter_mut() {
@@ -674,6 +683,7 @@ pub(crate) fn initial_scene_coeffs() -> SpatialCoefficients {
         early_reflections: Vec::new(),
         late_t60: Band8::splat(0.5),
         late_gain_db: 0.0,
+        directivity_gain: quasar_core::bands::Band8::splat(1.0),
         version: 0,
     }
 }

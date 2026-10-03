@@ -38,6 +38,32 @@ impl BiquadFilter {
         y
     }
 
+    /// Filter `buf` in place with per-sample coefficients (`b0[i] .. a2[i]` apply to sample `i`);
+    /// identical to calling [`Self::set_coefficients`] then [`Self::process`] for each sample, but
+    /// with the state held in registers. Processes `min` of all the slice lengths; afterwards the
+    /// filter holds the coefficients of the last processed sample.
+    pub fn process_block_varying(&mut self, buf: &mut [f32], b0: &[f32], b1: &[f32], b2: &[f32], a1: &[f32], a2: &[f32]) {
+        let n = buf.len().min(b0.len()).min(b1.len()).min(b2.len()).min(a1.len()).min(a2.len());
+        let (buf, b0, b1, b2, a1, a2) = (&mut buf[..n], &b0[..n], &b1[..n], &b2[..n], &a1[..n], &a2[..n]);
+        let (mut x1, mut x2, mut y1, mut y2) = (self.x1, self.x2, self.y1, self.y2);
+        for i in 0..n {
+            let x = buf[i];
+            let y = b0[i] * x + b1[i] * x1 + b2[i] * x2 - a1[i] * y1 - a2[i] * y2;
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
+            buf[i] = y;
+        }
+        self.x1 = x1;
+        self.x2 = x2;
+        self.y1 = y1;
+        self.y2 = y2;
+        if n > 0 {
+            self.set_coefficients(b0[n - 1], b1[n - 1], b2[n - 1], a1[n - 1], a2[n - 1]);
+        }
+    }
+
     /// Reset filter state to zero.
     pub fn reset(&mut self) {
         self.x1 = 0.0;

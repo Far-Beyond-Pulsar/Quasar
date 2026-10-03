@@ -46,6 +46,15 @@ impl MaterialParameterBuffer {
         bytemuck::try_cast_slice(&self.data).ok()
     }
 
+    /// Copy the buffer out as a single `T` (alignment-independent: a `Vec<u8>` is not
+    /// guaranteed to be aligned for `T`). `None` if the size does not match `size_of::<T>()`.
+    pub fn read_value<T: bytemuck::Pod>(&self) -> Option<T> {
+        if self.data.len() != size_of::<T>() {
+            return None;
+        }
+        Some(bytemuck::pod_read_unaligned(&self.data))
+    }
+
     /// Interpret the buffer as a single value of type `T`.
     ///
     /// Returns `None` if the buffer size does not match `size_of::<T>()`.

@@ -41,6 +41,7 @@
 //! toward +X (the listener's right); elevation +up.
 
 use crate::biquad::BiquadFilter;
+use crate::fractional_delay::HermiteInterpolatingDelayLine;
 use std::f32::consts::{FRAC_PI_2, PI};
 
 /// Renders one mono signal to a binaural pair for a given listener-space direction.
@@ -106,12 +107,18 @@ const P_NOTCH: usize = 9; // b0 b1 b2 a1 a2 (5)
 const NUM_PARAMS: usize = 14;
 type EarParams = [f32; NUM_PARAMS];
 
-/// Per-ear state: delay ring, head-shadow memory, shelf and notch biquads.
+/// Samples processed per inner pass: the per-sample parameter trajectories live on the stack
+/// (`2 * NUM_PARAMS * BIN_CHUNK` floats), so this is a stack / cache budget, not an API limit.
+const BIN_CHUNK: usize = 64;
+
+/// Per-sample parameter trajectories of one ear for one chunk (`[param][sample]`).
+type EarTrajectory = [[f32; BIN_CHUNK]; NUM_PARAMS];
+
+/// Per-ear state: delay line, head-shadow memory, shelf and notch biquads.
 struct EarState {
-    buf: Vec<f32>,
-    mask: usize,
-    /// Index of the newest sample.
-    w: usize,
+    line: HermiteInterpolatingDelayLine,
+    /// Largest delay (samples) the ITD read may use.
+    max_d: f32,
     sx1: f32,
     sy1: f32,
     shelf: BiquadFilter,
@@ -122,9 +129,8 @@ impl EarState {
     fn new(min_len: usize) -> Self {
         let len = min_len.next_power_of_two().max(16);
         Self {
-            buf: vec![0.0; len],
-            mask: len - 1,
-            w: 0,
+            line: HermiteInterpolatingDelayLine::with_capacity(len, BIN_CHUNK, 48_000.0),
+            max_d: (len - 4) as f32,
             sx1: 0.0,
             sy1: 0.0,
             shelf: BiquadFilter::new(),
@@ -133,52 +139,55 @@ impl EarState {
     }
 
     fn clear(&mut self) {
-        for v in self.buf.iter_mut() {
-            *v = 0.0;
-        }
-        self.w = 0;
+        self.line.clear();
         self.sx1 = 0.0;
         self.sy1 = 0.0;
         self.shelf.reset();
         self.notch.reset();
     }
 
-    /// Push `x`, read it back `delay` samples late (4-point Catmull-Rom), then
-    /// head shadow -> shelf -> notch with the given (already interpolated) params.
-    #[inline]
-    fn tick(&mut self, x: f32, p: &EarParams) -> f32 {
-        self.w = (self.w + 1) & self.mask;
-        self.buf[self.w] = x;
+    /// Render one chunk (at most [`BIN_CHUNK`] samples) and ADD it to `out`: push the chunk, read
+    /// it back with the per-sample ITD (4-point Catmull-Rom), then head shadow -> shelf -> notch
+    /// with the per-sample interpolated parameters `p`. One pass per stage over the chunk.
+    fn run_chunk(&mut self, input: &[f32], p: &EarTrajectory, out: &mut [f32]) {
+        let m = input.len().min(out.len()).min(BIN_CHUNK);
+        if m == 0 {
+            return;
+        }
+        self.line.push_slice(&input[..m]);
 
-        let max_d = (self.buf.len() - 4) as f32;
-        let d = p[P_DELAY].clamp(1.0, max_d);
-        let di = d as usize; // >= 1
-        let t = d - di as f32;
-        let at = |k: usize| self.buf[self.w.wrapping_sub(k) & self.mask];
-        // Newest is delay 0; older samples have larger delay, so `t` walks from
+        // Newest is delay 0; older samples have larger delay, so the fraction walks from
         // delay `di` toward `di + 1`.
-        let (pm1, p0, p1, p2) = (at(di - 1), at(di), at(di + 1), at(di + 2));
-        let m0 = 0.5 * (p1 - pm1);
-        let m1 = 0.5 * (p2 - p0);
-        let t2 = t * t;
-        let t3 = t2 * t;
-        let y = (2.0 * t3 - 3.0 * t2 + 1.0) * p0
-            + (t3 - 2.0 * t2 + t) * m0
-            + (-2.0 * t3 + 3.0 * t2) * p1
-            + (t3 - t2) * m1;
+        let mut d = [0.0_f32; BIN_CHUNK];
+        for (dst, &src) in d[..m].iter_mut().zip(p[P_DELAY].iter()) {
+            *dst = src.clamp(1.0, self.max_d);
+        }
+        let mut y = [0.0_f32; BIN_CHUNK];
+        self.line.tap_many(&d[..m], m - 1, true, &mut y[..m]);
 
         // Brown-Duda one-pole/one-zero.
-        let mut s = p[P_SHADOW] * y + p[P_SHADOW + 1] * self.sx1 - p[P_SHADOW + 2] * self.sy1;
-        if s.abs() < 1e-24 {
-            s = 0.0; // flush denormals
+        let (c0, c1, c2) = (&p[P_SHADOW], &p[P_SHADOW + 1], &p[P_SHADOW + 2]);
+        let (mut sx1, mut sy1) = (self.sx1, self.sy1);
+        let mut s = [0.0_f32; BIN_CHUNK];
+        for i in 0..m {
+            let mut v = c0[i] * y[i] + c1[i] * sx1 - c2[i] * sy1;
+            if v.abs() < 1e-24 {
+                v = 0.0; // flush denormals
+            }
+            sx1 = y[i];
+            sy1 = v;
+            s[i] = v;
         }
-        self.sx1 = y;
-        self.sy1 = s;
+        self.sx1 = sx1;
+        self.sy1 = sy1;
 
-        self.shelf.set_coefficients(p[P_SHELF], p[P_SHELF + 1], p[P_SHELF + 2], p[P_SHELF + 3], p[P_SHELF + 4]);
-        self.notch.set_coefficients(p[P_NOTCH], p[P_NOTCH + 1], p[P_NOTCH + 2], p[P_NOTCH + 3], p[P_NOTCH + 4]);
-        let s = self.shelf.process(s);
-        self.notch.process(s)
+        let sh = &p[P_SHELF..P_SHELF + 5];
+        self.shelf.process_block_varying(&mut s[..m], &sh[0], &sh[1], &sh[2], &sh[3], &sh[4]);
+        let nt = &p[P_NOTCH..P_NOTCH + 5];
+        self.notch.process_block_varying(&mut s[..m], &nt[0], &nt[1], &nt[2], &nt[3], &nt[4]);
+        for (o, v) in out[..m].iter_mut().zip(&s[..m]) {
+            *o += *v;
+        }
     }
 }
 
@@ -289,17 +298,27 @@ impl BinauralRenderer for ParametricBinauralRenderer {
             self.valid = true;
         }
         let inv_n = 1.0 / n as f32;
-        let mut cur = [[0.0_f32; NUM_PARAMS]; 2];
-        for i in 0..n {
-            let t = (i + 1) as f32 * inv_n;
+        let mut c0 = 0;
+        while c0 < n {
+            let m = (n - c0).min(BIN_CHUNK);
+            // Per-sample parameter trajectories of this chunk (one vectorisable pass each).
+            let mut t = [0.0_f32; BIN_CHUNK];
+            for (i, v) in t[..m].iter_mut().enumerate() {
+                *v = (c0 + i + 1) as f32 * inv_n;
+            }
+            let mut cur = [[[0.0_f32; BIN_CHUNK]; NUM_PARAMS]; 2];
             for e in 0..2 {
                 for k in 0..NUM_PARAMS {
-                    cur[e][k] = self.prev[e][k] + (target[e][k] - self.prev[e][k]) * t;
+                    let (a, b) = (self.prev[e][k], target[e][k]);
+                    for (c, &tt) in cur[e][k][..m].iter_mut().zip(&t[..m]) {
+                        *c = a + (b - a) * tt;
+                    }
                 }
             }
-            let x = input[i];
-            left[i] += self.ears[0].tick(x, &cur[0]);
-            right[i] += self.ears[1].tick(x, &cur[1]);
+            let x = &input[c0..c0 + m];
+            self.ears[0].run_chunk(x, &cur[0], &mut left[c0..c0 + m]);
+            self.ears[1].run_chunk(x, &cur[1], &mut right[c0..c0 + m]);
+            c0 += m;
         }
         self.prev = target;
     }
