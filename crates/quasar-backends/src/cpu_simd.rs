@@ -31,6 +31,7 @@ pub struct CpuSimdComputeBackend {
     room_warnings: u32,
     config: CpuSimdConfig,
     distance_model: DistanceModel,
+    debug_capture: std::sync::Arc<crate::debug_capture::AcousticDebugCapture>,
 }
 
 /// Configuration for the CPU SIMD backend.
@@ -696,6 +697,7 @@ struct ImageSearch {
     images: [[f32; 3]; MAX_IMAGE_ORDER + 1],
     nodes: usize,
     found: Vec<PathCandidate>,
+    debug_paths: Vec<crate::debug_capture::DebugReflectionPath>,
 }
 
 /// A validated path with the energy used to rank it.
@@ -1065,6 +1067,7 @@ impl CpuSimdComputeBackend {
             room_warnings: 0,
             config,
             distance_model: DistanceModel::default(),
+            debug_capture: Default::default(),
         };
         backend.build_bvh();
         backend
@@ -1138,8 +1141,16 @@ impl CpuSimdComputeBackend {
     }
 
     /// Trace a single ray through the BVH.
+    pub fn debug_capture(&self) -> std::sync::Arc<crate::debug_capture::AcousticDebugCapture> {
+        self.debug_capture.clone()
+    }
+
     fn trace_single_ray(&self, ray: &Ray) -> Option<RayHit> {
-        self.bvh.as_ref().and_then(|bvh| bvh.intersect(ray))
+        let hit = self.bvh.as_ref().and_then(|bvh| bvh.intersect(ray));
+        if self.debug_capture.is_enabled() {
+            self.debug_capture.record_ray(ray.clone(), hit.clone());
+        }
+        hit
     }
 
     /// Compute the direct path between source and listener.
@@ -1598,10 +1609,19 @@ impl CpuSimdComputeBackend {
             images: [[0.0; 3]; MAX_IMAGE_ORDER + 1],
             nodes: 0,
             found: Vec::new(),
+            debug_paths: Vec::new(),
         };
         st.images[0] = *source;
         self.expand_images(&mut st, 0, materials);
-        rank_reflections(st.found, &self.config)
+        let reflections = rank_reflections(st.found, &self.config);
+        for mut path in st.debug_paths {
+            path.selected = reflections.iter().any(|r| {
+                r.order == path.reflection.order && r.direction == path.reflection.direction
+                    && r.delay_samples == path.reflection.delay_samples && r.gain.0 == path.reflection.gain.0
+            });
+            self.debug_capture.record_path(path);
+        }
+        reflections
     }
 
     /// Depth-first image-tree expansion: node at `depth` holds `images[0..=depth]`
@@ -1640,7 +1660,7 @@ impl CpuSimdComputeBackend {
     /// `st.images[..=n]`); builds the [`EarlyReflection`] when it is a real path.
     fn validate_image_path(
         &self,
-        st: &ImageSearch,
+        st: &mut ImageSearch,
         n: usize,
         materials: &dyn MaterialProvider,
     ) -> Option<PathCandidate> {
@@ -1705,7 +1725,19 @@ impl CpuSimdComputeBackend {
         )?;
         candidate.refl.gain = candidate.refl.gain.mul(&blocker_gain);
         candidate.energy = candidate.refl.gain.0.iter().map(|g| g * g).sum();
-        (candidate.energy > 1e-14).then_some(candidate)
+        if !(candidate.energy > 1e-14) { return None; }
+        if self.debug_capture.is_enabled() {
+            st.debug_paths.push(crate::debug_capture::DebugReflectionPath {
+                source: st.source,
+                listener: st.listener,
+                bounces: pts[..n].to_vec(),
+                normals: tri_of[..n].iter().map(|&i| self.triangles[i].normal).collect(),
+                material_handles: tri_of[..n].iter().map(|&i| self.triangles[i].material_handle).collect(),
+                reflection: candidate.refl.clone(),
+                selected: false,
+            });
+        }
+        Some(candidate)
     }
 
     /// Triangle of `plane` containing the in-plane point `p` plus the edge window
@@ -1884,15 +1916,7 @@ impl IAcousticComputeBackend for CpuSimdComputeBackend {
     }
 
     fn trace_ray(&self, ray: &Ray) -> Vec<RayHit> {
-        let mut hits = Vec::new();
-
-        if let Some(bvh) = &self.bvh {
-            if let Some(hit) = bvh.intersect(ray) {
-                hits.push(hit);
-            }
-        }
-
-        hits
+        self.trace_single_ray(ray).into_iter().collect()
     }
 }
 

@@ -11,6 +11,70 @@ use quasar_core::scene::{AcousticMesh, AcousticScene};
 
 const FS: f32 = 48_000.0;
 
+#[test]
+fn debug_capture_records_actual_paths_and_preserves_solver_results() {
+    let backend = CpuSimdComputeBackend::new(shoebox(8.0, 3.0, 6.0), CpuSimdConfig { max_reflections: 3, ..cfg(2) });
+    let capture = backend.debug_capture();
+    let baseline = reflections(&backend, &Abs(0.2), SRC, LIS);
+    assert!(capture.take_frame().rays.is_empty());
+
+    capture.set_enabled(true);
+    let actual = reflections(&backend, &Abs(0.2), SRC, LIS);
+    let frame = capture.take_frame();
+    assert!(!frame.rays.is_empty());
+    assert_eq!(baseline.len(), actual.len());
+    for (a, b) in baseline.iter().zip(&actual) {
+        assert_eq!(a.direction, b.direction);
+        assert_eq!(a.delay_samples, b.delay_samples);
+        assert_eq!(a.gain.0, b.gain.0);
+    }
+    let selected: Vec<_> = frame.paths.iter().filter(|p| p.selected).collect();
+    assert_eq!(selected.len(), actual.len());
+    assert_eq!(selected.len(), 3);
+    assert!(frame.paths.iter().any(|p| !p.selected));
+    for path in selected {
+        assert_eq!(path.bounces.len(), path.reflection.order as usize);
+        assert_eq!(path.normals.len(), path.bounces.len());
+        assert_eq!(path.material_handles.len(), path.bounces.len());
+        let mut total = 0.0;
+        let mut from = SRC;
+        for &bounce in &path.bounces {
+            assert!((0..3).any(|i| bounce[i].abs() < 1e-4 || (bounce[i] - ROOM[i]).abs() < 1e-4));
+            total += dist3(from, bounce);
+            from = bounce;
+        }
+        total += dist3(from, LIS);
+        assert!((total * FS / SPEED_OF_SOUND - path.reflection.delay_samples).abs() < 0.01);
+        assert!(angle_deg(unit_from(LIS, from), path.reflection.direction) < 0.05);
+    }
+    for sample in &frame.rays {
+        if let Some(hit) = &sample.hit {
+            assert!(dist3(sample.ray.point_at(hit.distance), hit.point) < 1e-5);
+        }
+    }
+
+    let moved = [4.0, 1.0, 3.0];
+    capture.begin_update();
+    reflections(&backend, &Abs(0.2), SRC, moved);
+    assert!(capture.take_frame().paths.iter().all(|p| p.listener == moved));
+    capture.set_enabled(false);
+    reflections(&backend, &Abs(0.2), SRC, LIS);
+    let disabled = capture.take_frame();
+    assert!(disabled.rays.is_empty() && disabled.paths.is_empty());
+}
+
+#[test]
+fn debug_capture_keeps_queries_from_parallel_pairs() {
+    let backend = CpuSimdComputeBackend::new(shoebox(8.0, 3.0, 6.0), cfg(1));
+    let capture = backend.debug_capture();
+    capture.set_enabled(true);
+    let other = [3.0, 1.0, 2.0];
+    backend.query_spatial(&[query(SRC, LIS), query(other, LIS)], &Abs(0.2));
+    let frame = capture.take_frame();
+    assert!(frame.paths.iter().any(|p| p.source == SRC));
+    assert!(frame.paths.iter().any(|p| p.source == other));
+}
+
 /// Constant absorption on every surface and band.
 struct Abs(f32);
 impl MaterialProvider for Abs {

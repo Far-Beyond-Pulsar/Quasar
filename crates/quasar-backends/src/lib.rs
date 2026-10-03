@@ -9,3 +9,4 @@ pub use cpu_simd::CpuSimdComputeBackend;
 #[cfg(feature = "wgpu-compute")]
 pub use wgpu_compute::WgpuComputeBackend;
 pub use hw_stub::HardwareAcceleratorStub;
+pub mod debug_capture;

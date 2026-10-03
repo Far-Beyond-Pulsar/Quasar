@@ -15,7 +15,7 @@
 //! Controls:
 //!   WASD        — move forward/left/back/right
 //!   Space/Shift — move up/down
-//!   R           — toggle Quasar ray visualization
+//!   V (or R)    — toggle live acoustic rays and reflection paths
 //!   T           — toggle Quasar probe grid overlay
 //!   Y           — toggle Quasar material zone colors
 //!   G           — swap Aux Left/Right channels (live patch-bay remap)
@@ -26,6 +26,7 @@
 //!   Escape      — release cursor / exit
 
 mod v3_demo_common;
+mod acoustic_overlay;
 
 use helio::{
     required_experimental_features, required_wgpu_features, required_wgpu_limits, BakeConfig, Camera, DebugDrawState, HelioAction, HelioCommandBridge, LightId, MeshId, Movability, Renderer, RendererConfig, Scene,
@@ -191,6 +192,7 @@ impl StreamingPlayback {
 /// and the [`StreamingPlayback`] outright and shares only atomics with this side, so it never
 /// takes a lock the compute pass (which holds `engine`) could be holding.
 struct AudioEngine {
+    debug_capture: Arc<quasar_backends::debug_capture::AcousticDebugCapture>,
     /// Compute / configuration side (registries, ray tracing, command queue to the renderer).
     engine: Arc<Mutex<SpatialAudioEngine>>,
     _stream: cpal::Stream,
@@ -296,7 +298,9 @@ fn setup_audio_engine() -> AudioEngine {
         sample_rate: 48_000.,
         ..CpuSimdConfig::default()
     };
-    engine.set_backend(Box::new(CpuSimdComputeBackend::new(qs, cfg)));
+    let backend = CpuSimdComputeBackend::new(qs, cfg);
+    let debug_capture = backend.debug_capture();
+    engine.set_backend(Box::new(backend));
 
     // Baked probe grid covering the whole navigable cathedral so HybridBlend
     // late reverb is probe-driven everywhere the camera goes. T60 ramps from
@@ -448,7 +452,7 @@ fn setup_audio_engine() -> AudioEngine {
     ).expect("build output stream");
     stream.play().expect("play stream");
 
-    AudioEngine { engine, _stream: stream, master_gain_db, levels, source_id, outputs, listener_id }
+    AudioEngine { debug_capture, engine, _stream: stream, master_gain_db, levels, source_id, outputs, listener_id }
 }
 
 // ── Billboard sprite replacement (Helio issue #192 workaround) ─────────────
@@ -608,6 +612,7 @@ struct AppState {
     // Quasar spatial audio
     _audio_engine: AudioEngine,
     show_rays: bool,
+    acoustic_overlay: acoustic_overlay::AcousticOverlay,
     show_probes: bool,
     show_material_zones: bool,
     // Aux Left/Right pulls swapped live via the G key (patch-bay remap).
@@ -1018,6 +1023,7 @@ impl ApplicationHandler for App {
         }
 
         self.state = Some(AppState {
+            acoustic_overlay: acoustic_overlay::AcousticOverlay::new(&device, format),
             window,
             surface,
             device,
@@ -1059,7 +1065,7 @@ impl ApplicationHandler for App {
             candle_light_ids,
             start_time: std::time::Instant::now(),
             _audio_engine: audio_engine,
-            show_rays: true,
+            show_rays: false,
             show_probes: true,
             show_material_zones: true,
             aux_swapped: false,
@@ -1088,11 +1094,20 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // R: toggle Quasar ray visualization
+            // V toggles actual acoustic tracing; R remains an alias.
             WindowEvent::KeyboardInput {
-                event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyR), .. },
+                event: KeyEvent { state: ElementState::Pressed, repeat: false, physical_key: PhysicalKey::Code(KeyCode::KeyV | KeyCode::KeyR), .. },
                 ..
-            } => { state.show_rays = !state.show_rays; },
+            } => {
+                state.show_rays = !state.show_rays;
+                state._audio_engine.debug_capture.set_enabled(state.show_rays);
+                state.spatial_accum = SPATIAL_UPDATE_INTERVAL;
+                if !state.show_rays {
+                    state.acoustic_overlay.update(&state.device, &state.queue, &Default::default());
+                    state.window.set_title("Helio & Quasar; Indoor Cathedral w/ Spatial Audio");
+                }
+                println!("[quasar] acoustic rays: {} | blue: clear tests, red: hits, purple: valid candidate paths, green: selected paths, yellow: bounce points and normals; updated at the ~30 Hz spatial compute rate", state.show_rays);
+            },
             // T: toggle Quasar probe grid
             WindowEvent::KeyboardInput {
                 event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(KeyCode::KeyT), .. },
@@ -1461,7 +1476,16 @@ impl AppState {
             self.spatial_accum += dt;
             if self.spatial_accum >= SPATIAL_UPDATE_INTERVAL {
                 self.spatial_accum = 0.0;
+                if self.show_rays { self._audio_engine.debug_capture.begin_update(); }
                 engine.update_scene_spatial();
+                if self.show_rays {
+                    let frame = self._audio_engine.debug_capture.take_frame();
+                    self.window.set_title(&format!(
+                        "Quasar | V: toggle rays | {} ray tests | {} selected / {} valid paths | blue clear, red hit, green selected, purple candidate, yellow bounce",
+                        frame.rays.len(), frame.paths.iter().filter(|p| p.selected).count(), frame.paths.len(),
+                    ));
+                    self.acoustic_overlay.update(&self.device, &self.queue, &frame);
+                }
             }
         }
         renderer.debug_clear();
@@ -1498,21 +1522,6 @@ impl AppState {
         }).collect();
         renderer.set_billboard_instances(&billboards);
 
-        if self.show_rays {
-            for (i, &src_pos) in SPEAKER_POSITIONS.iter().enumerate() {
-                let hue = i as f32 / SPEAKER_POSITIONS.len() as f32;
-                let base = hsl_to_rgba(hue, 0.9, 0.6, 1.0);
-                renderer.debug_line(src_pos.into(), listener_pos.into(), base);
-                let walls = [glam::Vec3::new(-11.0, 1.0, listener_pos.z * 0.5), glam::Vec3::new(11.0, 1.0, listener_pos.z * 0.3)];
-                for (j, &wp) in walls.iter().enumerate() {
-                    let f = 1.0 - j as f32 * 0.2;
-                    let c = [base[0]*f, base[1]*f, base[2]*f, 0.6];
-                    renderer.debug_line(src_pos.into(), wp.into(), c);
-                    renderer.debug_line(wp.into(), listener_pos.into(), c);
-                    renderer.debug_sphere(wp.into(), 0.08, [1.0, 1.0, 0.0, 0.8], 8);
-                }
-            }
-        }
         if self.show_probes {
             for x in -2..=2 { for z in -2..=2 {
                 let p = glam::Vec3::new(x as f32 * 3.0, 0.5, z as f32 * 3.0);
@@ -1541,6 +1550,7 @@ impl AppState {
         if let Err(e) = renderer.render(&camera, &view) {
             log::error!("Render: {:?}", e);
         }
+        if self.show_rays { self.acoustic_overlay.render(&self.device, &self.queue, &camera, &view); }
         self.queue.present(output);
     }
 }
